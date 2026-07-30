@@ -1,0 +1,26 @@
+{
+  "name": "pear",
+  "version": "0.1.0",
+  "description": "Lean pair-programming harness — agent drives or navigates with you",
+  "type": "module",
+  "bin": {
+    "pear": "./bin/pear"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "start": "./bin/pear",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}
