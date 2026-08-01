@@ -2,27 +2,25 @@
 
 ## Project overview
 
-`pear` is a lean pair-programming CLI. It runs a coding **driver** agent and, for Git repositories, asynchronously runs a **navigator** agent that reviews uncommitted changes.
+`pear` is a pair-programming **loop core** plus thin **host adapters**. The loop gates mutating tool calls with human checkpoints and, in Git repos, runs a background **navigator** that reviews uncommitted changes. Findings are human-only by default.
 
 - Runtime: Node.js **>= 22.19.0** (`.tool-versions` pins the local version).
 - Language: TypeScript in native ESM / `NodeNext` mode.
 - Package manager: npm; commit `package-lock.json` when dependencies change.
 - Execution model: TypeScript is run directly with Node’s type-stripping support; this project does not build emitted JavaScript.
+- Primary ship: **pi extension** (`pi install` / `pi -e`). Follow-on adapters: opencode, Claude Code, Cursor.
 
 ## Repository layout
 
-- `bin/pear` — executable shell shim. Validates Node version and chooses the required type-stripping flag for Node 22–23.
-- `src/cli.ts` — command-line parsing and configuration assembly.
-- `src/config.ts` — configuration types, defaults, and pure threshold/model parsing helpers.
-- `src/drive.ts` — coding-driver agent setup and streamed terminal output.
-- `src/tools.ts` — agent file/shell tools and the human checkpoint gate.
-- `src/git.ts` — Git working-tree inspection, line counting, hashing, and diff generation.
-- `src/navigate.ts` — navigator review scheduler/state machine.
-- `src/review.ts` — navigator response schema parsing, triage, formatting, and review prompt.
-- `src/session.ts` — interactive session lifecycle, model registry, UI wiring, polling, and driver/navigator coordination.
-- `src/ui.ts` — `pi-tui` interactive UI: task editor, streamed agent output, queued findings, checkpoint overlay, and shutdown/input handling.
-- `src/theme.ts` — ANSI-based themes for the editor, Markdown output, and checkpoint select list.
-- `test/*.test.ts` — unit tests using Node’s built-in `node:test` runner; `ui.test.ts` covers UI behavior with a test terminal.
+- `core/` — host-free loop: git inspection, navigator scheduler, review parse/triage, config thresholds, checkpoint accounting, LLM review seam.
+- `adapters/pi/` — pi extension (`extensions/pear.ts`) + testable `runtime.ts`.
+- `adapters/opencode/`, `adapters/claude-code/`, `adapters/cursor/` — follow-on host plugins/hooks.
+- `adapters/shared/` — conversational block template + navigator daemon kit (Claude Code / Cursor).
+- `skills/pear-pairing/` — driver/navigator discipline skill (portable prompt layer).
+- `test/` — `node:test` suites for core + pi gate/lifecycle + conversational contracts.
+- `scripts/smoke-pi.sh` — pi `-e` and packaged-install smoke.
+
+Core rule: nothing under `core/` imports a host SDK. Adapters import core, never each other (except `adapters/shared/`).
 
 ## Setup and common commands
 
@@ -30,15 +28,21 @@
 npm install
 npm test
 npm run typecheck
-npm start -- --help
-# equivalent direct CLI invocation:
-./bin/pear --help
+npm run smoke:pi
 ```
 
-Run focused tests while iterating:
+Install as a pi package (from this repo):
 
 ```sh
-node --experimental-strip-types --test test/git.test.ts
+pi install "$(git rev-parse --show-toplevel)"
+# or: pi -e ./adapters/pi/extensions/pear.ts
+```
+
+Focused tests:
+
+```sh
+node --experimental-strip-types --test test/checkpoint.test.ts
+node --experimental-strip-types --test test/pi-gate.test.ts
 node --experimental-strip-types --test test/navigate.test.ts
 ```
 
@@ -54,7 +58,7 @@ There is no configured formatter or linter. Preserve the surrounding file’s fo
 
 - Keep source and tests as `.ts`; use explicit `.ts` extensions for local ESM imports:
   ```ts
-  import { changedLines } from "./git.ts";
+  import { changedLines } from "../core/git.ts";
   ```
 - `tsconfig.json` is strict, uses `NodeNext`, has `erasableSyntaxOnly`, and has `noEmit: true`.
 - Prefer standard erasable TypeScript syntax. Do not introduce enums, parameter properties, namespaces, or other syntax incompatible with Node type stripping / `erasableSyntaxOnly`.
@@ -64,72 +68,61 @@ There is no configured formatter or linter. Preserve the surrounding file’s fo
 - Use non-null assertions only when an immediately evident local invariant establishes presence; otherwise handle the absent case.
 - Keep pure policy/threshold logic in small exported functions where it can be tested without I/O.
 
-## Architecture and behavior constraints
+## Core invariants
 
-### CLI and configuration
+### Checkpoint accounting (`core/checkpoint.ts`)
 
-- Keep CLI options and help text synchronized in `src/cli.ts`.
-- Validate user-facing numeric options before constructing `Config`; errors should explain the bad option and expected value.
-- Model specs are `provider/id`; use `parseModel` and `resolveModel` rather than duplicating parsing or registry lookup.
-- Preserve the behavior that navigator review is always disabled outside a Git working tree; the CLI warns and uses mutation-count checkpoint pacing there. `--no-nav` explicitly disables it in Git repositories too.
+- Mutation counters are **relative to the last reset**; the mutation baseline is always 0.
+- `check` before `reserve`; settle by `toolCallId` (unknown ids no-op).
+- Mid-batch reset uses `resetBaseline(null)` → `rebasePending`; `finishRebase` only at the first following `turn_end`, or `abandonRebase` on read failure. Never leave `rebasePending` across turns.
+- Contract strings are canonical and cross-host: `STEERING_CONTRACT`, `ACK_CONTRACT`.
 
-### Git helpers
+### Pi adapter gate
 
-- The current Git baseline is `HEAD`; for unborn repositories use `EMPTY_TREE`.
-- Account for both tracked and untracked changes. `changedLines`, `diffText`, `stateHash`, and `changedFiles` intentionally include untracked files.
-- Treat filenames as arbitrary data where possible. Existing NUL-delimited Git parsing handles paths more safely than line-oriented output.
-- Do not remove binary detection, diff truncation, or read-error handling without a tested replacement. They bound model input and keep the CLI robust on unusual working trees.
-- Prefer `spawnSync`/`execFileSync` argument arrays for Git invocations rather than shell-concatenated commands.
+- Mutating tools: `write` / `edit` / `bash`.
+- Over budget + UI → always **block** the triggering call (`ACK_CONTRACT` or `STEERING_CONTRACT + text`) and suppress the rest of the batch until `turn_end`.
+- Headless (`hasUI=false`) allows without reserving. UI input throw fails open (reset + reserve + allow).
+- Git detection via `gitOk(cwd)`, not `stateHash` try/catch. All line reads go through a guarded helper.
 
-### Driver tools and checkpoints
+### Navigator scheduler (`core/navigate.ts`)
 
-- `createTools` is the policy boundary for agent-initiated filesystem and shell mutation.
-- Before each potentially mutating `write`, `edit`, or `bash`, preserve checkpoint gating via `gate`.
-- A tool result beginning with `NOT EXECUTED — human steering:` means the human redirected the action. It is direction, not a successful tool execution; do not assume any file or command side effect occurred.
-- Mutation count is deliberately used even for shell commands and non-Git directories. Keep checkpoint pacing conservative.
-- Keep file paths resolved relative to the requested project `cwd`; do not silently change process-wide working directory assumptions.
-
-### Navigator scheduler
-
-- `src/navigate.ts` is a state machine with `IDLE`, `PENDING`, `WAITING_INTERVAL`, and `REVIEWING` states.
-- Maintain the single-in-flight-review invariant. A new hash while `REVIEWING` must not launch a concurrent review.
-- Navigator reviews are debounced, minimum-size gated, interval-limited, and deduplicated by content-sensitive state hash.
-- Driver turns park navigator scheduling. A completed review while parked must not schedule another review until normal resume logic decides to do so.
-- Scheduler changes are race-prone. Add or update deterministic fake-timer tests for every state transition, retry behavior, deduplication rule, or driver-parking change.
+- States: `IDLE`, `PENDING`, `WAITING_INTERVAL`, `REVIEWING`.
+- Single in-flight review. Driver turns park scheduling (`setAgentActive`).
+- Reviews are debounced, min-size gated, interval-limited, and deduplicated by content-sensitive state hash.
+- Scheduler changes are race-prone — add fake-timer tests for every state transition.
 
 ### Review protocol
 
-- `REVIEW_SYSTEM` requires a JSON array of findings. Keep the response schema in `src/review.ts` and the prompt synchronized.
-- Parse model output defensively. A malformed response should become a navigator error, not crash the interactive session.
-- Preserve triage semantics unless intentionally changing product behavior: only `small` + `low` findings are filtered.
+- `REVIEW_SYSTEM` requires a JSON array of findings. Keep schema in `core/review.ts` and the prompt synchronized.
+- Parse defensively. Malformed responses become navigator errors, not session crashes.
+- Triage: only `small` + `low` findings are filtered.
+- Findings are human-only by default on every host.
+
+### Non-git cwd
+
+- Navigator off; mutation-count pacing only.
 
 ## Testing guidance
 
-- Tests use `node:test` and `node:assert/strict`; do not add a test framework without a compelling reason.
-- Keep tests independent and deterministic. Tests needing a repository should create a temporary directory with `mkdtempSync`, initialize/configure Git locally, and remove it in cleanup.
-- Test externally observable behavior and edge cases, especially:
-  - unborn Git repositories;
-  - staged, unstaged, and untracked changes;
-  - binary/unreadable files and diff size bounds;
-  - checkpoint continuation versus human steering;
-  - scheduler timing, races, review failures, and hash reversion;
-  - malformed review responses and finding triage.
-- When modifying a pure helper, add focused table-like cases in its existing test file. When modifying orchestration, test the full state transition or interaction rather than implementation details alone.
+- Tests use `node:test` and `node:assert/strict`.
+- Keep tests independent and deterministic. Temp Git repos via `mkdtempSync` + local `git init`.
+- Especially cover: unborn repos; staged/unstaged/untracked; binary/unreadable files; checkpoint continue vs steering; concurrent-sibling reservations; deferred rebase / abandon; scheduler races; malformed reviews.
+- Pi gate/lifecycle tests use injectable fakes — no pi runtime required.
+- When modifying a pure helper, add focused cases in its existing test file.
 
 ## Change workflow
 
-1. Read the relevant source module and its colocated conceptual test file under `test/`.
+1. Read the relevant `core/` or `adapters/` module and its tests.
 2. Make the smallest focused change that satisfies the task.
-3. Add or update tests with the implementation, particularly for changed edge cases.
+3. Add or update tests with the implementation.
 4. Run the focused test file during iteration.
 5. Run `npm test` and `npm run typecheck` before completion.
-6. Inspect `git diff --check` and `git diff` to catch whitespace problems and unintended edits.
+6. For pi packaging changes, run `npm run smoke:pi`.
+7. Inspect `git diff --check` and `git diff`.
 
 Avoid unrelated refactors, dependency upgrades, generated artifacts, or changes to runtime defaults unless the task requires them.
 
 ## Human collaboration expectations
-
-This repository implements a driver/navigator workflow and should be changed with the same discipline:
 
 - State intent briefly before making a change.
 - Prefer small, reviewable edits and validate them promptly.

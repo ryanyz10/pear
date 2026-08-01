@@ -1,26 +1,46 @@
 {
   "name": "pear",
   "version": "0.1.0",
-  "description": "Lean pair-programming harness — agent drives or navigates with you",
+  "description": "Pair-programming loop core + host adapters (pi extension first): checkpoints, navigator reviews, human-only findings",
   "type": "module",
-  "bin": {
-    "pear": "./bin/pear"
-  },
+  "keywords": [
+    "pi-package",
+    "pair-programming",
+    "code-review"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
-    "start": "./bin/pear",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke:pi": "bash scripts/smoke-pi.sh"
+  },
+  "pi": {
+    "extensions": [
+      "./adapters/pi/extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "^0.83.0",
     "@earendil-works/pi-ai": "^0.83.0",
     "@earendil-works/pi-tui": "^0.83.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.83.0",
     "@types/node": "^22.15.0",
     "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   }
 }

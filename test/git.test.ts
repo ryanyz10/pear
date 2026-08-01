@@ -12,7 +12,7 @@ import {
   isGitRepo,
   parseZPaths,
   stateHash,
-} from "../src/git.ts";
+} from "../core/git.ts";
 
 function git(cwd: string, args: string[]) {
   const r = spawnSync("git", args, { cwd, encoding: "utf8" });

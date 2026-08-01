@@ -11,5 +11,5 @@
     "rootDir": ".",
     "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["core/**/*.ts", "adapters/**/*.ts", "test/**/*.ts"]
 }

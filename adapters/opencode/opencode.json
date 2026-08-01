@@ -1,0 +1,4 @@
+{
+  "permission": { "edit": "ask", "bash": "ask" },
+  "plugin": ["pear"]
+}

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "node --experimental-strip-types adapters/cursor/hooks/pre-tool-use.ts"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "node --experimental-strip-types adapters/cursor/hooks/before-shell-execution.ts"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node --experimental-strip-types adapters/cursor/hooks/post-tool-use.ts"
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "node --experimental-strip-types adapters/cursor/hooks/session-start.ts"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "node --experimental-strip-types adapters/cursor/hooks/session-end.ts"
+      }
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseFindings, triage, type Finding } from "../src/review.ts";
+import { parseFindings, triage, type Finding } from "../core/review.ts";
 
 const f = (partial: Partial<Finding> & Pick<Finding, "size" | "confidence">): Finding => ({
   file: "a.ts",

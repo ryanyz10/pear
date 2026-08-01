@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createScheduler, type SchedulerHooks } from "../src/navigate.ts";
+import { createScheduler, type SchedulerHooks } from "../core/navigate.ts";
 
 type Fake = {
   now: number;
