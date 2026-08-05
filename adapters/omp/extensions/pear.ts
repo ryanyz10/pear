@@ -138,13 +138,15 @@ export default function (pi: ExtensionAPI) {
     session?.onTurnEnd();
   });
 
-  pi.on("tool_call", async (event, _ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (!session) return undefined;
-    return session.onToolCall({
+    const decision = await session.onToolCall({
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       input: event.input as Record<string, unknown>,
     });
+    if (decision?.block) ctx.abort();
+    return decision;
   });
 
   pi.on("tool_result", (event) => {

@@ -20,6 +20,7 @@ import {
   type SchedulerHooks,
 } from "../../core/navigate.ts";
 import { formatFindings } from "../../core/review.ts";
+import { blockMessage } from "./conversational.ts";
 
 export { ACK_CONTRACT, STEERING_CONTRACT };
 
@@ -365,19 +366,20 @@ export function createPearSession(deps: PearDeps): PearSession {
       safeFiles(),
     );
 
+    // Never await a human inside a tool_call: omp caps handlers at ~30s and
+    // injects that abort into ui.input, which then resolves `undefined`. The old
+    // code read that as an empty answer and returned ACK_CONTRACT — telling the
+    // model to re-issue and continue as if the human had approved. Decide
+    // synchronously instead, latch the rest of the batch, and route the actual
+    // review to the chat turn, where the human has no deadline.
+    suppressMutations = true;
+    resetAfterCheckpoint();
     try {
-      const raw = await deps.ui.input(summary, "Enter = continue, or type steering");
-      const text = (raw ?? "").trim();
-      resetAfterCheckpoint();
-      suppressMutations = true;
-      if (!text) return { block: true, reason: ACK_CONTRACT };
-      return { block: true, reason: STEERING_CONTRACT + text };
+      deps.ui.notify(summary, "warning");
     } catch {
-      // Fail open: same pending-aware reset, then reserve + allow.
-      resetAfterCheckpoint();
-      checkpoint.reserve(event.toolCallId);
-      return undefined;
+      /* best-effort surfacing; the returned block still carries the summary */
     }
+    return { block: true, reason: STEERING_CONTRACT + blockMessage(summary) };
   };
 
   const onToolResult = (toolCallId: string, isError: boolean) => {
@@ -397,6 +399,8 @@ export function createPearSession(deps: PearDeps): PearSession {
   };
 
   const onAgentStart = () => {
+    // A new agent turn is the human's reply after an aborted checkpoint.
+    suppressMutations = false;
     if (!scheduler) return;
     const wasPending =
       scheduler.getState() === "PENDING" || scheduler.getState() === "WAITING_INTERVAL";
@@ -413,7 +417,6 @@ export function createPearSession(deps: PearDeps): PearSession {
 
   const onAgentEnd = async () => {
     const lines = safeLines() ?? checkpoint.getBaselineLines();
-    let pendingSteer = "";
     try {
       if (deps.ui.hasUI && checkpoint.check({ lines })) {
         const snap = checkpoint.snapshot();
@@ -426,14 +429,14 @@ export function createPearSession(deps: PearDeps): PearSession {
           safeFiles(),
         );
         try {
-          pendingSteer = ((await deps.ui.input(summary)) ?? "").trim();
+          // agent_end has the same host deadline as tool_call; never await UI.
+          deps.ui.notify(summary, "warning");
         } finally {
-          // agent_end NEVER defers — turn_end already passed.
           checkpoint.resetBaseline(lines);
         }
       }
     } catch {
-      /* headless or UI failure: skip prompt */
+      /* headless or UI failure: cleanup below still runs */
     } finally {
       try {
         scheduler?.markReviewed(hashFn(cwd));
@@ -444,18 +447,6 @@ export function createPearSession(deps: PearDeps): PearSession {
         scheduler?.setAgentActive(false);
       } finally {
         refreshStatus();
-      }
-    }
-
-    if (pendingSteer) {
-      try {
-        deps.sendUserMessage(pendingSteer);
-      } catch {
-        try {
-          if (deps.ui.hasUI) deps.ui.notify(pendingSteer, "info");
-        } catch {
-          /* swallow: cleanup already complete */
-        }
       }
     }
   };

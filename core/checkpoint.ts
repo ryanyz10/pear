@@ -22,14 +22,15 @@ export type Checkpoint = {
   snapshot: () => CheckpointSnapshot;
 };
 
-/** Build the checkpoint summary (byte-compatible with pear's gate text). */
+/** Build the checkpoint summary. */
 export function buildSummary(
   label: string,
   delta: { lines: number; mutations: number },
   files: string[],
 ): string {
-  const filePart = files.length
-    ? `\nfiles: ${files.slice(0, 12).join(", ")}${files.length > 12 ? "…" : ""}`
+  const visibleFiles = files.slice(0, 12);
+  const filePart = visibleFiles.length
+    ? `\nfiles:\n${visibleFiles.map((file) => `- ${file}`).join("\n")}${files.length > 12 ? "\n…" : ""}`
     : "";
   return (
     `── checkpoint ──\n` +

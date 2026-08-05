@@ -21,7 +21,7 @@ describe("buildSummary", () => {
     const s = buildSummary("write a.ts", { lines: 10, mutations: 2 }, ["a.ts", "b.ts"]);
     assert.match(s, /── checkpoint ──/);
     assert.match(s, /\+10 lines \/ 2 mutations/);
-    assert.match(s, /files: a\.ts, b\.ts/);
+    assert.match(s, /files:\n- a\.ts\n- b\.ts/);
     assert.match(s, /about to: write a\.ts/);
     assert.match(s, /Enter = continue/);
   });

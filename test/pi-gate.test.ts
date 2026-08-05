@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import {
-  ACK_CONTRACT,
   STEERING_CONTRACT,
   SUPERSEDED_REASON,
   createPearSession,
@@ -89,20 +88,23 @@ describe("pi-gate under budget", () => {
 });
 
 describe("pi-gate always-block checkpoint", () => {
-  it("empty input → ACK_CONTRACT, no reservation, suppresses batch", async () => {
+  it("blocks immediately with a conversational checkpoint and suppresses the batch", async () => {
     const ui = fakeUi();
     const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a.ts" } });
     s.onToolResult("a", false);
 
-    ui.inputs.push("");
     const blocked = await s.onToolCall({
       toolCallId: "b",
       toolName: "write",
       input: { path: "b.ts" },
     });
-    assert.deepEqual(blocked, { block: true, reason: ACK_CONTRACT });
+    assert.equal(blocked?.block, true);
+    assert.ok(blocked?.reason.startsWith(STEERING_CONTRACT));
+    assert.match(blocked?.reason ?? "", /── checkpoint ──/);
+    assert.match(blocked?.reason ?? "", /Relay this checkpoint to the user/);
     assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.match(ui.notifies.at(-1)?.message ?? "", /about to: write b\.ts/);
 
     const sibling = await s.onToolCall({
       toolCallId: "c",
@@ -121,23 +123,33 @@ describe("pi-gate always-block checkpoint", () => {
     assert.equal(next, undefined);
     assert.equal(s.checkpoint.snapshot().pending, 1);
   });
+  it("clears suppression at the next agent turn after an abort", async () => {
+    const ui = fakeUi();
+    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    await s.onToolCall({ toolCallId: "a", toolName: "write", input: {} });
+    s.onToolResult("a", false);
+    const blocked = await s.onToolCall({ toolCallId: "b", toolName: "write", input: {} });
+    assert.equal(blocked?.block, true);
 
-  it("steering text → STEERING_CONTRACT + text and suppresses", async () => {
+    s.onAgentStart();
+    const next = await s.onToolCall({ toolCallId: "c", toolName: "write", input: {} });
+    assert.equal(next, undefined);
+  });
+
+  it("uses the canonical steering contract in the immediate block", async () => {
     const ui = fakeUi();
     const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "bash", input: { command: "true" } });
     s.onToolResult("a", false);
 
-    ui.inputs.push("stop and rethink");
     const blocked = await s.onToolCall({
       toolCallId: "b",
       toolName: "bash",
       input: { command: "rm -rf /" },
     });
-    assert.deepEqual(blocked, {
-      block: true,
-      reason: STEERING_CONTRACT + "stop and rethink",
-    });
+    assert.equal(blocked?.block, true);
+    assert.ok(blocked?.reason.includes(STEERING_CONTRACT));
+    assert.match(blocked?.reason ?? "", /awaiting user reply/);
     const sibling = await s.onToolCall({
       toolCallId: "c",
       toolName: "write",
@@ -147,32 +159,31 @@ describe("pi-gate always-block checkpoint", () => {
   });
 });
 
-describe("pi-gate headless and fail-open", () => {
+
+describe("pi-gate headless and immediate block", () => {
   it("hasUI=false allows without reserving", async () => {
     const ui = fakeUi(false);
     const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
     s.onToolResult("a", false);
-    // over budget but headless
     const d = await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
     assert.equal(d, undefined);
     assert.equal(s.checkpoint.snapshot().pending, 0);
-    s.onToolResult("b", false); // no-op settle
+    s.onToolResult("b", false);
     assert.equal(s.checkpoint.snapshot().confirmed, 1);
   });
 
-  it("input throw fails open with reservation after pending-aware reset", async () => {
+  it("UI presence never waits for input inside a tool call", async () => {
     const ui = fakeUi();
     const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
     s.onToolResult("a", false);
 
-    ui.inputs.push(new Error("ui down"));
     const d = await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
-    assert.equal(d, undefined);
-    assert.equal(s.checkpoint.snapshot().pending, 1);
-    s.onToolResult("b", false);
-    assert.equal(s.checkpoint.snapshot().confirmed, 1);
+    assert.equal(d?.block, true);
+    assert.match(d?.reason ?? "", /NOT EXECUTED/);
+    assert.equal(ui.inputs.length, 0);
+    assert.equal(s.checkpoint.snapshot().pending, 0);
   });
 });
 
@@ -202,6 +213,23 @@ describe("pi-gate concurrent siblings", () => {
     // blocked c3 settle no-ops
     s.onToolResult("c3", true);
     assert.equal(s.checkpoint.snapshot().pending, 0);
+  });
+  it("synchronously suppresses concurrent siblings before either can prompt", async () => {
+    const ui = fakeUi();
+    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    await s.onToolCall({ toolCallId: "seed", toolName: "write", input: {} });
+    s.onToolResult("seed", false);
+
+    const [first, sibling] = await Promise.all([
+      s.onToolCall({ toolCallId: "first", toolName: "write", input: {} }),
+      s.onToolCall({ toolCallId: "sibling", toolName: "edit", input: {} }),
+    ]);
+    assert.ok(first?.reason.startsWith(STEERING_CONTRACT));
+    assert.deepEqual(sibling, { block: true, reason: SUPERSEDED_REASON });
+    assert.equal(
+      ui.notifies.filter(({ message }) => message.includes("── checkpoint ──")).length,
+      1,
+    );
   });
 });
 
