@@ -6,9 +6,11 @@ import { tmpdir } from "node:os";
 import {
   createPearSession,
   PERSONA_APPEND,
+  resolveFlags,
   type PearFlags,
   type PearDeps,
 } from "../adapters/pi/runtime.ts";
+import { DEFAULTS } from "../core/config.ts";
 import { createScheduler } from "../core/navigate.ts";
 
 const flags = (over: Partial<PearFlags> = {}): PearFlags => ({
@@ -20,6 +22,23 @@ const flags = (over: Partial<PearFlags> = {}): PearFlags => ({
   debounceSeconds: 1,
   intervalSeconds: 1,
   ...over,
+});
+
+describe("resolveFlags", () => {
+  it("falls back to DEFAULTS.navModel with no flag and no fallback arg", () => {
+    const result = resolveFlags(() => undefined);
+    assert.equal(result.navModel, DEFAULTS.navModel);
+  });
+
+  it("uses the fallback arg when no flag is passed", () => {
+    const result = resolveFlags(() => undefined, "x/y");
+    assert.equal(result.navModel, "x/y");
+  });
+
+  it("prefers the flag over any fallback", () => {
+    const result = resolveFlags((name) => (name === "nav-model" ? "a/b" : undefined), "x/y");
+    assert.equal(result.navModel, "a/b");
+  });
 });
 
 function fakeUi(hasUI = true) {

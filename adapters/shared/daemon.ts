@@ -18,7 +18,8 @@ import {
   appendFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { DEFAULTS, parseModel } from "../../core/config.ts";
+import { homedir } from "node:os";
+import { DEFAULTS, parseModel, resolveNavModelPreference } from "../../core/config.ts";
 import { changedLines, diffText, gitOk, stateHash } from "../../core/git.ts";
 import { runReview } from "../../core/llm.ts";
 import { createScheduler } from "../../core/navigate.ts";
@@ -243,16 +244,16 @@ if (isMain) {
   const args = process.argv.slice(2);
   let cwd = process.cwd();
   let stop = false;
-  let navModel: string = DEFAULTS.navModel;
+  let navModelArg: string | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--cwd") cwd = args[++i]!;
     else if (args[i] === "--stop") stop = true;
-    else if (args[i] === "--nav-model") navModel = args[++i]!;
+    else if (args[i] === "--nav-model") navModelArg = args[++i]!;
   }
   if (stop) {
     process.exit(stopDaemon(cwd) ? 0 : 1);
   }
-  // Validate model spec early
+  const navModel = navModelArg ?? resolveNavModelPreference(cwd, homedir()) ?? DEFAULTS.navModel;
   parseModel(navModel);
   void REVIEW_SYSTEM;
   runDaemonLoop({ cwd, navModel });

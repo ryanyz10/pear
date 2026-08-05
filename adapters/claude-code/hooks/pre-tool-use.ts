@@ -1,4 +1,4 @@
-import { gateTool } from "../../shared/hook-checkpoint.ts";
+import { gateTool } from "../_vendor/adapters/shared/hook-checkpoint.ts";
 import {
   isMutatingTool,
   readStdinJson,
@@ -7,7 +7,7 @@ import {
   resolveToolInput,
   resolveToolName,
   writeJson,
-} from "../../shared/hook-io.ts";
+} from "../_vendor/adapters/shared/hook-io.ts";
 
 const body = await readStdinJson<Record<string, unknown>>();
 const cwd = resolveCwd(body);

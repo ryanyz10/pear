@@ -1,5 +1,5 @@
-import { readStdinJson, resolveCwd, writeJson } from "../../shared/hook-io.ts";
-import { drainFindings } from "../../shared/daemon.ts";
+import { readStdinJson, resolveCwd, writeJson } from "../_vendor/adapters/shared/hook-io.ts";
+import { drainFindings } from "../_vendor/adapters/shared/daemon.ts";
 
 const body = await readStdinJson<Record<string, unknown>>();
 const cwd = resolveCwd(body);

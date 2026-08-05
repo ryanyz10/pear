@@ -3,7 +3,7 @@ import {
   loadState,
   saveState,
   settle,
-} from "../../shared/hook-checkpoint.ts";
+} from "../_vendor/adapters/shared/hook-checkpoint.ts";
 import {
   readStdinJson,
   resolveCallId,
@@ -11,8 +11,8 @@ import {
   resolveToolName,
   isMutatingTool,
   writeJson,
-} from "../../shared/hook-io.ts";
-import { drainFindings } from "../../shared/daemon.ts";
+} from "../_vendor/adapters/shared/hook-io.ts";
+import { drainFindings } from "../_vendor/adapters/shared/daemon.ts";
 
 const body = await readStdinJson<Record<string, unknown>>();
 const cwd = resolveCwd(body);
@@ -20,7 +20,8 @@ const toolName = resolveToolName(body);
 
 if (isMutatingTool(toolName)) {
   let state = loadState(cwd);
-  state = settle(state, resolveCallId(body), !(body.is_error ?? body.isError));
+  const ok = body.hook_event_name !== "PostToolUseFailure";
+  state = settle(state, resolveCallId(body), ok);
   state = finishRebaseIfNeeded(cwd, state);
   saveState(cwd, state);
 }

@@ -1,18 +1,23 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { streamSimple } from "@earendil-works/pi-ai/compat";
-import { Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+// Host-package imports MUST target package roots: omp's extension loader remaps
+// `@oh-my-pi/pi-*` roots onto the copies bundled in the running binary, but a
+// subpath like `@oh-my-pi/pi-ai/stream` falls through to the plugin's own
+// node_modules and fails on transitive `@oh-my-pi/pi-catalog/*` imports.
+import { completeSimple } from "@oh-my-pi/pi-ai";
+import { Text } from "@oh-my-pi/pi-tui";
 import { homedir } from "node:os";
 import { DEFAULTS, resolveNavModelPreference, saveUserConfig } from "../../../core/config.ts";
 import { gitOk } from "../../../core/git.ts";
 import {
+  PERSONA_APPEND,
   createPearSession,
   maybeOnboardNavModel,
   resolveFlags,
-  resolveNavComplete,
   type PearSession,
-} from "../runtime.ts";
+} from "../../shared/pear-runtime.ts";
+import { resolveNavComplete } from "../runtime.ts";
 
-type FindingsData = { lines: string };
+const NAV_TYPE = "pear-nav";
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("nav-model", {
@@ -50,10 +55,23 @@ export default function (pi: ExtensionAPI) {
     default: String(DEFAULTS.intervalSeconds),
   });
 
-  pi.registerEntryRenderer<FindingsData>("pear-nav", (entry, _opts, theme) => {
-    const lines = entry.data?.lines ?? "";
-    return new Text(theme.fg("accent", lines), 0, 0);
+  pi.registerMessageRenderer(NAV_TYPE, (message, _options, theme) => {
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : message.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+    return new Text(theme.fg("accent", text), 0, 0);
   });
+
+  // Findings are human-only: strip them before the message list reaches the LLM.
+  // omp's convertMessageToLlm turns every surviving `role: "custom"` message into
+  // a `developer` message regardless of `display`, so without this filter the
+  // navigator's review text would leak into the model's context on the next turn.
+  pi.on("context", async (event) => ({
+    messages: event.messages.filter(
+      (m) => !(m.role === "custom" && m.customType === NAV_TYPE),
+    ),
+  }));
 
   let session: PearSession | null = null;
 
@@ -76,11 +94,7 @@ export default function (pi: ExtensionAPI) {
       save: (cfg) => saveUserConfig(homeDir, cfg),
     });
     const flags = resolveFlags((name) => pi.getFlag(name), onboarded ?? preference ?? DEFAULTS.navModel);
-    const complete = await resolveNavComplete(
-      ctx.modelRegistry,
-      flags.navModel,
-      streamSimple as any,
-    );
+    const complete = await resolveNavComplete(ctx.modelRegistry, flags.navModel, completeSimple);
 
     session = createPearSession({
       cwd: ctx.cwd,
@@ -92,7 +106,11 @@ export default function (pi: ExtensionAPI) {
         setStatus: (key, text) => ctx.ui.setStatus(key, text),
       },
       complete,
-      onFindings: (text) => pi.appendEntry<FindingsData>("pear-nav", { lines: text }),
+      onFindings: (text) =>
+        pi.sendMessage(
+          { customType: NAV_TYPE, content: text, display: true },
+          { triggerTurn: false },
+        ),
       sendUserMessage: (text) => pi.sendUserMessage(text),
     });
     session.start();
@@ -105,7 +123,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event) => {
     if (!session) return undefined;
-    return { systemPrompt: session.personaSystemPrompt(event.systemPrompt) };
+    return { systemPrompt: [...event.systemPrompt, PERSONA_APPEND] };
   });
 
   pi.on("agent_start", (_event, _ctx) => {

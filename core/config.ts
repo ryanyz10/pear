@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 export type Config = {
   cwd: string;
   driveModel: string;
@@ -59,4 +62,32 @@ export function parseModel(spec: string): { provider: string; id: string } {
     throw new Error(`Invalid --model '${spec}'; expected provider/id (e.g. anthropic/claude-sonnet-4-5)`);
   }
   return { provider: spec.slice(0, i), id: spec.slice(i + 1) };
+}
+
+export type PearUserConfig = { navModel?: string };
+
+/** Reads `<baseDir>/.pear/config.json`. Missing, malformed, or invalid-model config → `{}`. */
+export function loadUserConfig(baseDir: string): PearUserConfig {
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(baseDir, ".pear", "config.json"), "utf8"),
+    ) as Record<string, unknown>;
+    if (typeof raw.navModel !== "string") return {};
+    parseModel(raw.navModel);
+    return { navModel: raw.navModel };
+  } catch {
+    return {};
+  }
+}
+
+/** Writes `<baseDir>/.pear/config.json`, creating the `.pear` dir if needed. */
+export function saveUserConfig(baseDir: string, cfg: PearUserConfig): void {
+  if (cfg.navModel !== undefined) parseModel(cfg.navModel);
+  mkdirSync(join(baseDir, ".pear"), { recursive: true });
+  writeFileSync(join(baseDir, ".pear", "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+}
+
+/** Project config (`projectDir/.pear/config.json`) overrides global (`homeDir/.pear/config.json`). */
+export function resolveNavModelPreference(projectDir: string, homeDir: string): string | undefined {
+  return loadUserConfig(projectDir).navModel ?? loadUserConfig(homeDir).navModel;
 }

@@ -14,7 +14,10 @@
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "smoke:pi": "bash scripts/smoke-pi.sh"
+    "setup": "node --experimental-strip-types adapters/shared/setup.ts",
+    "smoke:pi": "bash scripts/smoke-pi.sh",
+    "smoke:claude": "bash scripts/smoke-claude.sh",
+    "smoke:omp": "bash scripts/smoke-omp.sh"
   },
   "pi": {
     "extensions": [
@@ -24,22 +27,36 @@
       "./skills"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./adapters/omp/extensions/pear.ts"
+    ]
+  },
   "dependencies": {
     "@earendil-works/pi-ai": "^0.83.0",
-    "@earendil-works/pi-tui": "^0.83.0"
+    "@earendil-works/pi-tui": "^0.83.0",
+    "@oh-my-pi/pi-ai": "^17.2.8",
+    "@oh-my-pi/pi-tui": "^17.2.8"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@oh-my-pi/pi-coding-agent": "^17.2.8",
     "@types/node": "^22.15.0",
     "typescript": "^5.8.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "@oh-my-pi/pi-coding-agent": "*",
+    "@oh-my-pi/pi-ai": "*",
+    "@oh-my-pi/pi-tui": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@oh-my-pi/pi-coding-agent": {
       "optional": true
     }
   }

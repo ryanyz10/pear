@@ -1,0 +1,13 @@
+{
+  "name": "pear",
+  "owner": { "name": "ryanyz10" },
+  "description": "Pear pair-programming loop core and host adapters",
+  "plugins": [
+    {
+      "name": "pear-claude-code",
+      "source": "./adapters/claude-code",
+      "description": "Pair-programming checkpoints and navigator daemon for Claude Code",
+      "author": { "name": "ryanyz10" }
+    }
+  ]
+}

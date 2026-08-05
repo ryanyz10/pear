@@ -1,5 +1,6 @@
 {
-  "name": "pear",
+  "name": "pear-claude-code",
   "version": "0.1.0",
-  "description": "Pair-programming checkpoints and navigator daemon for Claude Code"
+  "description": "Pair-programming checkpoints and navigator daemon for Claude Code",
+  "author": { "name": "ryanyz10" }
 }

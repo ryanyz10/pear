@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types adapters/claude-code/hooks/pre-tool-use.ts"
+            "command": "node",
+            "args": ["--experimental-strip-types", "${CLAUDE_PLUGIN_ROOT}/hooks/pre-tool-use.ts"]
           }
         ]
       }
@@ -16,7 +17,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types adapters/claude-code/hooks/post-tool-use.ts"
+            "command": "node",
+            "args": ["--experimental-strip-types", "${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-use.ts"]
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["--experimental-strip-types", "${CLAUDE_PLUGIN_ROOT}/hooks/post-tool-use.ts"]
           }
         ]
       }
@@ -26,7 +39,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types adapters/claude-code/hooks/user-prompt-submit.ts"
+            "command": "node",
+            "args": ["--experimental-strip-types", "${CLAUDE_PLUGIN_ROOT}/hooks/user-prompt-submit.ts"]
           }
         ]
       }
@@ -36,7 +50,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types adapters/claude-code/hooks/session-start.ts"
+            "command": "node",
+            "args": ["--experimental-strip-types", "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.ts"]
           }
         ]
       }
@@ -46,7 +61,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node --experimental-strip-types adapters/claude-code/hooks/session-end.ts"
+            "command": "node",
+            "args": ["--experimental-strip-types", "${CLAUDE_PLUGIN_ROOT}/hooks/session-end.ts"]
           }
         ]
       }
