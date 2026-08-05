@@ -1,13 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseFindings, triage, type Finding } from "../core/review.ts";
-
-const f = (partial: Partial<Finding> & Pick<Finding, "size" | "confidence">): Finding => ({
-  file: "a.ts",
-  line: 1,
-  issue: "x",
-  ...partial,
-});
+import { parseFindings } from "../core/review.ts";
 
 describe("parseFindings", () => {
   it("parses a plain JSON array", () => {
@@ -29,20 +22,5 @@ describe("parseFindings", () => {
     assert.throws(() => parseFindings(`{"file":"a"}`), /not a JSON array/);
     assert.throws(() => parseFindings(`[{"file":"a","line":"1","issue":"x","size":"small","confidence":"low"}]`), /line must be/);
     assert.throws(() => parseFindings(`[{"file":"a","line":1,"issue":"x","size":"tiny","confidence":"low"}]`), /invalid size/);
-  });
-});
-
-describe("triage", () => {
-  it("drops small+low only", () => {
-    const all: Finding[] = [
-      f({ size: "small", confidence: "low" }),
-      f({ size: "small", confidence: "medium" }),
-      f({ size: "medium", confidence: "low" }),
-      f({ size: "large", confidence: "high" }),
-    ];
-    const { kept, filtered } = triage(all);
-    assert.equal(filtered, 1);
-    assert.equal(kept.length, 3);
-    assert.ok(!kept.some((x) => x.size === "small" && x.confidence === "low"));
   });
 });

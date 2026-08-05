@@ -41,21 +41,18 @@ fail() {
   exit 1
 }
 
-# Fails closed: every leg must reach the marker, so an early crash, a hang, or
-# empty output is a failure rather than a silent pass. `--pause-edits` only
-# parses once pear's factory registered it, which is the load signal proper.
 check_loaded() {
   local label="$1"
   [[ "$STATUS" -ne 124 ]] || fail "$label timed out after ${TIMEOUT}s"
   ! grep -q "Failed to load extension" <<<"$OUT" || fail "$label reported a load failure"
-  ! grep -q "unknown flag" <<<"$OUT" || fail "$label did not register pear's flags"
+  ! grep -q "unknown flag" <<<"$OUT" || fail "$label rejected a flag"
   grep -qF "$MARKER" <<<"$OUT" || fail "$label did not reach model selection (expected \"$MARKER\")"
 }
 
-echo "== leg a: --extension dev-path registers pear's flags =="
+echo "== leg a: --extension dev-path loads pear.ts with no flags registered =="
 export HOME="$WORKDIR/home-a"
 mkdir -p "$HOME"
-run_omp --extension "$EXT" --pause-edits 1 --no-session --cwd "$REPO" --model "$NO_MODEL" -p ""
+run_omp --extension "$EXT" --no-session --cwd "$REPO" --model "$NO_MODEL" -p ""
 check_loaded "adapters/omp/extensions/pear.ts (--extension)"
 echo "ok: pear.ts loads cleanly via --extension"
 
@@ -63,8 +60,11 @@ echo "== leg b: omp plugin link + ambient discovery loads the same extension =="
 export HOME="$WORKDIR/home-b"
 mkdir -p "$HOME"
 timeout 120 omp plugin link "$ROOT" --scope user >/dev/null
-run_omp --pause-edits 1 --no-session --cwd "$REPO" --model "$NO_MODEL" -p ""
+run_omp --no-session --cwd "$REPO" --model "$NO_MODEL" -p ""
 check_loaded "linked pear plugin (ambient discovery)"
 echo "ok: omp plugin link + ambient discovery loads pear.ts cleanly"
+
+echo "== leg c: deterministic gate proof — checkpoint block, off passthrough, human-driver fallback =="
+node --experimental-strip-types "$ROOT/scripts/smoke-pear-runtime.ts"
 
 echo "smoke-omp: all legs passed"

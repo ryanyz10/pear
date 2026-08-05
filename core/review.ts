@@ -39,11 +39,6 @@ export function parseFindings(raw: string): Finding[] {
   return out;
 }
 
-/** Discard small+low; keep everything else. */
-export function triage(findings: Finding[]): { kept: Finding[]; filtered: number } {
-  const kept = findings.filter((f) => !(f.size === "small" && f.confidence === "low"));
-  return { kept, filtered: findings.length - kept.length };
-}
 
 export function formatFindings(kept: Finding[], filtered: number): string {
   if (kept.length === 0) {
@@ -65,3 +60,7 @@ export const REVIEW_SYSTEM = `You are a code navigator reviewing a human's uncom
 Return ONLY a JSON array of findings. Each finding:
 { "file": string, "line": number, "issue": string, "size": "small"|"medium"|"large", "confidence": "low"|"medium"|"high" }
 Be specific. Prefer high-confidence, real problems. Empty array [] if nothing worth raising.`;
+
+export const FILTER_SYSTEM = `You are a senior reviewer checking a junior reviewer's findings against a diff.
+You will receive the diff and a JSON array of candidate findings (same shape as before).
+Return ONLY a JSON array containing the subset of those findings that are both CORRECT (the diff actually has this problem) and IMPORTANT enough to interrupt a human for. Copy qualifying findings' fields exactly, unchanged. Empty array if none qualify.`;

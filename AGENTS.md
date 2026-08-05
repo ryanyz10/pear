@@ -2,7 +2,7 @@
 
 ## Project overview
 
-`pear` is a pair-programming **loop core** plus thin **host adapters**. The loop gates mutating tool calls with human checkpoints and, in Git repos, runs a background **navigator** that reviews uncommitted changes. Findings are human-only by default.
+`pear` is a pair-programming **loop core** plus thin **host adapters**. The loop runs in exactly one of three mutually exclusive modes per project — `off` (default), `agent-driver` (gates mutating tool calls with wall-clock + change-count checkpoints), or `human-driver` (runs a background **navigator** that reviews the human's uncommitted changes with a two-stage review). Findings are human-only by default.
 
 - Runtime: Node.js **>= 22.19.0** (`.tool-versions` pins the local version).
 - Language: TypeScript in native ESM / `NodeNext` mode.
@@ -73,40 +73,50 @@ There is no configured formatter or linter. Preserve the surrounding file’s fo
 ### Checkpoint accounting (`core/checkpoint.ts`)
 
 - Mutation counters are **relative to the last reset**; the mutation baseline is always 0.
+- Time+count baseline: `checkpointDue` (in `core/config.ts`) fires when elapsed wall-clock time ≥ `checkpointSeconds` OR change count ≥ `maxChangesPerCheckpoint` — a pure OR gate.
 - `check` before `reserve`; settle by `toolCallId` (unknown ids no-op).
-- Mid-batch reset uses `resetBaseline(null)` → `rebasePending`; `finishRebase` only at the first following `turn_end`, or `abandonRebase` on read failure. Never leave `rebasePending` across turns.
+- `resetBaseline(now, fileHashes)` is synchronous and immediate — no rebase/deferral exists. Both the time baseline and the file-hash baseline advance together, always, at every reset site.
+- `filesSinceBaseline` / `filesSincePersistedBaseline` return only paths whose hash changed since the last reset — a checkpoint summary never re-lists a file an earlier checkpoint already showed.
 - Contract strings are canonical and cross-host: `STEERING_CONTRACT`, `ACK_CONTRACT`.
 
-### Pi adapter gate
+### Mode exclusivity (all adapters)
+
+- Exactly one mode is active per project at a time: `off`, `human-driver`, `agent-driver` — resolved via `core/config.ts`'s `resolveConfig` from `.pear/config.json` (project) + `~/.pear/config.json` (global model fallback only; mode/cadence have no global fallback).
+- `agent-driver` → checkpoint only, no scheduler/poll. `human-driver` → scheduler/poll only, no checkpoint gate. `off` → neither. Never both loops at once, in any adapter.
+- Pi/omp: `/pear-mode` and `/pear-config` in-chat commands drive `PearSession.setMode`. Hook hosts (Cursor, Claude Code, OpenCode) have no in-chat command surface: mode/config is file-only, via `.pear/config.json` and `npm run setup`.
+
+### Pi/omp adapter gate (`adapters/shared/pear-runtime.ts`)
 
 - Mutating tools: `write` / `edit` / `bash`.
-- Over budget + UI → always **block** the triggering call (`ACK_CONTRACT` or `STEERING_CONTRACT + text`) and suppress the rest of the batch until `turn_end`.
-- Headless (`hasUI=false`) allows without reserving. UI input throw fails open (reset + reserve + allow).
-- Git detection via `gitOk(cwd)`, not `stateHash` try/catch. All line reads go through a guarded helper.
+- The checkpoint gate is active only in `agent-driver` mode. Over budget + UI → always **block** the triggering call (`ACK_CONTRACT` or `STEERING_CONTRACT + text`) and suppress the rest of the batch until `turn_end`.
+- Headless (`hasUI=false`) allows without reserving.
+- Git detection via `gitOk(cwd)`. All file-hash reads go through a guarded `safeFileHashes` helper, never unguarded.
 
 ### Navigator scheduler (`core/navigate.ts`)
 
 - States: `IDLE`, `PENDING`, `WAITING_INTERVAL`, `REVIEWING`.
-- Single in-flight review. Driver turns park scheduling (`setAgentActive`).
+- Single in-flight review. No agent-turn coupling — in `human-driver` mode the agent is never the one editing, so there is nothing to park (`setAgentActive`/`isParked`/`markReviewed` do not exist).
 - Reviews are debounced, min-size gated, interval-limited, and deduplicated by content-sensitive state hash.
+- The 2-second poll uses `quickStateHash` (metadata-only, cheap, never reads file contents); the authoritative `diffText`/full-content `stateHash` only run once debounce/min-lines gating decides to review.
 - Scheduler changes are race-prone — add fake-timer tests for every state transition.
 
 ### Review protocol
 
-- `REVIEW_SYSTEM` requires a JSON array of findings. Keep schema in `core/review.ts` and the prompt synchronized.
+- `REVIEW_SYSTEM` requires a JSON array of findings; `FILTER_SYSTEM` has a second, stronger model filter those findings. Keep both schemas in `core/review.ts` synchronized with the prompts.
 - Parse defensively. Malformed responses become navigator errors, not session crashes.
-- Triage: only `small` + `low` findings are filtered.
+- Two-stage filtering replaces the old heuristic triage: only findings the filter model echoes back (matching file/line/issue) survive; an invented finding is dropped.
 - Findings are human-only by default on every host.
 
 ### Non-git cwd
 
-- Navigator off; mutation-count pacing only.
+- `agent-driver`'s cadence is git-independent (pure wall-clock + count); file-hash display degrades gracefully to an empty list on git failure.
+- `human-driver` requires git; a non-git cwd falls back to `off` for that session without changing persisted config.
 
 ## Testing guidance
 
 - Tests use `node:test` and `node:assert/strict`.
 - Keep tests independent and deterministic. Temp Git repos via `mkdtempSync` + local `git init`.
-- Especially cover: unborn repos; staged/unstaged/untracked; binary/unreadable files; checkpoint continue vs steering; concurrent-sibling reservations; deferred rebase / abandon; scheduler races; malformed reviews.
+- Especially cover: unborn repos; staged/unstaged/untracked; binary/unreadable files; checkpoint continue vs steering; concurrent-sibling reservations; mode-exclusivity transitions; checkpoint file-hash provenance across resets; scheduler races; malformed reviews.
 - Pi gate/lifecycle tests use injectable fakes — no pi runtime required.
 - When modifying a pure helper, add focused cases in its existing test file.
 

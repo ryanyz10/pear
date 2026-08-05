@@ -3,7 +3,11 @@ export async function readStdinJson<T extends Record<string, unknown>>(): Promis
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
   const text = Buffer.concat(chunks).toString("utf8").trim();
   if (!text) return {} as T;
-  return JSON.parse(text) as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {} as T; // fail open on malformed stdin — treat as an empty/unknown event
+  }
 }
 
 export function writeJson(obj: unknown): void {

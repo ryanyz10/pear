@@ -19,10 +19,7 @@ export type SchedulerHooks = {
 export type Scheduler = {
   /** Notify of a content-sensitive state hash change. */
   notify: (hash: string) => void;
-  setAgentActive: (active: boolean) => void;
-  markReviewed: (hash: string) => void;
   getState: () => SchedulerState;
-  isParked: () => boolean;
   getLatestHash: () => string;
   getReviewed: () => ReadonlySet<string>;
   /** Last review summary for /status. */
@@ -32,7 +29,6 @@ export type Scheduler = {
 
 export function createScheduler(cfg: SchedulerCfg, hooks: SchedulerHooks): Scheduler {
   let state: SchedulerState = "IDLE";
-  let agentActive = false;
   let timer: unknown = null;
   let lastSeen = "";
   let latestHash = "";
@@ -63,7 +59,7 @@ export function createScheduler(cfg: SchedulerCfg, hooks: SchedulerHooks): Sched
   };
 
   async function onDebounceFire() {
-    if (stopped || agentActive) return;
+    if (stopped) return;
     if (reviewed.has(latestHash)) {
       state = "IDLE";
       return;
@@ -83,7 +79,7 @@ export function createScheduler(cfg: SchedulerCfg, hooks: SchedulerHooks): Sched
   }
 
   async function fire() {
-    if (stopped || agentActive) return;
+    if (stopped) return;
     if (reviewed.has(latestHash)) {
       state = "IDLE";
       return;
@@ -110,16 +106,9 @@ export function createScheduler(cfg: SchedulerCfg, hooks: SchedulerHooks): Sched
     } else {
       hooks.onOutput(`── navigator error ── ${result.error}\n`);
       lastSummary = `error: ${result.error.slice(0, 80)}`;
-      // parked failure is retired — no retry after turn (see setAgentActive/resume)
     }
 
-    if (agentActive) {
-      // Completion while parked: record outcome, schedule NOTHING.
-      state = "IDLE";
-      return;
-    }
-
-    // Unparked completion: drain if failed or tree moved.
+    // Drain if failed or the tree moved while this review was in flight.
     if (!result.ok || latestHash !== frozenHash) {
       startDebounce();
     } else {
@@ -128,7 +117,7 @@ export function createScheduler(cfg: SchedulerCfg, hooks: SchedulerHooks): Sched
   }
 
   function notify(hash: string) {
-    if (stopped || agentActive) return;
+    if (stopped) return;
     if (hash === lastSeen) return;
     lastSeen = hash;
     latestHash = hash;
@@ -144,44 +133,9 @@ export function createScheduler(cfg: SchedulerCfg, hooks: SchedulerHooks): Sched
     startDebounce();
   }
 
-  function setAgentActive(active: boolean) {
-    if (active === agentActive) return;
-    agentActive = active;
-    if (active) {
-      // Park: cancel debounce/interval; ignore further notifies.
-      clearTimer();
-      // If PENDING/WAITING, fold into turn (session prints the notice).
-      if (state === "PENDING" || state === "WAITING_INTERVAL") state = "IDLE";
-      // REVIEWING stays REVIEWING.
-      return;
-    }
-    // Resume.
-    if (state === "REVIEWING") return; // in-flight completion drives
-    if (reviewed.has(latestHash) || !latestHash) {
-      state = "IDLE";
-      return;
-    }
-    startDebounce();
-  }
-
-  function markReviewed(hash: string) {
-    reviewed.add(hash);
-    latestHash = hash;
-    lastSeen = hash;
-    if (state === "REVIEWING") {
-      // Preserve in-flight review; only its completion may transition.
-      return;
-    }
-    clearTimer();
-    state = "IDLE";
-  }
-
   return {
     notify,
-    setAgentActive,
-    markReviewed,
     getState: () => state,
-    isParked: () => agentActive,
     getLatestHash: () => latestHash,
     getReviewed: () => reviewed,
     getLastSummary: () => lastSummary,

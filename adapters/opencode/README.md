@@ -4,6 +4,6 @@ Copy `adapters/opencode/` into your OpenCode plugins directory, or symlink `inde
 
 Merge `opencode.json` into your project config so `write`/`edit`/`bash` use `ask` permission and load the `pear` plugin.
 
-The plugin gates mutating tools at DEFAULTS pause lines/edits (150 lines / 5 mutations). Over budget it throws a conversational checkpoint block; under budget it reserves and allows.
+Pear runs in one mode at a time, read from `.pear/config.json` (project) and `~/.pear/config.json` (global model fallback): `off` (default), `agent-driver`, or `human-driver`. OpenCode has no in-chat command surface, so mode/config here is file-only — see the top-level [README](../../README.md#configuration) for fields and defaults.
 
-Optional navigator stub polls git state when the project is a repo and appends stub findings to `.pear/findings.log`.
+In `agent-driver` mode the plugin gates mutating tools at `checkpointSeconds`/`maxChangesPerCheckpoint`. Over budget it throws a conversational checkpoint block; under budget it reserves and allows. In `human-driver` mode (git repos only) it polls git state and appends stub navigator findings to `.pear/findings.log` — this remains a stub, matching OpenCode's pre-existing review integration; it does not make a real model call. `off` mode does neither.

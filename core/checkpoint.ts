@@ -1,31 +1,47 @@
-import { overBudget, type BudgetCfg } from "./config.ts";
+import { checkpointDue } from "./config.ts";
 
 export const STEERING_CONTRACT = "NOT EXECUTED — human steering: ";
 export const ACK_CONTRACT =
   "NOT EXECUTED — checkpoint acknowledged; re-issue this call and continue as planned";
 
-export type CheckpointSnapshot = {
-  baselineLines: number;
-  confirmed: number;
-  pending: number;
-  rebasePending: boolean;
-};
+export type CheckpointSnapshot = { baselineTime: number; confirmed: number; pending: number };
 
 export type Checkpoint = {
-  check: (stats: { lines: number }) => boolean;
+  check: (now: number) => boolean;
   reserve: (callId: string) => void;
   settle: (callId: string, ok: boolean) => void;
-  resetBaseline: (lines: number | null) => void;
-  finishRebase: (lines: number) => void;
-  abandonRebase: () => void;
-  getBaselineLines: () => number;
+  resetBaseline: (now: number, fileHashes: Map<string, string>) => void;
+  getBaselineTime: () => number;
+  filesSinceBaseline: (currentFileHashes: Map<string, string>) => string[];
   snapshot: () => CheckpointSnapshot;
 };
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m${seconds}s` : `${seconds}s`;
+}
+
+/**
+ * Plain-object equivalent of `Checkpoint.filesSinceBaseline`, for
+ * JSON-persisted callers (`adapters/shared/hook-checkpoint.ts`) that cannot
+ * store a `Map`. Returns every path in `current` whose hash is missing from
+ * or differs from `baseline` — new files, files edited again since the last
+ * checkpoint, and files edited for the first time this batch. A path with an
+ * identical hash in both is excluded.
+ */
+export function filesSincePersistedBaseline(
+  baseline: Record<string, string>,
+  current: Record<string, string>,
+): string[] {
+  return Object.keys(current).filter((path) => current[path] !== baseline[path]);
+}
 
 /** Build the checkpoint summary. */
 export function buildSummary(
   label: string,
-  delta: { lines: number; mutations: number },
+  delta: { elapsedMs: number; changes: number },
   files: string[],
 ): string {
   const visibleFiles = files.slice(0, 12);
@@ -34,37 +50,33 @@ export function buildSummary(
     : "";
   return (
     `── checkpoint ──\n` +
-    `+${delta.lines} lines / ${delta.mutations} mutations since last look` +
+    `${formatElapsed(delta.elapsedMs)} elapsed / ${delta.changes} changes since last look` +
     filePart +
     `\nabout to: ${label}\n` +
-    `Enter = continue, or type steering: `
+    `Enter = continue, or type steering: \n` +
+    `Before continuing: tell the human the big-picture goal of this batch and what you plan to do next, then continue.`
   );
 }
 
-export function createCheckpoint(cfg: BudgetCfg, initialLines = 0): Checkpoint {
-  let baselineLines = initialLines;
+export function createCheckpoint(
+  cfg: { checkpointSeconds: number; maxChangesPerCheckpoint: number },
+  initialTime: number,
+  initialFileHashes: Map<string, string>,
+): Checkpoint {
+  let baselineTime = initialTime;
+  let baselineFileHashes = new Map(initialFileHashes);
   let confirmed = 0;
   let pending = 0;
-  let rebasePending = false;
-  const reservations = new Map<string, true>();
-
-  const effectiveMutations = () => confirmed + pending;
+  const reservations = new Set<string>();
 
   return {
-    check(stats) {
-      return overBudget(
-        {
-          lines: rebasePending ? baselineLines : stats.lines,
-          mutations: effectiveMutations(),
-        },
-        { lines: baselineLines, mutations: 0 },
-        cfg,
-      );
+    check(now) {
+      return checkpointDue({ elapsedMs: now - baselineTime, changes: confirmed + pending }, cfg);
     },
 
     reserve(callId) {
       if (reservations.has(callId)) return;
-      reservations.set(callId, true);
+      reservations.add(callId);
       pending++;
     },
 
@@ -75,30 +87,23 @@ export function createCheckpoint(cfg: BudgetCfg, initialLines = 0): Checkpoint {
       if (ok) confirmed++;
     },
 
-    resetBaseline(lines) {
+    resetBaseline(now, fileHashes) {
+      baselineTime = now;
+      baselineFileHashes = new Map(fileHashes);
       confirmed = 0;
       pending = 0;
       reservations.clear();
-      if (lines === null) {
-        rebasePending = true;
-      } else {
-        baselineLines = lines;
-        rebasePending = false;
-      }
     },
 
-    finishRebase(lines) {
-      if (!rebasePending) return;
-      baselineLines = lines;
-      rebasePending = false;
+    getBaselineTime: () => baselineTime,
+
+    filesSinceBaseline(currentFileHashes) {
+      return filesSincePersistedBaseline(
+        Object.fromEntries(baselineFileHashes),
+        Object.fromEntries(currentFileHashes),
+      );
     },
 
-    abandonRebase() {
-      rebasePending = false;
-    },
-
-    getBaselineLines: () => baselineLines,
-
-    snapshot: () => ({ baselineLines, confirmed, pending, rebasePending }),
+    snapshot: () => ({ baselineTime, confirmed, pending }),
   };
 }

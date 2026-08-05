@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadUserConfig, saveUserConfig, resolveNavModelPreference } from "../core/config.ts";
+import { DEFAULTS, loadUserConfig, saveUserConfig, resolveConfig } from "../core/config.ts";
 
 function withDir<T>(fn: (dir: string) => T): T {
   const dir = mkdtempSync(join(tmpdir(), "pear-config-test-"));
@@ -29,11 +29,47 @@ describe("loadUserConfig", () => {
     });
   });
 
-  it("returns {} for an invalid navModel spec", () => {
+  it("drops an invalid reviewModel spec but keeps the rest of a valid file", () => {
     withDir((dir) => {
       mkdirSync(join(dir, ".pear"), { recursive: true });
-      writeFileSync(join(dir, ".pear", "config.json"), JSON.stringify({ navModel: "bad" }));
-      assert.deepEqual(loadUserConfig(dir), {});
+      writeFileSync(
+        join(dir, ".pear", "config.json"),
+        JSON.stringify({ reviewModel: "bad", mode: "agent-driver", checkpointSeconds: 60 }),
+      );
+      assert.deepEqual(loadUserConfig(dir), { mode: "agent-driver", checkpointSeconds: 60 });
+    });
+  });
+
+  it("drops an invalid mode but keeps the rest of a valid file", () => {
+    withDir((dir) => {
+      mkdirSync(join(dir, ".pear"), { recursive: true });
+      writeFileSync(
+        join(dir, ".pear", "config.json"),
+        JSON.stringify({ mode: "not-a-mode", minLines: 20 }),
+      );
+      assert.deepEqual(loadUserConfig(dir), { minLines: 20 });
+    });
+  });
+
+  it("drops a non-positive-integer cadence field but keeps the rest", () => {
+    withDir((dir) => {
+      mkdirSync(join(dir, ".pear"), { recursive: true });
+      writeFileSync(
+        join(dir, ".pear", "config.json"),
+        JSON.stringify({ checkpointSeconds: -5, maxChangesPerCheckpoint: 2.5, minLines: 10 }),
+      );
+      assert.deepEqual(loadUserConfig(dir), { minLines: 10 });
+    });
+  });
+
+  it("silently ignores unknown/legacy keys", () => {
+    withDir((dir) => {
+      mkdirSync(join(dir, ".pear"), { recursive: true });
+      writeFileSync(
+        join(dir, ".pear", "config.json"),
+        JSON.stringify({ navModel: "openai/gpt-test", pauseLines: 150, minLines: 10 }),
+      );
+      assert.deepEqual(loadUserConfig(dir), { minLines: 10 });
     });
   });
 });
@@ -42,64 +78,77 @@ describe("saveUserConfig", () => {
   it("round-trips through loadUserConfig, creating .pear/ if absent", () => {
     withDir((dir) => {
       assert.equal(existsSync(join(dir, ".pear")), false);
-      saveUserConfig(dir, { navModel: "anthropic/claude-sonnet-4-5" });
+      saveUserConfig(dir, { mode: "agent-driver", checkpointSeconds: 120 });
       assert.equal(existsSync(join(dir, ".pear", "config.json")), true);
-      assert.deepEqual(loadUserConfig(dir), { navModel: "anthropic/claude-sonnet-4-5" });
+      assert.deepEqual(loadUserConfig(dir), { mode: "agent-driver", checkpointSeconds: 120 });
     });
   });
 
-  it("throws the same invalid-model error as parseModel", () => {
+  it("drops an invalid model instead of persisting it", () => {
     withDir((dir) => {
-      assert.throws(() => saveUserConfig(dir, { navModel: "bad" }), /Invalid --model/);
-      assert.equal(existsSync(join(dir, ".pear", "config.json")), false);
+      saveUserConfig(dir, { reviewModel: "bad", mode: "off" });
+      assert.deepEqual(loadUserConfig(dir), { mode: "off" });
     });
   });
 
   it("writes pretty JSON with a trailing newline", () => {
     withDir((dir) => {
-      saveUserConfig(dir, { navModel: "openai/gpt-test" });
+      saveUserConfig(dir, { reviewModel: "openai/gpt-test" });
       const raw = readFileSync(join(dir, ".pear", "config.json"), "utf8");
       assert.ok(raw.endsWith("\n"));
-      assert.deepEqual(JSON.parse(raw), { navModel: "openai/gpt-test" });
+      assert.deepEqual(JSON.parse(raw), { reviewModel: "openai/gpt-test" });
     });
   });
 });
 
-describe("resolveNavModelPreference", () => {
-  it("prefers project over global when both are valid", () => {
+describe("resolveConfig", () => {
+  it("prefers project models over global when both are valid", () => {
     withDir((project) =>
       withDir((home) => {
-        saveUserConfig(project, { navModel: "anthropic/claude-opus-4" });
-        saveUserConfig(home, { navModel: "openai/gpt-test" });
-        assert.equal(resolveNavModelPreference(project, home), "anthropic/claude-opus-4");
+        saveUserConfig(project, { reviewModel: "anthropic/claude-opus-4" });
+        saveUserConfig(home, { reviewModel: "openai/gpt-test" });
+        assert.equal(resolveConfig(project, home).reviewModel, "anthropic/claude-opus-4");
       }),
     );
   });
 
-  it("falls back to global when project config is invalid", () => {
+  it("falls back to the global model when project config has none", () => {
     withDir((project) =>
       withDir((home) => {
-        mkdirSync(join(project, ".pear"), { recursive: true });
-        writeFileSync(join(project, ".pear", "config.json"), JSON.stringify({ navModel: "bad" }));
-        saveUserConfig(home, { navModel: "openai/gpt-test" });
-        assert.equal(resolveNavModelPreference(project, home), "openai/gpt-test");
+        saveUserConfig(home, { filterModel: "openai/gpt-test" });
+        assert.equal(resolveConfig(project, home).filterModel, "openai/gpt-test");
       }),
     );
   });
 
-  it("returns the global value when only global is set", () => {
+  it("returns DEFAULTS when neither project nor global is set", () => {
     withDir((project) =>
       withDir((home) => {
-        saveUserConfig(home, { navModel: "openai/gpt-test" });
-        assert.equal(resolveNavModelPreference(project, home), "openai/gpt-test");
+        assert.deepEqual(resolveConfig(project, home), DEFAULTS);
       }),
     );
   });
 
-  it("returns undefined when neither is set", () => {
+  it("mode is project-only: a global mode never applies", () => {
     withDir((project) =>
       withDir((home) => {
-        assert.equal(resolveNavModelPreference(project, home), undefined);
+        saveUserConfig(home, { mode: "agent-driver" });
+        assert.equal(resolveConfig(project, home).mode, DEFAULTS.mode);
+        saveUserConfig(project, { mode: "human-driver" });
+        assert.equal(resolveConfig(project, home).mode, "human-driver");
+      }),
+    );
+  });
+
+  it("cadence fields are project-only: a global value never applies", () => {
+    withDir((project) =>
+      withDir((home) => {
+        saveUserConfig(home, { checkpointSeconds: 900, minLines: 5 });
+        const resolved = resolveConfig(project, home);
+        assert.equal(resolved.checkpointSeconds, DEFAULTS.checkpointSeconds);
+        assert.equal(resolved.minLines, DEFAULTS.minLines);
+        saveUserConfig(project, { checkpointSeconds: 30 });
+        assert.equal(resolveConfig(project, home).checkpointSeconds, 30);
       }),
     );
   });

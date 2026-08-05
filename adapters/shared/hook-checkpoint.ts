@@ -1,16 +1,17 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
-import { buildSummary } from "../../core/checkpoint.ts";
-import { DEFAULTS, overBudget, type BudgetCfg } from "../../core/config.ts";
-import { changedFiles, changedLines, gitOk } from "../../core/git.ts";
+import { buildSummary, filesSincePersistedBaseline } from "../../core/checkpoint.ts";
+import { checkpointDue, resolveConfig, type PearConfig } from "../../core/config.ts";
+import { fileStateHashes, gitOk } from "../../core/git.ts";
 import { blockMessage } from "./conversational.ts";
 import { ensurePearDir } from "./daemon.ts";
 
 export type PersistedCheckpoint = {
-  baselineLines: number;
+  baselineTime: number;
+  fileHashes: Record<string, string>;
   confirmed: number;
   pending: number;
-  rebasePending: boolean;
   reservations: string[];
   awaitingSteering: boolean;
 };
@@ -31,36 +32,44 @@ function statePath(cwd: string): string {
   return join(cwd, ".pear", FILE);
 }
 
-function defaultState(cwd: string): PersistedCheckpoint {
-  const isGit = gitOk(cwd);
-  let baseline = 0;
-  if (isGit) {
-    try {
-      baseline = changedLines(cwd);
-    } catch {
-      baseline = 0;
-    }
+function safeFileHashes(cwd: string): Record<string, string> {
+  if (!gitOk(cwd)) return {};
+  try {
+    return Object.fromEntries(fileStateHashes(cwd));
+  } catch {
+    return {};
   }
+}
+
+function freshState(currentHashes: Record<string, string>, now: number): PersistedCheckpoint {
   return {
-    baselineLines: baseline,
+    baselineTime: now,
+    fileHashes: currentHashes,
     confirmed: 0,
     pending: 0,
-    rebasePending: false,
     reservations: [],
     awaitingSteering: false,
   };
 }
 
+function defaultState(cwd: string): PersistedCheckpoint {
+  return freshState(safeFileHashes(cwd), Date.now());
+}
+
 export function loadState(cwd: string): PersistedCheckpoint {
   ensurePearDir(cwd);
   try {
-    const raw = JSON.parse(readFileSync(statePath(cwd), "utf8")) as PersistedCheckpoint;
-    if (typeof raw.baselineLines !== "number") return defaultState(cwd);
+    const raw = JSON.parse(readFileSync(statePath(cwd), "utf8")) as Partial<PersistedCheckpoint>;
+    if (typeof raw.baselineTime !== "number" || typeof raw.fileHashes !== "object" || raw.fileHashes === null) {
+      // Legacy (line-based) or malformed state — start fresh; the next
+      // successful gateTool call persists the new shape.
+      return defaultState(cwd);
+    }
     return {
-      baselineLines: raw.baselineLines,
+      baselineTime: raw.baselineTime,
+      fileHashes: raw.fileHashes,
       confirmed: raw.confirmed ?? 0,
       pending: raw.pending ?? 0,
-      rebasePending: raw.rebasePending ?? false,
       reservations: Array.isArray(raw.reservations) ? raw.reservations : [],
       awaitingSteering: raw.awaitingSteering ?? false,
     };
@@ -74,24 +83,6 @@ export function saveState(cwd: string, state: PersistedCheckpoint): void {
   writeFileSync(statePath(cwd), JSON.stringify(state, null, 2));
 }
 
-function safeLines(cwd: string): number | null {
-  if (!gitOk(cwd)) return null;
-  try {
-    return changedLines(cwd);
-  } catch {
-    return null;
-  }
-}
-
-function safeFiles(cwd: string): string[] {
-  if (!gitOk(cwd)) return [];
-  try {
-    return changedFiles(cwd);
-  } catch {
-    return [];
-  }
-}
-
 export function toolLabel(event: GateInput): string {
   const input = event.input;
   const name = event.toolName.toLowerCase();
@@ -103,37 +94,19 @@ export function toolLabel(event: GateInput): string {
   return event.toolName;
 }
 
-function checkBudget(state: PersistedCheckpoint, lines: number, cfg: BudgetCfg): boolean {
-  return overBudget(
-    {
-      lines: state.rebasePending ? state.baselineLines : lines,
-      mutations: state.confirmed + state.pending,
-    },
-    { lines: state.baselineLines, mutations: 0 },
-    cfg,
-  );
-}
-
-function delta(state: PersistedCheckpoint, lines: number) {
-  return {
-    lines: state.rebasePending ? 0 : lines - state.baselineLines,
-    mutations: state.confirmed + state.pending,
-  };
-}
-
-function resetAfterCheckpoint(
+function checkBudget(
   state: PersistedCheckpoint,
-  lines: number | null,
-): PersistedCheckpoint {
-  return {
-    baselineLines: lines ?? state.baselineLines,
-    confirmed: 0,
-    pending: 0,
-    rebasePending: lines === null,
-    reservations: [],
-    awaitingSteering: false,
-  };
+  now: number,
+  cfg: { checkpointSeconds: number; maxChangesPerCheckpoint: number },
+): boolean {
+  return checkpointDue({ elapsedMs: now - state.baselineTime, changes: state.confirmed + state.pending }, cfg);
 }
+
+function delta(state: PersistedCheckpoint, now: number) {
+  return { elapsedMs: now - state.baselineTime, changes: state.confirmed + state.pending };
+}
+
+
 
 export function reserve(state: PersistedCheckpoint, callId: string): PersistedCheckpoint {
   if (state.reservations.includes(callId)) return state;
@@ -158,40 +131,52 @@ export function settle(
   };
 }
 
-export function finishRebaseIfNeeded(cwd: string, state: PersistedCheckpoint): PersistedCheckpoint {
-  if (!state.rebasePending) return state;
-  const lines = safeLines(cwd);
-  if (lines === null) return { ...state, rebasePending: false };
-  return { ...state, baselineLines: lines, rebasePending: false };
+/**
+ * Clears stale reservations left over at turn end (e.g. a tool call whose
+ * post-tool-use hook never fired for this turn). Deliberately leaves
+ * `baselineTime`, `fileHashes`, and `awaitingSteering` untouched — those are
+ * only ever reset together, by `gateTool` itself: once immediately on
+ * denial (baseline advances to the moment of denial) and again on the next
+ * call after steering (re-anchoring to the moment work actually resumes, so
+ * the human's response latency never counts against the next checkpoint).
+ */
+export function sweepTurnEnd(state: PersistedCheckpoint): PersistedCheckpoint {
+  if (state.pending === 0 && state.reservations.length === 0) return state;
+  return { ...state, pending: 0, reservations: [] };
 }
 
 export function gateTool(
   cwd: string,
   event: GateInput,
-  cfg: BudgetCfg = { pauseLines: DEFAULTS.pauseLines, pauseEdits: DEFAULTS.pauseEdits },
+  cfg?: Pick<Required<PearConfig>, "mode" | "checkpointSeconds" | "maxChangesPerCheckpoint">,
 ): GateResult {
+  const effectiveCfg = cfg ?? resolveConfig(cwd, homedir());
+
+  if (effectiveCfg.mode !== "agent-driver") {
+    return { action: "allow", state: loadState(cwd) };
+  }
+
   let state = loadState(cwd);
-  const isGit = gitOk(cwd);
+  const now = Date.now();
 
   if (state.awaitingSteering) {
-    const lines = isGit ? safeLines(cwd) : 0;
-    state = resetAfterCheckpoint(
-      state,
-      isGit ? (state.pending > 0 ? null : lines) : 0,
-    );
+    state = freshState(safeFileHashes(cwd), now);
     saveState(cwd, state);
   }
 
-  const lines = isGit ? (safeLines(cwd) ?? state.baselineLines) : 0;
-
-  if (!checkBudget(state, lines, cfg)) {
+  if (!checkBudget(state, now, effectiveCfg)) {
     const next = reserve(state, event.callId);
     saveState(cwd, next);
     return { action: "allow", state: next };
   }
 
-  const summary = buildSummary(toolLabel(event), delta(state, lines), safeFiles(cwd));
-  const next = { ...state, awaitingSteering: true };
+  // Denial: build the summary from the OLD (pre-reset) baseline, then reset
+  // immediately — baselineTime/fileHashes/counts all advance together in the
+  // same write, mirroring pear-runtime.ts's immediate (never-deferred) reset.
+  const currentHashes = safeFileHashes(cwd);
+  const files = filesSincePersistedBaseline(state.fileHashes, currentHashes);
+  const summary = buildSummary(toolLabel(event), delta(state, now), files);
+  const next = { ...freshState(currentHashes, now), awaitingSteering: true };
   saveState(cwd, next);
   return { action: "deny", summary, block: blockMessage(summary), state: next };
 }

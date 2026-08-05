@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -9,42 +9,38 @@ import {
   SUPERSEDED_REASON,
   createPearSession,
   type PearDeps,
-  type PearFlags,
   type PearSession,
-} from "../adapters/pi/runtime.ts";
+  type ReviewCompletions,
+} from "../adapters/shared/pear-runtime.ts";
+import { DEFAULTS, type PearConfig } from "../core/config.ts";
 
-const flags = (over: Partial<PearFlags> = {}): PearFlags => ({
-  navModel: "openai/gpt-test",
-  noNav: true,
-  pauseLines: 150,
-  pauseEdits: 5,
-  minLines: 50,
-  debounceSeconds: 10,
-  intervalSeconds: 60,
+const cfg = (over: Partial<Required<PearConfig>> = {}): Required<PearConfig> => ({
+  mode: "agent-driver",
+  reviewModel: DEFAULTS.reviewModel,
+  filterModel: DEFAULTS.filterModel,
+  minLines: DEFAULTS.minLines,
+  debounceSeconds: DEFAULTS.debounceSeconds,
+  intervalSeconds: DEFAULTS.intervalSeconds,
+  checkpointSeconds: 300,
+  maxChangesPerCheckpoint: 5,
   ...over,
 });
 
+const noCompletions: ReviewCompletions = { small: null, large: null };
+
 type FakeUi = {
   hasUI: boolean;
-  inputs: Array<string | Error>;
   notifies: Array<{ message: string; type?: string }>;
   statuses: string[];
 };
 
 function fakeUi(hasUI = true): FakeUi & PearDeps["ui"] {
-  const inputs: Array<string | Error> = [];
   const notifies: Array<{ message: string; type?: string }> = [];
   const statuses: string[] = [];
   return {
     hasUI,
-    inputs,
     notifies,
     statuses,
-    input: async () => {
-      const next = inputs.shift();
-      if (next instanceof Error) throw next;
-      return next ?? "";
-    },
     notify: (message, type) => {
       notifies.push({ message, type });
     },
@@ -56,41 +52,46 @@ function fakeUi(hasUI = true): FakeUi & PearDeps["ui"] {
 
 function session(
   ui: ReturnType<typeof fakeUi>,
-  over: Partial<PearDeps> & { flags?: PearFlags } = {},
+  over: Partial<PearDeps> & { cfg?: Required<PearConfig> } = {},
 ): PearSession {
   return createPearSession({
     cwd: over.cwd ?? "/tmp/pear-nongit",
-    flags: over.flags ?? flags(),
+    cfg: over.cfg ?? cfg(),
+    completions: over.completions ?? noCompletions,
     ui,
-    complete: over.complete ?? null,
     onFindings: over.onFindings ?? (() => {}),
     sendUserMessage: over.sendUserMessage ?? (() => {}),
+    saveConfig: over.saveConfig ?? (() => {}),
     gitOk: over.gitOk ?? (() => false),
     changedLines: over.changedLines,
-    changedFiles: over.changedFiles,
-    stateHash: over.stateHash,
     diffText: over.diffText,
-    ...over,
+    quickStateHash: over.quickStateHash,
+    fileStateHashesFn: over.fileStateHashesFn,
+    now: over.now,
+    setTimeout: over.setTimeout,
+    clearTimeout: over.clearTimeout,
+    setInterval: over.setInterval,
+    clearInterval: over.clearInterval,
   });
 }
 
 describe("pi-gate under budget", () => {
   it("allows and reserves when under budget", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 5 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 5 }) });
     const d = await s.onToolCall({ toolCallId: "1", toolName: "write", input: { path: "a.ts" } });
     assert.equal(d, undefined);
-    assert.equal(s.checkpoint.snapshot().pending, 1);
+    assert.equal(s.checkpoint!.snapshot().pending, 1);
     s.onToolResult("1", false);
-    assert.equal(s.checkpoint.snapshot().confirmed, 1);
-    assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.equal(s.checkpoint!.snapshot().confirmed, 1);
+    assert.equal(s.checkpoint!.snapshot().pending, 0);
   });
 });
 
 describe("pi-gate always-block checkpoint", () => {
   it("blocks immediately with a conversational checkpoint and suppresses the batch", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a.ts" } });
     s.onToolResult("a", false);
 
@@ -103,7 +104,7 @@ describe("pi-gate always-block checkpoint", () => {
     assert.ok(blocked?.reason.startsWith(STEERING_CONTRACT));
     assert.match(blocked?.reason ?? "", /── checkpoint ──/);
     assert.match(blocked?.reason ?? "", /Relay this checkpoint to the user/);
-    assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.equal(s.checkpoint!.snapshot().pending, 0);
     assert.match(ui.notifies.at(-1)?.message ?? "", /about to: write b\.ts/);
 
     const sibling = await s.onToolCall({
@@ -112,7 +113,7 @@ describe("pi-gate always-block checkpoint", () => {
       input: { path: "c.ts" },
     });
     assert.deepEqual(sibling, { block: true, reason: SUPERSEDED_REASON });
-    assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.equal(s.checkpoint!.snapshot().pending, 0);
 
     s.onTurnEnd();
     const next = await s.onToolCall({
@@ -121,11 +122,12 @@ describe("pi-gate always-block checkpoint", () => {
       input: { path: "d.ts" },
     });
     assert.equal(next, undefined);
-    assert.equal(s.checkpoint.snapshot().pending, 1);
+    assert.equal(s.checkpoint!.snapshot().pending, 1);
   });
+
   it("clears suppression at the next agent turn after an abort", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: {} });
     s.onToolResult("a", false);
     const blocked = await s.onToolCall({ toolCallId: "b", toolName: "write", input: {} });
@@ -138,7 +140,7 @@ describe("pi-gate always-block checkpoint", () => {
 
   it("uses the canonical steering contract in the immediate block", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "bash", input: { command: "true" } });
     s.onToolResult("a", false);
 
@@ -159,38 +161,36 @@ describe("pi-gate always-block checkpoint", () => {
   });
 });
 
-
 describe("pi-gate headless and immediate block", () => {
   it("hasUI=false allows without reserving", async () => {
     const ui = fakeUi(false);
-    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
     s.onToolResult("a", false);
     const d = await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
     assert.equal(d, undefined);
-    assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.equal(s.checkpoint!.snapshot().pending, 0);
     s.onToolResult("b", false);
-    assert.equal(s.checkpoint.snapshot().confirmed, 1);
+    assert.equal(s.checkpoint!.snapshot().confirmed, 1);
   });
 
-  it("UI presence never waits for input inside a tool call", async () => {
+  it("resolves the block synchronously, with a NOT EXECUTED reason", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 1 }) });
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
     s.onToolResult("a", false);
 
     const d = await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
     assert.equal(d?.block, true);
     assert.match(d?.reason ?? "", /NOT EXECUTED/);
-    assert.equal(ui.inputs.length, 0);
-    assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.equal(s.checkpoint!.snapshot().pending, 0);
   });
 });
 
 describe("pi-gate concurrent siblings", () => {
   it("N+1th preflight trips via reservations; failed settle releases", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 3 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 3 }) });
     for (let i = 0; i < 3; i++) {
       const d = await s.onToolCall({
         toolCallId: `c${i}`,
@@ -199,7 +199,6 @@ describe("pi-gate concurrent siblings", () => {
       });
       assert.equal(d, undefined);
     }
-    ui.inputs.push("");
     const trip = await s.onToolCall({
       toolCallId: "c3",
       toolName: "write",
@@ -212,11 +211,12 @@ describe("pi-gate concurrent siblings", () => {
     s.onToolResult("c2", false);
     // blocked c3 settle no-ops
     s.onToolResult("c3", true);
-    assert.equal(s.checkpoint.snapshot().pending, 0);
+    assert.equal(s.checkpoint!.snapshot().pending, 0);
   });
+
   it("synchronously suppresses concurrent siblings before either can prompt", async () => {
     const ui = fakeUi();
-    const s = session(ui, { flags: flags({ pauseEdits: 1 }) });
+    const s = session(ui, { cfg: cfg({ maxChangesPerCheckpoint: 1 }) });
     await s.onToolCall({ toolCallId: "seed", toolName: "write", input: {} });
     s.onToolResult("seed", false);
 
@@ -233,221 +233,132 @@ describe("pi-gate concurrent siblings", () => {
   });
 });
 
-describe("pi-gate deferred rebase", () => {
-  it("mid-batch checkpoint defers baseline; turn_end finishRebase; next turn charges own lines", async () => {
-    let lines = 10;
+describe("pi-gate cadence", () => {
+  it("OR semantics: elapsed time alone trips the checkpoint with zero changes", async () => {
+    let nowMs = 0;
     const ui = fakeUi();
     const s = session(ui, {
-      flags: flags({ pauseEdits: 2, pauseLines: 20 }),
-      gitOk: () => true,
-      changedLines: () => lines,
-      changedFiles: () => ["a.ts"],
-      stateHash: () => `h${lines}`,
-      diffText: () => "",
+      cfg: cfg({ checkpointSeconds: 10, maxChangesPerCheckpoint: 1000 }),
+      now: () => nowMs,
     });
-    // init baseline was 10
-    assert.equal(s.checkpoint.getBaselineLines(), 10);
-
-    await s.onToolCall({ toolCallId: "1", toolName: "write", input: { path: "a" } });
-    await s.onToolCall({ toolCallId: "2", toolName: "write", input: { path: "b" } });
-    // pending=2, trip on 3rd
-    ui.inputs.push("");
-    const blocked = await s.onToolCall({
-      toolCallId: "3",
-      toolName: "write",
-      input: { path: "c" },
-    });
-    assert.equal(blocked?.block, true);
-    assert.equal(s.checkpoint.snapshot().rebasePending, true);
-    // late sibling write lands on disk before turn_end
-    lines = 40;
-    s.onTurnEnd();
-    assert.equal(s.checkpoint.snapshot().rebasePending, false);
-    assert.equal(s.checkpoint.getBaselineLines(), 40);
-
-    // next turn re-issue under new baseline — own writes of +5 don't trip pauseLines=20
-    lines = 45;
-    const ok = await s.onToolCall({
-      toolCallId: "4",
-      toolName: "write",
-      input: { path: "d" },
-    });
-    assert.equal(ok, undefined);
-    s.onToolResult("4", false);
-
-    // oversized jump trips on following preflight
-    lines = 100;
-    ui.inputs.push("");
-    const trip = await s.onToolCall({
-      toolCallId: "5",
-      toolName: "write",
-      input: { path: "e" },
-    });
+    nowMs = 5_000;
+    const under = await s.onToolCall({ toolCallId: "a", toolName: "write", input: {} });
+    assert.equal(under, undefined);
+    s.onToolResult("a", false);
+    nowMs = 11_000;
+    const trip = await s.onToolCall({ toolCallId: "b", toolName: "write", input: {} });
     assert.equal(trip?.block, true);
   });
 
-  it("turn_end read failure abandons rebase and keeps old baseline", async () => {
-    let fail = false;
-    let lines = 5;
+  it("onAgentEnd fires the checkpoint when the cadence became due mid-turn with no further calls", async () => {
+    let nowMs = 0;
     const ui = fakeUi();
     const s = session(ui, {
-      flags: flags({ pauseEdits: 2 }),
-      gitOk: () => true,
-      changedLines: () => {
-        if (fail) throw new Error("git down");
-        return lines;
-      },
-      changedFiles: () => [],
-      stateHash: () => "h",
-      diffText: () => "",
+      cfg: cfg({ checkpointSeconds: 10, maxChangesPerCheckpoint: 1000 }),
+      now: () => nowMs,
     });
-    await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
-    await s.onToolCall({ toolCallId: "x", toolName: "write", input: { path: "x" } });
-    ui.inputs.push("");
-    await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
-    assert.equal(s.checkpoint.snapshot().rebasePending, true);
-    const old = s.checkpoint.getBaselineLines();
-    fail = true;
-    s.onTurnEnd();
-    assert.equal(s.checkpoint.snapshot().rebasePending, false);
-    assert.equal(s.checkpoint.getBaselineLines(), old);
+    const baseline = s.checkpoint!.getBaselineTime();
+    nowMs = 11_000;
+    await s.onAgentEnd();
+    assert.notEqual(s.checkpoint!.getBaselineTime(), baseline);
+    assert.match(ui.notifies.at(-1)?.message ?? "", /end of turn/);
   });
 });
 
-describe("pi-gate non-git and git-read failures", () => {
-  it("non-git never calls changedLines and paces mutations only", async () => {
-    const ui = fakeUi();
-    let called = 0;
-    const s = session(ui, {
-      flags: flags({ pauseEdits: 2 }),
-      gitOk: () => false,
-      changedLines: () => {
-        called++;
-        throw new Error("should not call");
-      },
-    });
-    await s.onToolCall({ toolCallId: "1", toolName: "write", input: { path: "a" } });
-    s.onToolResult("1", false);
-    await s.onToolCall({ toolCallId: "2", toolName: "write", input: { path: "b" } });
-    s.onToolResult("2", false);
-    ui.inputs.push("");
-    const trip = await s.onToolCall({
-      toolCallId: "3",
-      toolName: "write",
-      input: { path: "c" },
-    });
-    assert.equal(trip?.block, true);
-    assert.equal(called, 0);
-    assert.equal(s.checkpoint.snapshot().rebasePending, false);
-  });
-
-  it("preflight read throw → mutation-only check; nothing escapes", async () => {
+describe("pi-gate file-hash provenance", () => {
+  it("a throwing fileStateHashesFn does not affect the count-based gate", async () => {
     const ui = fakeUi();
     const s = session(ui, {
-      flags: flags({ pauseEdits: 1, pauseLines: 1000 }),
+      cfg: cfg({ maxChangesPerCheckpoint: 1 }),
       gitOk: () => true,
-      changedLines: () => {
+      fileStateHashesFn: () => {
         throw new Error("boom");
       },
-      changedFiles: () => [],
-      stateHash: () => "h",
-      diffText: () => "",
     });
-    // baseline init fell back to 0
-    assert.equal(s.checkpoint.getBaselineLines(), 0);
     await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
     s.onToolResult("a", false);
-    ui.inputs.push("");
-    const trip = await s.onToolCall({
-      toolCallId: "b",
-      toolName: "write",
-      input: { path: "b" },
-    });
+    const trip = await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
     assert.equal(trip?.block, true);
+    assert.match(ui.notifies.at(-1)?.message ?? "", /── checkpoint ──/);
   });
-});
 
-describe("pi-gate initial baseline", () => {
-  it("pre-existing uncommitted lines do not consume budget", async () => {
+  it("pre-existing dirty files are excluded from the first checkpoint's file list", async () => {
     const ui = fakeUi();
     const s = session(ui, {
-      flags: flags({ pauseLines: 50, pauseEdits: 100 }),
+      cfg: cfg({ maxChangesPerCheckpoint: 1 }),
       gitOk: () => true,
-      changedLines: () => 80,
-      changedFiles: () => ["old.ts"],
-      stateHash: () => "h",
-      diffText: () => "",
+      fileStateHashesFn: () => new Map([["old.ts", "h1"]]),
     });
-    assert.equal(s.checkpoint.getBaselineLines(), 80);
-    const d = await s.onToolCall({
-      toolCallId: "1",
-      toolName: "write",
-      input: { path: "a" },
-    });
+    const d = await s.onToolCall({ toolCallId: "1", toolName: "write", input: { path: "a" } });
     assert.equal(d, undefined);
-  });
-});
-
-describe("pi-gate outage recovery", () => {
-  it("abandon then oversized write remains chargeable after recovery", async () => {
-    let lines = 10;
-    let fail = false;
-    const ui = fakeUi();
-    const s = session(ui, {
-      flags: flags({ pauseEdits: 2, pauseLines: 30 }),
-      gitOk: () => true,
-      changedLines: () => {
-        if (fail) throw new Error("down");
-        return lines;
-      },
-      changedFiles: () => [],
-      stateHash: () => `h${lines}`,
-      diffText: () => "",
-    });
-    // two in-flight so reset defers
-    await s.onToolCall({ toolCallId: "a", toolName: "write", input: { path: "a" } });
-    await s.onToolCall({ toolCallId: "p", toolName: "write", input: { path: "p" } });
-    ui.inputs.push("");
-    await s.onToolCall({ toolCallId: "b", toolName: "write", input: { path: "b" } });
-    assert.equal(s.checkpoint.snapshot().rebasePending, true);
-    fail = true;
-    s.onTurnEnd(); // abandon
-    assert.equal(s.checkpoint.getBaselineLines(), 10);
-
-    fail = false;
-    lines = 50; // includes outage writes relative to old baseline
-    ui.inputs.push("");
-    const trip = await s.onToolCall({
-      toolCallId: "c",
-      toolName: "write",
-      input: { path: "c" },
-    });
+    const trip = await s.onToolCall({ toolCallId: "2", toolName: "write", input: { path: "b" } });
     assert.equal(trip?.block, true);
+    assert.ok(!ui.notifies.at(-1)?.message?.includes("old.ts"));
+  });
+
+  it("two consecutive checkpoints each list only the newly-touched file, never earlier ones", async () => {
+    const ui = fakeUi();
+    let hashes = new Map([["a.ts", "h-a"]]); // pre-existing dirty file before agent-driver started
+    const s = session(ui, {
+      cfg: cfg({ maxChangesPerCheckpoint: 1 }),
+      gitOk: () => true,
+      fileStateHashesFn: () => hashes,
+    });
+
+    // checkpoint 1: b.ts newly written
+    hashes = new Map([
+      ["a.ts", "h-a"],
+      ["b.ts", "h-b"],
+    ]);
+    const d1 = await s.onToolCall({ toolCallId: "1", toolName: "write", input: { path: "a" } });
+    assert.equal(d1, undefined);
+    const trip1 = await s.onToolCall({ toolCallId: "2", toolName: "write", input: { path: "b" } });
+    assert.equal(trip1?.block, true);
+    const summary1 = ui.notifies.at(-1)?.message ?? "";
+    assert.ok(summary1.includes("b.ts"), summary1);
+    assert.ok(!summary1.includes("a.ts"), summary1);
+    s.onTurnEnd();
+
+    // checkpoint 2: c.ts newly written; a.ts/b.ts unchanged since checkpoint 1's reset
+    hashes = new Map([
+      ["a.ts", "h-a"],
+      ["b.ts", "h-b"],
+      ["c.ts", "h-c"],
+    ]);
+    const d2 = await s.onToolCall({ toolCallId: "3", toolName: "write", input: { path: "c" } });
+    assert.equal(d2, undefined);
+    const trip2 = await s.onToolCall({ toolCallId: "4", toolName: "write", input: { path: "d" } });
+    assert.equal(trip2?.block, true);
+    const summary2 = ui.notifies.at(-1)?.message ?? "";
+    assert.ok(summary2.includes("c.ts"), summary2);
+    assert.ok(!summary2.includes("a.ts"), summary2);
+    assert.ok(!summary2.includes("b.ts"), summary2);
   });
 });
 
 describe("gitOk detection in real temp dir", () => {
-  it("non-git temp dir disables navigator", () => {
+  it("non-git temp dir falls back to off for human-driver mode", () => {
     const dir = mkdtempSync(join(tmpdir(), "pear-nongit-"));
     try {
       const ui = fakeUi();
       const s = createPearSession({
         cwd: dir,
-        flags: flags({ noNav: false }),
+        cfg: cfg({ mode: "human-driver" }),
+        completions: { small: async () => "[]", large: async () => "[]" },
         ui,
-        complete: async () => "[]",
         onFindings: () => {},
         sendUserMessage: () => {},
+        saveConfig: () => {},
       });
       assert.equal(s.isGit, false);
+      assert.equal(s.mode, "off");
       assert.equal(s.scheduler, null);
-      assert.match(ui.notifies[0]?.message ?? "", /not a git repo/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("git temp dir enables navigator when complete provided", () => {
+  it("git temp dir enables the scheduler when both completions resolve", () => {
     const dir = mkdtempSync(join(tmpdir(), "pear-git-"));
     try {
       execFileSync("git", ["init"], { cwd: dir });
@@ -459,14 +370,17 @@ describe("gitOk detection in real temp dir", () => {
       const ui = fakeUi();
       const s = createPearSession({
         cwd: dir,
-        flags: flags({ noNav: false }),
+        cfg: cfg({ mode: "human-driver" }),
+        completions: { small: async () => "[]", large: async () => "[]" },
         ui,
-        complete: async () => "[]",
         onFindings: () => {},
         sendUserMessage: () => {},
+        saveConfig: () => {},
       });
       assert.equal(s.isGit, true);
+      assert.equal(s.mode, "human-driver");
       assert.ok(s.scheduler);
+      assert.equal(s.checkpoint, null);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

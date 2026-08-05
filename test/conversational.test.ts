@@ -5,7 +5,7 @@ import {
   STEERING_CONTRACT,
   blockMessage,
 } from "../adapters/shared/conversational.ts";
-import { PERSONA_APPEND } from "../adapters/pi/runtime.ts";
+import { AGENT_DRIVER_PERSONA, HUMAN_DRIVER_PERSONA } from "../adapters/pi/runtime.ts";
 
 describe("conversational contracts", () => {
   it("exports stable steering and ack contracts", () => {
@@ -24,9 +24,14 @@ describe("conversational contracts", () => {
     assert.match(msg, /awaiting user reply/);
   });
 
-  it("persona append names both contracts and re-issue instruction", () => {
-    assert.match(PERSONA_APPEND, /human steering/);
-    assert.match(PERSONA_APPEND, /re-issue the same call unchanged/);
-    assert.ok(PERSONA_APPEND.includes(ACK_CONTRACT));
+  it("agent-driver persona names both contracts and the re-issue instruction", () => {
+    assert.match(AGENT_DRIVER_PERSONA, /human steering/);
+    assert.match(AGENT_DRIVER_PERSONA, /re-issue the same call unchanged/);
+    assert.ok(AGENT_DRIVER_PERSONA.includes(ACK_CONTRACT));
+  });
+
+  it("human-driver persona names pear-nav findings as informational-only", () => {
+    assert.match(HUMAN_DRIVER_PERSONA, /pear-nav/);
+    assert.match(HUMAN_DRIVER_PERSONA, /informational/);
   });
 });

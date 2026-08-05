@@ -1,9 +1,4 @@
-import {
-  finishRebaseIfNeeded,
-  loadState,
-  saveState,
-  settle,
-} from "../../shared/hook-checkpoint.ts";
+import { loadState, saveState, settle } from "../../shared/hook-checkpoint.ts";
 import {
   isMutatingTool,
   readStdinJson,
@@ -21,7 +16,6 @@ const toolName = resolveToolName(body);
 if (isMutatingTool(toolName)) {
   let state = loadState(cwd);
   state = settle(state, resolveCallId(body), !(body.is_error ?? body.isError));
-  state = finishRebaseIfNeeded(cwd, state);
   saveState(cwd, state);
 }
 

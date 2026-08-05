@@ -2,15 +2,16 @@
  * Background navigator daemon for hook-based hosts (Claude Code, Cursor).
  *
  * Usage:
- *   node --experimental-strip-types adapters/shared/daemon.ts --cwd <dir> [--nav-model …]
+ *   node --experimental-strip-types adapters/shared/daemon.ts --cwd <dir>
  *   node --experimental-strip-types adapters/shared/daemon.ts --stop --cwd <dir>
  *
- * Polls git state → core scheduler → review → appends findings to .pear/findings.pending.
+ * Only runs its poll/review loop in human-driver mode (per `.pear/config.json`);
+ * every other mode is a no-op. Polls git state → core scheduler → review →
+ * appends findings to .pear/findings.pending.
  * Pidfile: .pear/daemon.pid
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import {
-  existsSync,
   mkdirSync,
   readFileSync,
   unlinkSync,
@@ -19,20 +20,16 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { DEFAULTS, parseModel, resolveNavModelPreference } from "../../core/config.ts";
-import { changedLines, diffText, gitOk, stateHash } from "../../core/git.ts";
-import { runReview } from "../../core/llm.ts";
+import { resolveConfig } from "../../core/config.ts";
+import { changedLines, diffText, gitOk, quickStateHash } from "../../core/git.ts";
+import { runReview, type Complete } from "../../core/llm.ts";
 import { createScheduler } from "../../core/navigate.ts";
-import { formatFindings, REVIEW_SYSTEM } from "../../core/review.ts";
+import { formatFindings } from "../../core/review.ts";
 
 export type DaemonOpts = {
   cwd: string;
-  navModel?: string;
-  minLines?: number;
-  debounceSeconds?: number;
-  intervalSeconds?: number;
-  /** Review transport. Default: try `claude -p`, else refuse. */
-  complete?: (system: string, user: string) => Promise<string>;
+  /** Review transport factory: model spec -> completion fn. Default: `claude -p`. */
+  complete?: (model: string) => Complete;
   pollMs?: number;
 };
 
@@ -120,12 +117,12 @@ export function drainFindings(cwd: string): string {
   }
 }
 
-function defaultComplete(navModel: string): (system: string, user: string) => Promise<string> {
+function defaultComplete(model: string): Complete {
   return (system, user) =>
     new Promise((resolve, reject) => {
       const child = spawn(
         "claude",
-        ["-p", "--model", navModel, "--system-prompt", system],
+        ["-p", "--model", model, "--system-prompt", system],
         { stdio: ["pipe", "pipe", "pipe"] },
       );
       let out = "";
@@ -144,6 +141,10 @@ function defaultComplete(navModel: string): (system: string, user: string) => Pr
 
 export function runDaemonLoop(opts: DaemonOpts): { stop: () => void } {
   const cwd = opts.cwd;
+  const cfg = resolveConfig(cwd, homedir());
+  if (cfg.mode !== "human-driver") {
+    return { stop: () => {} };
+  }
   if (!gitOk(cwd)) {
     throw new Error("pear daemon requires a git working tree");
   }
@@ -154,24 +155,21 @@ export function runDaemonLoop(opts: DaemonOpts): { stop: () => void } {
   }
   writePid(cwd, process.pid);
 
-  const navModel = opts.navModel ?? DEFAULTS.navModel;
-  const complete = opts.complete ?? defaultComplete(navModel);
+  const completeFactory = opts.complete ?? defaultComplete;
+  const completeSmall = completeFactory(cfg.reviewModel);
+  const completeLarge = completeFactory(cfg.filterModel);
 
   const scheduler = createScheduler(
-    {
-      minLines: opts.minLines ?? DEFAULTS.minLines,
-      intervalSeconds: opts.intervalSeconds ?? DEFAULTS.intervalSeconds,
-      debounceSeconds: opts.debounceSeconds ?? DEFAULTS.debounceSeconds,
-    },
+    { minLines: cfg.minLines, intervalSeconds: cfg.intervalSeconds, debounceSeconds: cfg.debounceSeconds },
     {
       now: () => Date.now(),
       setTimeout: (fn, ms) => setTimeout(fn, ms),
-      clearTimeout: (id) => clearTimeout(id as ReturnType<typeof setTimeout>),
+      clearTimeout: (id) => clearTimeout(id as NodeJS.Timeout),
       getChangedLines: () => changedLines(cwd),
       getDiffText: () => diffText(cwd),
       runReview: async (diff) => {
         try {
-          const { kept, filtered } = await runReview(complete, diff);
+          const { kept, filtered } = await runReview(completeSmall, completeLarge, diff);
           appendFindings(cwd, formatFindings(kept, filtered));
           return { ok: true };
         } catch (e) {
@@ -185,7 +183,7 @@ export function runDaemonLoop(opts: DaemonOpts): { stop: () => void } {
   const pollMs = opts.pollMs ?? 2000;
   const timer = setInterval(() => {
     try {
-      scheduler.notify(stateHash(cwd));
+      scheduler.notify(quickStateHash(cwd));
     } catch {
       /* transient */
     }
@@ -225,7 +223,6 @@ export function spawnDaemon(opts: DaemonOpts): ChildProcess | null {
     "--cwd",
     cwd,
   ];
-  if (opts.navModel) args.push("--nav-model", opts.navModel);
   const child = spawn(process.execPath, args, {
     detached: true,
     stdio: "ignore",
@@ -244,18 +241,13 @@ if (isMain) {
   const args = process.argv.slice(2);
   let cwd = process.cwd();
   let stop = false;
-  let navModelArg: string | undefined;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--cwd") cwd = args[++i]!;
     else if (args[i] === "--stop") stop = true;
-    else if (args[i] === "--nav-model") navModelArg = args[++i]!;
   }
   if (stop) {
     process.exit(stopDaemon(cwd) ? 0 : 1);
   }
-  const navModel = navModelArg ?? resolveNavModelPreference(cwd, homedir()) ?? DEFAULTS.navModel;
-  parseModel(navModel);
-  void REVIEW_SYSTEM;
-  runDaemonLoop({ cwd, navModel });
+  runDaemonLoop({ cwd });
   // Keep process alive
 }

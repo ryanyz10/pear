@@ -1,9 +1,4 @@
-import {
-  finishRebaseIfNeeded,
-  loadState,
-  saveState,
-  settle,
-} from "../_vendor/adapters/shared/hook-checkpoint.ts";
+import { loadState, saveState, settle } from "../_vendor/adapters/shared/hook-checkpoint.ts";
 import {
   readStdinJson,
   resolveCallId,
@@ -22,7 +17,6 @@ if (isMutatingTool(toolName)) {
   let state = loadState(cwd);
   const ok = body.hook_event_name !== "PostToolUseFailure";
   state = settle(state, resolveCallId(body), ok);
-  state = finishRebaseIfNeeded(cwd, state);
   saveState(cwd, state);
 }
 

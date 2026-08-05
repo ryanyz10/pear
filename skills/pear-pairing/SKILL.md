@@ -28,4 +28,4 @@ Ignore small style nits unless they hide a real bug.
 
 ## Manual fallback (no pear adapter)
 
-After more than ~50 changed lines, run `git diff` (and `git status`) and self-review against the rubric above. Pause and ask the human before continuing past ~150 new lines or ~5 mutating tool calls without a checkpoint.
+After any batch of edits, before moving to a new, unrelated change, run `git diff` (and `git status`) and self-review against the rubric above. Pause and ask the human after 300 seconds (5 minutes) or 3 mutating tool calls since the last checkpoint — whichever comes first. Before continuing: tell the human the big-picture goal of this batch and what you plan to do next, then continue.

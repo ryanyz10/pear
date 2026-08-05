@@ -1,15 +1,10 @@
 import { buildSummary, createCheckpoint, type Checkpoint } from "../../core/checkpoint.ts";
-import { DEFAULTS } from "../../core/config.ts";
-import {
-  changedFiles,
-  changedLines,
-  diffText,
-  gitOk,
-  stateHash,
-} from "../../core/git.ts";
+import { resolveConfig } from "../../core/config.ts";
+import { changedLines, diffText, fileStateHashes, gitOk, quickStateHash } from "../../core/git.ts";
 import { createScheduler, type Scheduler } from "../../core/navigate.ts";
 import { blockMessage } from "../shared/conversational.ts";
 import { appendFindings, ensurePearDir } from "../shared/daemon.ts";
+import { homedir } from "node:os";
 
 const MUTATING = new Set(["write", "edit", "bash"]);
 
@@ -49,50 +44,43 @@ export const PearPlugin = async ({
   directory: string;
 }) => {
   const isGit = gitOk(directory);
-  const checkpoint: Checkpoint = createCheckpoint(
-    { pauseLines: DEFAULTS.pauseLines, pauseEdits: DEFAULTS.pauseEdits },
-    0,
-  );
+  const cfg = resolveConfig(directory, homedir());
 
-  const safeLines = (): number => {
-    if (!isGit) return 0;
+  const safeFileHashes = (): Map<string, string> => {
+    if (!isGit) return new Map();
     try {
-      return changedLines(directory);
+      return fileStateHashes(directory);
     } catch {
-      return checkpoint.getBaselineLines();
+      return new Map();
     }
   };
-
-  const safeFiles = (): string[] => {
-    if (!isGit) return [];
-    try {
-      return changedFiles(directory);
-    } catch {
-      return [];
-    }
-  };
-
-  checkpoint.resetBaseline(isGit ? safeLines() : 0);
 
   let scheduler: Scheduler | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let checkpoint: Checkpoint | null = null;
+  let pollTimer: NodeJS.Timeout | null = null;
   let awaitingSteering = false;
 
-  if (isGit) {
+  if (cfg.mode === "agent-driver") {
+    checkpoint = createCheckpoint(
+      { checkpointSeconds: cfg.checkpointSeconds, maxChangesPerCheckpoint: cfg.maxChangesPerCheckpoint },
+      Date.now(),
+      safeFileHashes(),
+    );
+  } else if (cfg.mode === "human-driver" && isGit) {
     ensurePearDir(directory);
     scheduler = createScheduler(
-      {
-        minLines: DEFAULTS.minLines,
-        intervalSeconds: DEFAULTS.intervalSeconds,
-        debounceSeconds: DEFAULTS.debounceSeconds,
-      },
+      { minLines: cfg.minLines, intervalSeconds: cfg.intervalSeconds, debounceSeconds: cfg.debounceSeconds },
       {
         now: () => Date.now(),
         setTimeout: (fn, ms) => setTimeout(fn, ms),
-        clearTimeout: (id) => clearTimeout(id as ReturnType<typeof setTimeout>),
-        getChangedLines: () => safeLines(),
+        clearTimeout: (id) => clearTimeout(id as NodeJS.Timeout),
+        getChangedLines: () => changedLines(directory),
         getDiffText: () => diffText(directory),
         runReview: async (diff) => {
+          // ── navigator (stub) ── no real model call for OpenCode yet; this
+          // migrates to the mode/checkpoint contracts without implementing a
+          // real two-stage review — that was already out of scope before this
+          // rewrite.
           const stub = `── navigator (stub) ──\n${diff.slice(0, 400)}`;
           if (client?.session?.create) {
             try {
@@ -108,29 +96,19 @@ export const PearPlugin = async ({
         onOutput: (text) => appendFindings(directory, text),
       },
     );
-    pollTimer = setInterval(() => {
-      try {
-        scheduler?.notify(stateHash(directory));
-      } catch {
-        /* transient git error */
-      }
-    }, 2000);
   }
 
   const gateBefore = (ctx: ToolCtx) => {
+    if (!checkpoint) return;
     const tool = toolFrom(ctx);
     if (!MUTATING.has(tool)) return;
 
     if (awaitingSteering) {
-      const snap = checkpoint.snapshot();
-      checkpoint.resetBaseline(
-        isGit ? (snap.pending > 0 ? null : safeLines()) : 0,
-      );
+      checkpoint.resetBaseline(Date.now(), safeFileHashes());
       awaitingSteering = false;
     }
 
-    const lines = safeLines();
-    if (!checkpoint.check({ lines })) {
+    if (!checkpoint.check(Date.now())) {
       checkpoint.reserve(callIdFrom(ctx));
       return;
     }
@@ -138,36 +116,36 @@ export const PearPlugin = async ({
     const snap = checkpoint.snapshot();
     const summary = buildSummary(
       toolLabel(tool, inputFrom(ctx)),
-      {
-        lines: snap.rebasePending ? 0 : lines - snap.baselineLines,
-        mutations: snap.confirmed + snap.pending,
-      },
-      safeFiles(),
+      { elapsedMs: Date.now() - snap.baselineTime, changes: snap.confirmed + snap.pending },
+      checkpoint.filesSinceBaseline(safeFileHashes()),
     );
     awaitingSteering = true;
+    checkpoint.resetBaseline(Date.now(), safeFileHashes());
     throw new Error(blockMessage(summary));
   };
 
   const settleAfter = (ctx: ToolCtx) => {
+    if (!checkpoint) return;
     const tool = toolFrom(ctx);
     if (!MUTATING.has(tool)) return;
     checkpoint.settle(callIdFrom(ctx), !ctx.error);
-    const snap = checkpoint.snapshot();
-    if (snap.rebasePending) {
-      try {
-        checkpoint.finishRebase(safeLines());
-      } catch {
-        checkpoint.abandonRebase();
-      }
-    }
   };
 
   return {
     "session.created": () => {
-      scheduler?.setAgentActive(true);
+      if (scheduler && pollTimer == null) {
+        pollTimer = setInterval(() => {
+          try {
+            scheduler?.notify(quickStateHash(directory));
+          } catch {
+            /* transient git error */
+          }
+        }, 2000);
+      }
     },
     "session.ended": () => {
-      if (pollTimer) clearInterval(pollTimer);
+      clearInterval(pollTimer as NodeJS.Timeout);
+      pollTimer = null;
       scheduler?.stop();
     },
     "tool.execute.before": gateBefore,

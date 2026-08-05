@@ -2,18 +2,22 @@
 
 Pair-programming loop core + host adapters.
 
-Pear gates mutating tool calls with human checkpoints and, in Git repos, runs a background **navigator** that reviews uncommitted changes. Findings are human-only by default.
+Pear runs in exactly one mode at a time, per project:
 
-- **Pi** — full modal checkpoints + in-process navigator (primary ship)
+- **`off`** (default) — no gating, no reviews.
+- **`agent-driver`** — you drive; pear gates mutating tool calls with a wall-clock + change-count checkpoint so the agent pauses and explains itself periodically.
+- **`human-driver`** — the human drives; pear runs a background navigator that reviews uncommitted changes with a two-stage review (a fast model generates findings, a stronger model filters them) and posts human-only findings.
+
+- **Pi** — full in-chat mode commands + in-process checkpoint/navigator (primary ship)
 - **oh-my-pi (`omp`)** — native extension on the same core, using omp's own message/renderer API
-- **Opencode / Claude Code / Cursor** — follow-on adapters on the same core (conversational gate / daemon)
+- **Opencode / Claude Code / Cursor** — follow-on adapters on the same core (conversational gate / daemon), configured via `.pear/config.json` since these hosts have no in-chat command surface
 
 ## Requirements
 
 - Node.js 22.19.0 or later
 - [pi](https://github.com/badlogic/pi-mono) for the primary extension
 - [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) for the native omp extension
-- Git, if you want navigator reviews
+- Git, for `agent-driver`'s checkpoint file-provenance display and for `human-driver` (which requires a git working tree)
 
 ## Install (pi)
 
@@ -26,13 +30,7 @@ pi install "$(git rev-parse --show-toplevel)"
 pi -e ./adapters/pi/extensions/pear.ts
 ```
 
-Useful flags (registered by the extension):
-
-```sh
-pi --nav-model provider/id --pause-lines 150 --pause-edits 5 --no-nav
-```
-
-In-session: `/pear-status`, `/pear-setup`
+In-session: `/pear-mode [off|human-driver|agent-driver]`, `/pear-config`, `/pear-status`
 
 ## Install (omp)
 
@@ -45,23 +43,30 @@ omp plugin link "$(git rev-parse --show-toplevel)" --scope user
 omp --extension ./adapters/omp/extensions/pear.ts
 ```
 
-Useful flags (registered by the extension):
+In-session: `/pear-mode [off|human-driver|agent-driver]`, `/pear-config`, `/pear-status`
 
-```sh
-omp --nav-model provider/id --pause-lines 150 --pause-edits 5 --no-nav
-```
+## Configuration
 
-In-session: `/pear-status`, `/pear-setup`
+Pi and omp read/write `.pear/config.json` in the project root (gitignored) via `/pear-mode` and `/pear-config`. Fields and defaults:
 
-## Navigator model
+| Field | Default | Applies to |
+|---|---|---|
+| `mode` | `"off"` | all — `"off" \| "human-driver" \| "agent-driver"` |
+| `reviewModel` | `openai/gpt-5.6-terra` | `human-driver` — small/fast model that generates findings |
+| `filterModel` | `openai/gpt-5.6-sol` | `human-driver` — larger model that filters those findings |
+| `minLines` | `50` | `human-driver` — min changed lines before a review fires |
+| `debounceSeconds` | `10` | `human-driver` — quiet period after the last edit |
+| `intervalSeconds` | `60` | `human-driver` — min seconds between reviews |
+| `checkpointSeconds` | `300` | `agent-driver` — wall-clock cadence before a forced pause |
+| `maxChangesPerCheckpoint` | `3` | `agent-driver` — mutating tool calls per checkpoint |
 
-On first session in a git repo, pi/omp ask once which model the navigator should use — sourced from your configured models, not a hardcoded list — and save the answer to `~/.pear/config.json` (global), applied across every project and host, including the Claude Code/Cursor daemon. `--nav-model provider/id` always overrides it for that run. Re-run the picker with `/pear-setup` (pi/omp) or, from a checkout:
+`mode` and the cadence fields are project-scoped only (no global fallback). `reviewModel`/`filterModel` fall back to `~/.pear/config.json` (global), then to the defaults above.
+
+Claude Code and Cursor have no in-chat command surface: they read the same `.pear/config.json` plus `~/.pear/config.json`, and `SessionStart` nudges once with the setup command when nothing is configured. Run interactively from a checkout:
 
 ```sh
 npm run setup
 ```
-
-Claude Code and Cursor have no interactive picker; `SessionStart` nudges once with the exact command to run when nothing is configured. A single project can override the global choice by hand-editing `.pear/config.json` in that repo (gitignored; project config wins over global).
 
 ## Development
 

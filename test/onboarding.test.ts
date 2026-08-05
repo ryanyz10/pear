@@ -1,12 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { maybeOnboardNavModel, ONBOARDING_SKIP, type OnboardingUi } from "../adapters/shared/pear-runtime.ts";
-import { DEFAULTS } from "../core/config.ts";
+import { ensureModelsConfigured, type ModelPickerUi } from "../adapters/shared/pear-runtime.ts";
+import { DEFAULTS, type PearConfig } from "../core/config.ts";
 
 function fakeUi(selectResult: string | undefined) {
   const notifies: Array<{ message: string; type?: string }> = [];
   const selects: Array<{ title: string; choices: string[] }> = [];
-  const ui: OnboardingUi = {
+  const ui: ModelPickerUi = {
     select: async (title, choices) => {
       selects.push({ title, choices });
       return selectResult;
@@ -16,110 +16,110 @@ function fakeUi(selectResult: string | undefined) {
   return { ui, notifies, selects };
 }
 
-function baseOpts(overrides: Partial<Parameters<typeof maybeOnboardNavModel>[0]> = {}) {
-  const { ui } = fakeUi(undefined);
-  return {
-    ui,
-    hasUI: true,
-    isGit: true,
-    noNav: false,
-    cliOverride: false,
-    hasPreference: false,
-    availableModels: ["anthropic/claude-opus-4"],
-    save: () => {},
-    ...overrides,
-  };
-}
+const cfg = (over: Partial<Required<PearConfig>> = {}): Required<PearConfig> => ({
+  mode: "human-driver",
+  reviewModel: DEFAULTS.reviewModel,
+  filterModel: DEFAULTS.filterModel,
+  minLines: DEFAULTS.minLines,
+  debounceSeconds: DEFAULTS.debounceSeconds,
+  intervalSeconds: DEFAULTS.intervalSeconds,
+  checkpointSeconds: DEFAULTS.checkpointSeconds,
+  maxChangesPerCheckpoint: DEFAULTS.maxChangesPerCheckpoint,
+  ...over,
+});
 
-describe("maybeOnboardNavModel gating", () => {
-  it("never prompts when hasUI is false", async () => {
-    const { ui, selects } = fakeUi("anthropic/claude-opus-4");
-    const result = await maybeOnboardNavModel(baseOpts({ ui, hasUI: false }));
-    assert.equal(result, undefined);
-    assert.equal(selects.length, 0);
+describe("ensureModelsConfigured gating", () => {
+  it("agent-driver has no model requirement, even with empty model fields", async () => {
+    const { ui } = fakeUi(undefined);
+    const result = await ensureModelsConfigured(
+      "agent-driver",
+      cfg({ reviewModel: "", filterModel: "" }),
+      ui,
+      [],
+      true,
+    );
+    assert.deepEqual(result, { ok: true, patch: {} });
   });
 
-  it("never prompts when isGit is false", async () => {
-    const { ui, selects } = fakeUi("anthropic/claude-opus-4");
-    const result = await maybeOnboardNavModel(baseOpts({ ui, isGit: false }));
-    assert.equal(result, undefined);
-    assert.equal(selects.length, 0);
+  it("off has no model requirement", async () => {
+    const { ui } = fakeUi(undefined);
+    const result = await ensureModelsConfigured("off", cfg(), ui, [], true);
+    assert.deepEqual(result, { ok: true, patch: {} });
   });
 
-  it("never prompts when noNav is true", async () => {
-    const { ui, selects } = fakeUi("anthropic/claude-opus-4");
-    const result = await maybeOnboardNavModel(baseOpts({ ui, noNav: true }));
-    assert.equal(result, undefined);
-    assert.equal(selects.length, 0);
-  });
-
-  it("never prompts when cliOverride is true", async () => {
-    const { ui, selects } = fakeUi("anthropic/claude-opus-4");
-    const result = await maybeOnboardNavModel(baseOpts({ ui, cliOverride: true }));
-    assert.equal(result, undefined);
-    assert.equal(selects.length, 0);
-  });
-
-  it("never prompts when hasPreference is true", async () => {
-    const { ui, selects } = fakeUi("anthropic/claude-opus-4");
-    const result = await maybeOnboardNavModel(baseOpts({ ui, hasPreference: true }));
-    assert.equal(result, undefined);
+  it("human-driver with both models already set returns ok with an empty patch, no prompt", async () => {
+    const { ui, selects } = fakeUi(undefined);
+    const result = await ensureModelsConfigured("human-driver", cfg(), ui, ["a/b"], true);
+    assert.deepEqual(result, { ok: true, patch: {} });
     assert.equal(selects.length, 0);
   });
 });
 
-describe("maybeOnboardNavModel choice handling", () => {
-  it("saves and returns the chosen model", async () => {
-    const { ui, notifies, selects } = fakeUi("anthropic/claude-opus-4");
-    let saved: { navModel: string } | undefined;
-    const result = await maybeOnboardNavModel(
-      baseOpts({ ui, save: (cfg) => (saved = cfg) }),
+describe("ensureModelsConfigured with UI", () => {
+  it("prompts only for the missing model field using the exact titles", async () => {
+    const { ui, selects } = fakeUi("anthropic/claude-sonnet-4-5");
+    const result = await ensureModelsConfigured(
+      "human-driver",
+      cfg({ filterModel: "" }),
+      ui,
+      ["anthropic/claude-sonnet-4-5"],
+      true,
     );
-    assert.equal(result, "anthropic/claude-opus-4");
-    assert.deepEqual(saved, { navModel: "anthropic/claude-opus-4" });
+    assert.deepEqual(result, { ok: true, patch: { filterModel: "anthropic/claude-sonnet-4-5" } });
     assert.equal(selects.length, 1);
-    assert.equal(
-      selects[0]!.title,
-      "Pick a model for pear's navigator (reviews your uncommitted changes):",
-    );
-    assert.deepEqual(selects[0]!.choices, ["anthropic/claude-opus-4", ONBOARDING_SKIP]);
-    assert.equal(notifies.length, 1);
-    assert.equal(notifies[0]!.type, "info");
+    assert.match(selects[0]!.title, /filter model/);
+    assert.deepEqual(selects[0]!.choices, ["anthropic/claude-sonnet-4-5"]);
   });
 
-  it("persists DEFAULTS.navModel and returns it when the user picks skip", async () => {
-    const { ui } = fakeUi(ONBOARDING_SKIP);
-    let saved: { navModel: string } | undefined;
-    const result = await maybeOnboardNavModel(
-      baseOpts({ ui, save: (cfg) => (saved = cfg) }),
+  it("prompts for both missing fields using the exact review/filter titles", async () => {
+    const { ui, selects } = fakeUi("openai/gpt-test");
+    const result = await ensureModelsConfigured(
+      "human-driver",
+      cfg({ reviewModel: "", filterModel: "" }),
+      ui,
+      ["openai/gpt-test"],
+      true,
     );
-    assert.equal(result, DEFAULTS.navModel);
-    assert.deepEqual(saved, { navModel: DEFAULTS.navModel });
+    assert.deepEqual(result, {
+      ok: true,
+      patch: { reviewModel: "openai/gpt-test", filterModel: "openai/gpt-test" },
+    });
+    assert.equal(selects.length, 2);
+    assert.match(selects[0]!.title, /review model/);
+    assert.match(selects[1]!.title, /filter model/);
   });
 
-  it("saves nothing and returns undefined when dismissed", async () => {
+  it("fails when the selection is dismissed", async () => {
     const { ui } = fakeUi(undefined);
-    let saveCalled = false;
-    const result = await maybeOnboardNavModel(
-      baseOpts({ ui, save: () => (saveCalled = true) }),
+    const result = await ensureModelsConfigured("human-driver", cfg({ reviewModel: "" }), ui, ["a/b"], true);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.reason, /reviewModel and filterModel/);
+  });
+});
+
+describe("ensureModelsConfigured headless", () => {
+  it("fails with a clear reason instead of prompting when a model is missing", async () => {
+    const { ui, selects } = fakeUi(undefined);
+    const result = await ensureModelsConfigured(
+      "human-driver",
+      cfg({ filterModel: "" }),
+      ui,
+      ["a/b"],
+      false,
     );
-    assert.equal(result, undefined);
-    assert.equal(saveCalled, false);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(
+        result.reason,
+        "human-driver needs reviewModel and filterModel set — run /pear-config first",
+      );
+    }
+    assert.equal(selects.length, 0);
   });
 
-  it("returns the selected model, notifies an error, and does not throw when save fails", async () => {
-    const { ui, notifies } = fakeUi("anthropic/claude-opus-4");
-    const result = await maybeOnboardNavModel(
-      baseOpts({
-        ui,
-        save: () => {
-          throw new Error("disk full");
-        },
-      }),
-    );
-    assert.equal(result, "anthropic/claude-opus-4");
-    assert.equal(notifies.length, 1);
-    assert.equal(notifies[0]!.type, "error");
-    assert.match(notifies[0]!.message, /disk full/);
+  it("succeeds headless when both models are already set", async () => {
+    const { ui } = fakeUi(undefined);
+    const result = await ensureModelsConfigured("human-driver", cfg(), ui, [], false);
+    assert.deepEqual(result, { ok: true, patch: {} });
   });
 });

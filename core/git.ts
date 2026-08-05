@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 /** Git's empty-tree object — unborn repos (no commits yet) diff against this. */
@@ -137,6 +137,33 @@ export function stateHash(cwd: string): string {
   return createHash("sha1").update(tracked).update("\0").update(framing).update("\0").update(untracked).digest("hex");
 }
 
+/**
+ * Cheap, metadata-sensitive poll signal: `git status` plus size/mtime for
+ * every changed/untracked path. Never reads file contents — a known ceiling
+ * is that two edits to the same path preserving size and filesystem
+ * timestamp precision may collide, which can delay (never corrupt) a review
+ * that later runs against the authoritative `diffText`. Upgrade path if this
+ * proves inadequate: fall back to `stateHash`'s full content hash.
+ */
+export function quickStateHash(cwd: string): string {
+  const r = git(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+    encoding: "buffer",
+  });
+  const raw = (r.stdout as Buffer) ?? Buffer.alloc(0);
+  const meta = parseZPaths(raw)
+    .map((rel) => {
+      try {
+        const st = statSync(join(cwd, rel), { bigint: true });
+        const mtime = st.mtimeNs !== undefined ? st.mtimeNs.toString() : String(st.mtimeMs);
+        return `${rel}:${st.size}:${mtime}`;
+      } catch {
+        return `${rel}:missing`;
+      }
+    })
+    .join("\n");
+  return createHash("sha1").update(raw).update("\0").update(meta).digest("hex");
+}
+
 export function diffText(cwd: string): string {
   const b = base(cwd);
   let text = String(git(cwd, ["diff", b]).stdout ?? "");
@@ -156,6 +183,41 @@ export function changedFiles(cwd: string): string[] {
     .split("\n")
     .filter(Boolean);
   return [...new Set([...tracked, ...untrackedPaths(cwd)])];
+}
+
+/**
+ * Per-path content hash for every path `changedFiles` would return: tracked
+ * paths hash `git diff <base> -- <path>`, untracked paths hash the file's
+ * own bytes. A missing/unreadable path is omitted. Runs only at checkpoint
+ * time over the small set of actually-dirty paths, never on the 2-second
+ * poll — distinct from `quickStateHash` (change detection) and `stateHash`
+ * (whole-tree dedup key): this answers "which paths changed since a baseline."
+ */
+export function fileStateHashes(cwd: string): Map<string, string> {
+  const b = base(cwd);
+  const tracked = String(git(cwd, ["diff", b, "--name-only"]).stdout ?? "")
+    .split("\n")
+    .filter(Boolean);
+  const result = new Map<string, string>();
+  for (const rel of tracked) {
+    try {
+      const out = String(git(cwd, ["diff", b, "--", rel]).stdout ?? "");
+      result.set(rel, createHash("sha1").update(out).digest("hex"));
+    } catch {
+      /* omit: path unreadable */
+    }
+  }
+  for (const rel of untrackedPaths(cwd)) {
+    if (result.has(rel)) continue;
+    const abs = join(cwd, rel);
+    if (!existsSync(abs)) continue;
+    try {
+      result.set(rel, createHash("sha1").update(readFileSync(abs)).digest("hex"));
+    } catch {
+      /* omit unreadable */
+    }
+  }
+  return result;
 }
 
 export function gitOk(cwd: string): boolean {

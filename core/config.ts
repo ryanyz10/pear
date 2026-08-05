@@ -1,40 +1,38 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type Config = {
-  cwd: string;
-  driveModel: string;
-  navModel: string;
-  pauseLines: number;
-  pauseEdits: number;
-  minLines: number;
-  debounceSeconds: number;
-  intervalSeconds: number;
-  noNav: boolean;
-  isGit: boolean;
+export type Mode = "off" | "human-driver" | "agent-driver";
+
+export type PearConfig = {
+  mode?: Mode;
+  reviewModel?: string; // human-driver: small/fast model that generates findings
+  filterModel?: string; // human-driver: large model that filters those findings
+  minLines?: number; // human-driver: min changed lines before a review fires
+  debounceSeconds?: number; // human-driver: quiet period after last edit
+  intervalSeconds?: number; // human-driver: min seconds between reviews
+  checkpointSeconds?: number; // agent-driver: wall-clock cadence before forced pause
+  maxChangesPerCheckpoint?: number; // agent-driver: mutating tool-calls per checkpoint
 };
 
 export const DEFAULTS = {
-  driveModel: "openai/gpt-5.6-terra",
-  navModel: "openai/gpt-5.6-terra",
-  pauseLines: 150,
-  pauseEdits: 5,
+  mode: "off",
+  reviewModel: "openai/gpt-5.6-terra",
+  filterModel: "openai/gpt-5.6-sol",
   minLines: 50,
   debounceSeconds: 10,
   intervalSeconds: 60,
-} as const;
+  checkpointSeconds: 300,
+  maxChangesPerCheckpoint: 3,
+} as const satisfies Required<PearConfig>;
 
-export type BudgetStats = { lines: number; mutations: number };
-export type BudgetCfg = { pauseLines: number; pauseEdits: number };
-
-export function overBudget(
-  current: BudgetStats,
-  baseline: BudgetStats,
-  cfg: BudgetCfg,
+/** Pure OR gate for the agent-driver checkpoint cadence. */
+export function checkpointDue(
+  current: { elapsedMs: number; changes: number },
+  cfg: { checkpointSeconds: number; maxChangesPerCheckpoint: number },
 ): boolean {
   return (
-    current.lines - baseline.lines >= cfg.pauseLines ||
-    current.mutations - baseline.mutations >= cfg.pauseEdits
+    current.elapsedMs >= cfg.checkpointSeconds * 1000 ||
+    current.changes >= cfg.maxChangesPerCheckpoint
   );
 }
 
@@ -64,30 +62,99 @@ export function parseModel(spec: string): { provider: string; id: string } {
   return { provider: spec.slice(0, i), id: spec.slice(i + 1) };
 }
 
-export type PearUserConfig = { navModel?: string };
+export type PearUserConfig = PearConfig;
 
-/** Reads `<baseDir>/.pear/config.json`. Missing, malformed, or invalid-model config → `{}`. */
+function isMode(v: unknown): v is Mode {
+  return v === "off" || v === "human-driver" || v === "agent-driver";
+}
+
+const POSITIVE_INT_FIELDS = [
+  "minLines",
+  "debounceSeconds",
+  "intervalSeconds",
+  "checkpointSeconds",
+  "maxChangesPerCheckpoint",
+] as const;
+const MODEL_FIELDS = ["reviewModel", "filterModel"] as const;
+
+function isPositiveInt(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v > 0;
+}
+
+/**
+ * Validates each `PearConfig` field independently against the full schema:
+ * `mode` must be one of the three literals, the cadence fields must be
+ * positive integers, and the model fields must pass `parseModel`. An invalid
+ * field is dropped; the rest of a valid object is kept. Unknown/legacy keys
+ * are silently ignored. Shared by `loadUserConfig` and `saveUserConfig` so
+ * neither can persist or read back a field the other would reject.
+ */
+function sanitizePearConfig(raw: Record<string, unknown>): PearUserConfig {
+  const out: PearUserConfig = {};
+  if (isMode(raw.mode)) out.mode = raw.mode;
+  for (const field of POSITIVE_INT_FIELDS) {
+    if (isPositiveInt(raw[field])) out[field] = raw[field] as number;
+  }
+  for (const field of MODEL_FIELDS) {
+    if (typeof raw[field] === "string") {
+      try {
+        parseModel(raw[field] as string);
+        out[field] = raw[field] as string;
+      } catch {
+        /* drop invalid model spec, keep the rest of the object */
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Reads `<baseDir>/.pear/config.json`. Missing or malformed JSON → `{}`.
+ * Each field is validated independently via `sanitizePearConfig`: an invalid
+ * field is dropped while the rest of a valid file is kept.
+ */
 export function loadUserConfig(baseDir: string): PearUserConfig {
+  let raw: Record<string, unknown>;
   try {
-    const raw = JSON.parse(
-      readFileSync(join(baseDir, ".pear", "config.json"), "utf8"),
-    ) as Record<string, unknown>;
-    if (typeof raw.navModel !== "string") return {};
-    parseModel(raw.navModel);
-    return { navModel: raw.navModel };
+    raw = JSON.parse(readFileSync(join(baseDir, ".pear", "config.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
   } catch {
     return {};
   }
+  return sanitizePearConfig(raw);
 }
 
-/** Writes `<baseDir>/.pear/config.json`, creating the `.pear` dir if needed. */
+/**
+ * Writes `<baseDir>/.pear/config.json`, creating the `.pear` dir if needed.
+ * `cfg` is sanitized through the same per-field validation as
+ * `loadUserConfig` before being written, so an invalid field is dropped
+ * rather than persisted.
+ */
 export function saveUserConfig(baseDir: string, cfg: PearUserConfig): void {
-  if (cfg.navModel !== undefined) parseModel(cfg.navModel);
+  const sanitized = sanitizePearConfig(cfg);
   mkdirSync(join(baseDir, ".pear"), { recursive: true });
-  writeFileSync(join(baseDir, ".pear", "config.json"), JSON.stringify(cfg, null, 2) + "\n");
+  writeFileSync(join(baseDir, ".pear", "config.json"), JSON.stringify(sanitized, null, 2) + "\n");
 }
 
-/** Project config (`projectDir/.pear/config.json`) overrides global (`homeDir/.pear/config.json`). */
-export function resolveNavModelPreference(projectDir: string, homeDir: string): string | undefined {
-  return loadUserConfig(projectDir).navModel ?? loadUserConfig(homeDir).navModel;
+/**
+ * Resolves the effective config: `DEFAULTS`, overlaid with `{ reviewModel,
+ * filterModel }` from the global config, then overlaid with every field from
+ * the project config. Project wins on every field; global only ever
+ * contributes model choice; `mode` has no global fallback.
+ */
+export function resolveConfig(projectDir: string, homeDir: string): Required<PearConfig> {
+  const global = loadUserConfig(homeDir);
+  const project = loadUserConfig(projectDir);
+  return {
+    mode: project.mode ?? DEFAULTS.mode,
+    reviewModel: project.reviewModel ?? global.reviewModel ?? DEFAULTS.reviewModel,
+    filterModel: project.filterModel ?? global.filterModel ?? DEFAULTS.filterModel,
+    minLines: project.minLines ?? DEFAULTS.minLines,
+    debounceSeconds: project.debounceSeconds ?? DEFAULTS.debounceSeconds,
+    intervalSeconds: project.intervalSeconds ?? DEFAULTS.intervalSeconds,
+    checkpointSeconds: project.checkpointSeconds ?? DEFAULTS.checkpointSeconds,
+    maxChangesPerCheckpoint: project.maxChangesPerCheckpoint ?? DEFAULTS.maxChangesPerCheckpoint,
+  };
 }
