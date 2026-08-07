@@ -1,325 +1,496 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { streamSimple } from "@earendil-works/pi-ai/compat";
+/**
+ * pear as a pi extension.
+ *
+ * This file is the only pi-specific code in the project; everything it calls
+ * lives in `core/` or `adapters/pi/runtime.ts`. Porting pear to another
+ * harness means rewriting this file alone.
+ *
+ * API facts relied on here are recorded in `docs/pi-api-notes.md`, verified
+ * against the pinned pi version.
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { homedir } from "node:os";
+import { Type } from "typebox";
+import { captureGitState } from "../../../core/git.ts";
 import {
-  loadUserConfig,
-  resolveConfig,
-  saveUserConfig,
+  ConfigWriteError,
+  MAX_CHANGES,
+  MIN_CHANGES,
+  MODES,
+  isValidMaxChanges,
+  loadConfig,
+  saveConfig,
   type Mode,
-  type PearConfig,
 } from "../../../core/config.ts";
 import {
-  createPearSession,
-  ensureModelsConfigured,
-  resolveNavComplete,
-  type Complete,
-  type PearSession,
-  type ReviewCompletions,
-} from "../runtime.ts";
+  AGENT_DRIVER_PERSONA,
+  CHECKPOINT_TOOL_DESCRIPTION,
+  CHECKPOINT_TOOL_NAME,
+  resultCheckpointFailed,
+} from "../../../core/prompts.ts";
+import { createRuntime, type CheckpointOutcome, type PearRuntime } from "../runtime.ts";
+import { renderCheckpointCard, type CardAnswer } from "./checkpoint-card.ts";
 
-type FindingsData = { lines: string };
-type ConfigField =
-  | "mode"
-  | "reviewModel"
-  | "filterModel"
-  | "checkpointModel"
-  | "minLines"
-  | "debounceSeconds"
-  | "intervalSeconds"
-  | "checkpointSeconds"
-  | "maxChangesPerCheckpoint";
+const CheckpointParams = Type.Object({
+  summary: Type.String({ description: "What you changed and why, in plain language." }),
+  files: Type.Array(Type.String(), { description: "Files you touched, so the human can review them." }),
+  next: Type.String({ description: "What you plan to do next." }),
+});
 
-const MODES = ["off", "human-driver", "agent-driver"] as const;
-const NUMERIC_FIELDS: readonly ConfigField[] = [
-  "minLines",
-  "debounceSeconds",
-  "intervalSeconds",
-  "checkpointSeconds",
-  "maxChangesPerCheckpoint",
-];
+type CheckpointDetails = {
+  summary: string;
+  claimedFiles: string[];
+  gitFiles: string[];
+  verified: boolean;
+  answer: string;
+};
 
-export default function (pi: ExtensionAPI) {
-  pi.registerEntryRenderer<FindingsData>("pear-nav", (entry, _opts, theme) => {
-    const lines = entry.data?.lines ?? "";
-    return new Text(theme.fg("accent", lines), 0, 0);
-  });
+export default function pear(pi: ExtensionAPI) {
+  // `runtime.mode` is the single source of truth for the mode this session is
+  // actually running, which can differ from what is on disk (see the headless
+  // policy below). Deliberately not mirrored in a second variable.
+  let runtime: PearRuntime | null = null;
 
-  let session: PearSession | null = null;
+  const captureFiles = (cwd: string) => () => {
+    const state = captureGitState(cwd);
+    return state.ok ? state.files : null;
+  };
 
-  async function resolveCompletions(
-    cfg: Required<PearConfig>,
-    ctx: { modelRegistry: Parameters<typeof resolveNavComplete>[0] },
-  ): Promise<ReviewCompletions> {
-    const [small, large] = await Promise.all([
-      resolveNavComplete(ctx.modelRegistry, cfg.reviewModel, streamSimple as any),
-      resolveNavComplete(ctx.modelRegistry, cfg.filterModel, streamSimple as any),
-    ]);
-    return { small, large };
-  }
-
-  async function resolveCheckpointJudge(
-    cfg: Required<PearConfig>,
-    ctx: { modelRegistry: Parameters<typeof resolveNavComplete>[0] },
-  ): Promise<Complete | null> {
-    if (!cfg.checkpointModel) return null;
-    // Best-effort: agent-driver never requires a model, so a registry/auth
-    // exception here must degrade to today's deterministic behavior, not
-    // crash session startup/mode switching.
+  const refreshStatus = (ctx: { ui: { setStatus: (k: string, t: string | undefined) => void } }) => {
+    if (runtime === null) return;
     try {
-      return await resolveNavComplete(ctx.modelRegistry, cfg.checkpointModel, streamSimple as any);
+      ctx.ui.setStatus("pear", runtime.statusText());
     } catch {
-      return null;
+      /* status is cosmetic */
     }
-  }
+  };
 
-  async function applyMode(
-    target: Mode,
-    ctx: {
-      cwd: string;
-      hasUI: boolean;
-      ui: {
-        select: (t: string, c: string[]) => Promise<string | undefined>;
-        notify: (m: string, ty?: "info" | "warning" | "error") => void;
-      };
-      modelRegistry: Parameters<typeof resolveNavComplete>[0] & {
-        getAvailable: () => Array<{ provider: string; id: string }>;
-      };
-    },
-  ): Promise<void> {
-    const homeDir = homedir();
-    if (target === "human-driver") {
-      const cfgNow = resolveConfig(ctx.cwd, homeDir);
-      const availableModels = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
-      const result = await ensureModelsConfigured(
-        "human-driver",
-        cfgNow,
-        { select: ctx.ui.select, notify: ctx.ui.notify },
-        availableModels,
-        ctx.hasUI,
+  /**
+   * `ui.custom` only works in the TUI. `hasUI` is also true in RPC, where it
+   * silently no-ops, so tiering on `hasUI` would degrade the checkpoint to
+   * nothing. See docs/pi-api-notes.md.
+   */
+  const canShowCard = (ctx: ExtensionContext) => ctx.mode === "tui";
+  const canShowDialogs = (ctx: ExtensionContext) => ctx.hasUI;
+
+  // ---------------------------------------------------------------- session
+
+  pi.on("session_start", (_event, ctx) => {
+    const loaded = loadConfig(ctx.cwd);
+
+    if (loaded.legacyMode !== undefined) {
+      ctx.ui.notify(
+        `pear: "${loaded.legacyMode}" mode isn't available in this version — running off. ` +
+          `Your config file was left unchanged. Use /pear-mode for agent-driver.`,
+        "warning",
       );
-      if (!result.ok) {
-        ctx.ui.notify(result.reason, "error");
-        return;
-      }
-      saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), ...result.patch, mode: "human-driver" });
-      const resolvedCfg = resolveConfig(ctx.cwd, homeDir);
-      const completions = await resolveCompletions(resolvedCfg, ctx);
-      if (!completions.small || !completions.large) {
-        ctx.ui.notify("pear: could not resolve reviewModel/filterModel — mode unchanged", "error");
-        return;
-      }
-      session?.setMode("human-driver", resolvedCfg, completions);
-    } else {
-      saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), mode: target });
-      const resolvedCfg = resolveConfig(ctx.cwd, homeDir);
-      const checkpointJudge = target === "agent-driver" ? await resolveCheckpointJudge(resolvedCfg, ctx) : null;
-      session?.setMode(target, resolvedCfg, { small: null, large: null, checkpointJudge });
     }
-    ctx.ui.notify(`pear: mode set to ${target}`, "info");
-  }
-
-  pi.on("session_start", async (_event, ctx) => {
-    const homeDir = homedir();
-    const cfg = resolveConfig(ctx.cwd, homeDir);
-
-    let completions: ReviewCompletions = { small: null, large: null, checkpointJudge: null };
-    if (cfg.mode === "human-driver") {
-      const { small, large } = await resolveCompletions(cfg, ctx);
-      completions = { small, large, checkpointJudge: null };
-      if (!small || !large) {
-        ctx.ui.notify(
-          "pear: human-driver needs reviewModel and filterModel available — check /pear-config",
-          "warning",
-        );
-      }
-    } else if (cfg.mode === "agent-driver") {
-      completions = { small: null, large: null, checkpointJudge: await resolveCheckpointJudge(cfg, ctx) };
+    if (loaded.malformed) {
+      ctx.ui.notify(
+        "pear: .pear/config.json could not be parsed — using defaults. " +
+          "It will be backed up before any change is saved.",
+        "warning",
+      );
     }
 
-    session = createPearSession({
+    // Headless fail-closed: never approve changes without a human present.
+    let startMode: Mode = loaded.config.mode;
+    if (startMode === "agent-driver" && !canShowDialogs(ctx)) {
+      ctx.ui.notify(
+        "pear: agent-driver needs an interactive session to show checkpoints — running off for this session. " +
+          "Config unchanged.",
+        "warning",
+      );
+      startMode = "off";
+    }
+
+    runtime = createRuntime({
       cwd: ctx.cwd,
-      cfg,
-      completions,
-      ui: {
-        hasUI: ctx.hasUI,
-        notify: (message, type) => ctx.ui.notify(message, type),
-        setStatus: (key, text) => ctx.ui.setStatus(key, text),
-      },
-      onFindings: (text) => pi.appendEntry<FindingsData>("pear-nav", { lines: text }),
-      sendUserMessage: (text) => pi.sendUserMessage(text),
-      saveConfig: (patch) => saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), ...patch }),
+      mode: startMode,
+      maxChangesPerCheckpoint: loaded.config.maxChangesPerCheckpoint,
+      captureFiles: captureFiles(ctx.cwd),
     });
-    session.start();
+    refreshStatus(ctx);
   });
 
+  // A pending card must not outlive the session (quit, reload, fork, ...).
   pi.on("session_shutdown", () => {
-    session?.stop();
-    session = null;
+    runtime?.resolvePending({ kind: "cancelled" });
   });
 
-  pi.on("before_agent_start", async (event) => {
-    if (!session) return undefined;
-    return { systemPrompt: session.personaSystemPrompt(event.systemPrompt) };
+  // --------------------------------------------------------------- persona
+
+  pi.on("before_agent_start", (event) => {
+    if (runtime === null || runtime.mode !== "agent-driver") return undefined;
+    return { systemPrompt: `${event.systemPrompt}\n\n${AGENT_DRIVER_PERSONA}` };
   });
 
-  pi.on("agent_start", (_event, _ctx) => {
-    session?.onAgentStart();
-  });
+  // ------------------------------------------------------------ the gate
 
-  pi.on("agent_end", async (_event, _ctx) => {
-    await session?.onAgentEnd();
-  });
-
-  pi.on("turn_end", () => {
-    session?.onTurnEnd();
-  });
-
-  pi.on("tool_call", async (event, ctx) => {
-    if (!session) return undefined;
-    const decision = await session.onToolCall({
-      toolCallId: event.toolCallId,
-      toolName: event.toolName,
-      input: event.input as Record<string, unknown>,
-    });
-    if (decision?.block) ctx.abort();
+  pi.on("tool_call", (event, ctx) => {
+    if (runtime === null) return undefined;
+    const decision = runtime.onMutatingToolCall(
+      event.toolName,
+      event.toolCallId,
+      event.input as Record<string, unknown>,
+    );
+    refreshStatus(ctx);
+    // NOTE: no ctx.abort(). Returning the block is what lets the model read
+    // the reason and recover; aborting is what broke the previous version.
     return decision;
   });
 
-  pi.on("tool_result", (event) => {
-    session?.onToolResult(event.toolCallId, event.isError);
+  pi.on("tool_result", (event, ctx) => {
+    if (runtime === null) return;
+    runtime.onToolResult(event.toolCallId, event.isError);
+    refreshStatus(ctx);
   });
 
+  /**
+   * Only genuine user input clears a stop. `source === "extension"` is a
+   * message injected by an extension via sendUserMessage, which must not be
+   * able to override the human.
+   */
+  pi.on("input", (event, ctx) => {
+    if (runtime === null) return undefined;
+    if (event.source !== "extension") {
+      runtime.onUserInput();
+      refreshStatus(ctx);
+    }
+    return undefined;
+  });
+
+  /**
+   * `agent_settled` — not `agent_end` — is the terminal boundary: pi may still
+   * auto-retry or run a queued continuation after `agent_end`.
+   */
+  pi.on("agent_settled", (_event, ctx) => {
+    if (runtime === null || runtime.mode !== "agent-driver") return;
+    const outstanding = runtime.onAgentSettled();
+    if (outstanding > 0) {
+      ctx.ui.notify(
+        `pear: ${outstanding} change${outstanding === 1 ? "" : "s"} not yet checkpointed. ` +
+          `Run /pear-checkpoint to review them.`,
+        "info",
+      );
+    }
+    refreshStatus(ctx);
+  });
+
+  // ------------------------------------------------------ checkpoint tool
+
+  /** Ask the human, by whatever means this host supports right now. */
+  async function askHuman(ctx: ExtensionContext, view: {
+    summary: string;
+    next: string;
+    claimedFiles: string[];
+    gitFiles: string[];
+    verified: boolean;
+    verifyDetail?: string;
+  }): Promise<CheckpointOutcome> {
+    if (canShowCard(ctx)) {
+      const answer: CardAnswer | null = await ctx.ui.custom((tui, theme, _kb, done) =>
+        renderCheckpointCard(tui, theme, done, view),
+      );
+      if (answer === null) return { kind: "cancelled" };
+      if (answer.kind === "steer") return { kind: "steer", text: answer.text };
+      return answer.kind === "stop" ? { kind: "stop" } : { kind: "continue" };
+    }
+
+    // RPC: ui.custom no-ops, but dialogs work. Only offer outcomes we can
+    // actually complete here — an unavailable option must not silently
+    // become "cancelled".
+    const CONTINUE = "continue — looks good, keep going";
+    const STEER = "make changes — I'll type what to do";
+    const STOP = "stop — I'm taking over";
+    const options = [CONTINUE, STEER, STOP];
+
+    const picked = await ctx.ui.select(
+      `pear checkpoint: ${view.summary}\nNext: ${view.next}`,
+      options,
+    );
+    if (picked === undefined) return { kind: "cancelled" };
+    if (picked === STOP) return { kind: "stop" };
+    if (picked === STEER) {
+      const text = await ctx.ui.input("What should I do instead?");
+      if (text === undefined || text.trim() === "") return { kind: "cancelled" };
+      return { kind: "steer", text };
+    }
+    return { kind: "continue" };
+  }
+
+  /** Shared by the tool and the /pear-checkpoint command. */
+  async function runCheckpoint(
+    ctx: ExtensionContext,
+    claimed: { summary: string; files: string[]; next: string },
+  ): Promise<{ text: string; terminate: boolean; details: CheckpointDetails }> {
+    const rt = runtime;
+    if (rt === null) {
+      return {
+        text: resultCheckpointFailed("pear is not initialised"),
+        terminate: false,
+        details: { summary: claimed.summary, claimedFiles: claimed.files, gitFiles: [], verified: false, answer: "error" },
+      };
+    }
+
+    const started = rt.beginCheckpoint();
+    if ("immediate" in started) {
+      return {
+        text: started.immediate.text,
+        terminate: started.immediate.terminate,
+        details: {
+          summary: claimed.summary,
+          claimedFiles: claimed.files,
+          gitFiles: [],
+          verified: false,
+          answer: "not-run",
+        },
+      };
+    }
+
+    const { files: gitFiles, verified } = rt.filesSinceBaseline();
+
+    let outcome: CheckpointOutcome;
+    try {
+      // Race the human against every way this can be torn down. Whichever
+      // resolves first wins; the loser is a no-op because resolvePending and
+      // the promise itself are both idempotent.
+      const answered = askHuman(ctx, {
+        summary: claimed.summary,
+        next: claimed.next,
+        claimedFiles: claimed.files,
+        gitFiles,
+        verified,
+      }).then((o) => {
+        rt.resolvePending(o);
+        return o;
+      });
+      outcome = await Promise.race([started.pending.promise, answered]);
+    } catch (e) {
+      // A UI failure must not leave the card pending or the baseline moved.
+      rt.resolvePending({ kind: "cancelled" });
+      const detail = e instanceof Error ? e.message : String(e);
+      const resolution = rt.applyOutcome({ kind: "cancelled" });
+      return {
+        text: `${resultCheckpointFailed(detail)}\n\n${resolution.text}`,
+        terminate: resolution.terminate,
+        details: { summary: claimed.summary, claimedFiles: claimed.files, gitFiles, verified, answer: "error" },
+      };
+    }
+
+    const resolution = rt.applyOutcome(outcome);
+    refreshStatus(ctx);
+    return {
+      text: resolution.text,
+      terminate: resolution.terminate,
+      details: {
+        summary: claimed.summary,
+        claimedFiles: claimed.files,
+        gitFiles,
+        verified,
+        answer: outcome.kind,
+      },
+    };
+  }
+
+  pi.registerTool({
+    name: CHECKPOINT_TOOL_NAME,
+    label: "Checkpoint",
+    description: CHECKPOINT_TOOL_DESCRIPTION,
+    parameters: CheckpointParams,
+    // Keeps the card from opening while sibling mutations are still writing.
+    executionMode: "sequential",
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const onAbort = () => runtime?.resolvePending({ kind: "cancelled" });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        const { text, terminate, details } = await runCheckpoint(ctx, {
+          summary: params.summary,
+          files: params.files,
+          next: params.next,
+        });
+        return {
+          content: [{ type: "text" as const, text }],
+          details,
+          terminate,
+        };
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
+    },
+
+    renderCall(args, theme) {
+      const files = Array.isArray(args.files) ? args.files : [];
+      const head = theme.fg("toolTitle", theme.bold("checkpoint "));
+      const body = theme.fg("muted", String(args.summary ?? ""));
+      const tail = files.length ? theme.fg("dim", `\n  ${files.length} file(s)`) : "";
+      return new Text(head + body + tail, 0, 0);
+    },
+
+    renderResult(result, _options, theme) {
+      const d = result.details as CheckpointDetails | undefined;
+      if (d === undefined) return new Text("", 0, 0);
+      const label =
+        d.answer === "continue"
+          ? theme.fg("success", "✓ continue")
+          : d.answer === "steer"
+            ? theme.fg("accent", "✎ steering")
+            : d.answer === "stop"
+              ? theme.fg("warning", "■ stop")
+              : theme.fg("dim", d.answer);
+      return new Text(label, 0, 0);
+    },
+  });
+
+  // ------------------------------------------------------------- commands
+
   pi.registerCommand("pear-status", {
-    description: "Show pear's mode, checkpoint, and scheduler status",
+    description: "Show pear's mode and checkpoint budget",
     handler: async (_args, ctx) => {
-      const text = session?.statusText() ?? "pear: off — /pear-mode to start";
-      if (ctx.hasUI) ctx.ui.notify(text, "info");
+      if (runtime === null) {
+        ctx.ui.notify("pear: not initialised", "warning");
+        return;
+      }
+      const snap = runtime.checkpoint.snapshot();
+      const { files, verified } = runtime.filesSinceBaseline();
+      ctx.ui.notify(
+        `${runtime.statusText()}\n` +
+          `confirmed ${snap.confirmed}, in-flight ${snap.pending}, unknown ${snap.stale}\n` +
+          (verified ? `${files.length} file(s) changed since last checkpoint` : "file list unavailable (not a git repo)"),
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("pear-checkpoint", {
+    description: "Open a checkpoint yourself, without waiting for the agent",
+    handler: async (_args, ctx) => {
+      if (runtime === null) {
+        ctx.ui.notify("pear: not initialised", "warning");
+        return;
+      }
+      const { files } = runtime.filesSinceBaseline();
+      const { text } = await runCheckpoint(ctx, {
+        summary: "Checkpoint requested by you (navigator).",
+        files,
+        next: "(awaiting your direction)",
+      });
+      ctx.ui.notify(text, "info");
     },
   });
 
   pi.registerCommand("pear-mode", {
-    description: "Switch pear's mode: off | human-driver | agent-driver",
+    description: `Switch pear's mode: ${MODES.join(" | ")}`,
     handler: async (args, ctx) => {
-      const trimmed = args.trim();
-      if (trimmed !== "" && !(MODES as readonly string[]).includes(trimmed)) {
-        ctx.ui.notify(`pear: unknown mode "${trimmed}" — expected off, human-driver, or agent-driver`, "error");
+      if (runtime === null) {
+        ctx.ui.notify("pear: not initialised", "warning");
         return;
       }
-      let target: Mode;
+      const trimmed = args.trim();
+      let target: Mode | undefined;
+
       if (trimmed === "") {
         if (!ctx.hasUI) {
-          ctx.ui.notify(
-            "pear-mode requires a mode name in headless sessions: off | human-driver | agent-driver",
-            "warning",
-          );
+          ctx.ui.notify(`pear-mode needs a mode name here: ${MODES.join(" | ")}`, "warning");
           return;
         }
-        const choice = await ctx.ui.select("Pick pear's mode:", [...MODES]);
-        if (choice === undefined) return;
-        target = choice as Mode;
-      } else {
+        const picked = await ctx.ui.select("pear mode:", [...MODES]);
+        if (picked === undefined) return;
+        target = picked as Mode;
+      } else if ((MODES as readonly string[]).includes(trimmed)) {
         target = trimmed as Mode;
+      } else {
+        ctx.ui.notify(`pear: unknown mode "${trimmed}" — expected ${MODES.join(" or ")}`, "error");
+        return;
       }
-      await applyMode(target, ctx);
+
+      let persisted = true;
+      let detail = "";
+      try {
+        saveConfig(ctx.cwd, { mode: target });
+      } catch (e) {
+        persisted = false;
+        detail = e instanceof ConfigWriteError ? e.message : String(e);
+      }
+
+      // Saving a mode and running it are separate concerns: a scripted
+      // `pi -p "/pear-mode agent-driver"` is a legitimate way to set a project
+      // up. What we must not do is claim it is active when no human could
+      // answer a checkpoint here.
+      const runnable = target !== "agent-driver" || canShowDialogs(ctx);
+      runtime.setMode(runnable ? target : "off");
+      refreshStatus(ctx);
+
+      if (!persisted) {
+        ctx.ui.notify(
+          `pear: mode set to ${target} for this session only — NOT persisted: ${detail}`,
+          "warning",
+        );
+      } else if (!runnable) {
+        ctx.ui.notify(
+          `pear: saved mode=${target}, but it needs an interactive session to show checkpoints — ` +
+            `this session stays off.`,
+          "warning",
+        );
+      } else {
+        ctx.ui.notify(`pear: mode set to ${target}`, "info");
+      }
     },
   });
 
   pi.registerCommand("pear-config", {
-    description: "Adjust pear's mode, models, and cadence",
-    handler: async (_args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify("edit .pear/config.json directly, or run npm run setup", "warning");
+    description: "Set how many changes may pass between checkpoints",
+    handler: async (args, ctx) => {
+      if (runtime === null) {
+        ctx.ui.notify("pear: not initialised", "warning");
         return;
       }
-      const homeDir = homedir();
-      const cfgNow = resolveConfig(ctx.cwd, homeDir);
-      const entries: Array<{ key: ConfigField; label: string }> = [
-        { key: "mode", label: `mode (${cfgNow.mode})` },
-        { key: "reviewModel", label: `reviewModel (${cfgNow.reviewModel})` },
-        { key: "filterModel", label: `filterModel (${cfgNow.filterModel})` },
-        { key: "checkpointModel", label: `checkpointModel (${cfgNow.checkpointModel})` },
-        ...NUMERIC_FIELDS.map((key) => ({ key, label: `${key} (${cfgNow[key]})` })),
-      ];
-      const choice = await ctx.ui.select(
-        "Pick a field to change:",
-        entries.map((e) => e.label),
-      );
-      if (choice === undefined) return;
-      const field = entries.find((e) => e.label === choice)!.key;
-      const availableModels = ctx.modelRegistry.getAvailable().map((m) => `${m.provider}/${m.id}`);
+      const current = loadConfig(ctx.cwd).config;
+      let raw = args.trim();
 
-      if (field === "mode") {
-        const target = await ctx.ui.select("Pick pear's mode:", [...MODES]);
-        if (target === undefined) return;
-        await applyMode(target as Mode, ctx);
-        return;
-      }
-
-      if (field === "reviewModel" || field === "filterModel") {
-        const choiceModel = await ctx.ui.select(`Pick ${field}:`, availableModels);
-        if (choiceModel === undefined) return;
-        const candidateCfg: Required<PearConfig> = { ...cfgNow, [field]: choiceModel };
-        if (candidateCfg.mode === "human-driver") {
-          const completions = await resolveCompletions(candidateCfg, ctx);
-          if (!completions.small || !completions.large) {
-            ctx.ui.notify(`pear: could not resolve ${field}=${choiceModel} — not saved`, "error");
-            return;
-          }
-          saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), [field]: choiceModel });
-          session?.setMode("human-driver", candidateCfg, completions);
-        } else {
-          saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), [field]: choiceModel });
-        }
-        ctx.ui.notify(`pear: ${field} set to ${choiceModel}`, "info");
-        return;
-      }
-
-      if (field === "checkpointModel") {
-        const choiceModel = await ctx.ui.select(`Pick ${field}:`, availableModels);
-        if (choiceModel === undefined) return;
-        const candidateCfg: Required<PearConfig> = { ...cfgNow, checkpointModel: choiceModel };
-        saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), checkpointModel: choiceModel });
-        if (candidateCfg.mode === "agent-driver") {
-          const checkpointJudge = await resolveCheckpointJudge(candidateCfg, ctx);
-          if (!checkpointJudge) {
-            ctx.ui.notify(
-              `pear: saved checkpointModel=${choiceModel}, but it didn't resolve — checkpoints will keep pausing on cadence alone until it does`,
-              "warning",
-            );
-          }
-          session?.setMode("agent-driver", candidateCfg, { small: null, large: null, checkpointJudge });
-        } else {
-          ctx.ui.notify(`pear: checkpointModel set to ${choiceModel}`, "info");
-        }
-        return;
-      }
-
-      // Numeric field.
-      const raw = await ctx.ui.input(`New value for ${field} (positive integer):`);
-      if (raw === undefined) return;
-      const n = Number(raw);
-      if (!Number.isInteger(n) || n <= 0) {
-        ctx.ui.notify(`pear: ${field} must be a positive integer`, "error");
-        return;
-      }
-      const candidateCfg: Required<PearConfig> = { ...cfgNow, [field]: n };
-      if (candidateCfg.mode === "human-driver") {
-        const completions = await resolveCompletions(candidateCfg, ctx);
-        if (!completions.small || !completions.large) {
-          ctx.ui.notify(`pear: could not resolve reviewModel/filterModel — ${field} not saved`, "error");
+      if (raw === "") {
+        if (!ctx.hasUI) {
+          ctx.ui.notify(
+            `pear-config needs a number here (${MIN_CHANGES}-${MAX_CHANGES}); currently ${current.maxChangesPerCheckpoint}`,
+            "warning",
+          );
           return;
         }
-        saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), [field]: n });
-        session?.setMode("human-driver", candidateCfg, completions);
-      } else {
-        saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), [field]: n });
-        if (candidateCfg.mode === "agent-driver") {
-          const checkpointJudge = await resolveCheckpointJudge(candidateCfg, ctx);
-          session?.setMode("agent-driver", candidateCfg, { small: null, large: null, checkpointJudge });
-        }
+        const typed = await ctx.ui.input(
+          `Changes allowed between checkpoints (${MIN_CHANGES}-${MAX_CHANGES}), currently ${current.maxChangesPerCheckpoint}:`,
+        );
+        if (typed === undefined) return;
+        raw = typed.trim();
       }
-      ctx.ui.notify(`pear: ${field} set to ${n}`, "info");
+
+      const value = Number(raw);
+      if (!isValidMaxChanges(value)) {
+        ctx.ui.notify(
+          `pear: need a whole number between ${MIN_CHANGES} and ${MAX_CHANGES}`,
+          "error",
+        );
+        return;
+      }
+
+      let persisted = true;
+      let detail = "";
+      try {
+        saveConfig(ctx.cwd, { maxChangesPerCheckpoint: value });
+      } catch (e) {
+        persisted = false;
+        detail = e instanceof ConfigWriteError ? e.message : String(e);
+      }
+
+      runtime.setMaxChanges(value);
+      refreshStatus(ctx);
+      ctx.ui.notify(
+        persisted
+          ? `pear: up to ${value} change(s) between checkpoints`
+          : `pear: set to ${value} for this session only — NOT persisted: ${detail}`,
+        persisted ? "info" : "warning",
+      );
     },
   });
 }

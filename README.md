@@ -1,127 +1,183 @@
 # pear
 
-Pair-programming loop core + host adapters.
+A pair-programming loop for [pi](https://github.com/badlogic/pi-mono). The agent
+drives; you navigate. After each logical change it stops, tells you what it did
+and why, shows you which files moved, and asks what to do next:
 
-Pear runs in exactly one mode at a time, per project:
+```
+──────────────────────────────────────────────
+ pear checkpoint
 
-- **`off`** (default) — no gating, no reviews.
-- **`agent-driver`** — you drive; pear gates mutating tool calls with a wall-clock + change-count checkpoint so the agent pauses and explains itself periodically.
-- **`human-driver`** — the human drives; pear runs a background navigator that reviews uncommitted changes with a two-stage review (a fast model generates findings, a stronger model filters them) and posts human-only findings.
+ Session tokens weren't cleared on logout, so a reused browser session
+ could resurrect an old identity. Cleared the store in logout() and
+ added a test for the reuse case.
 
-- **Pi** — full in-chat mode commands + in-process checkpoint/navigator (primary ship)
-- **oh-my-pi (`omp`)** — native extension on the same core, using omp's own message/renderer API
-- **Opencode / Claude Code / Cursor** — follow-on adapters on the same core (conversational gate / daemon), configured via `.pear/config.json` since these hosts have no in-chat command surface
+ changed since last checkpoint (git, best-effort) — 2
+   src/auth.ts
+   test/auth.test.ts
 
-## Requirements
+ next: audit the refresh path for the same bug
 
-- Node.js 22.19.0 or later
-- [pi](https://github.com/badlogic/pi-mono) for the primary extension
-- [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp`) for the native omp extension
-- Git, for `agent-driver`'s checkpoint file-provenance display and for `human-driver` (which requires a git working tree)
+ > 1. Continue        looks good, keep going
+   2. Make changes…   tell them what to do instead
+   3. Stop            I'm taking over
 
-## Install (pi)
+ ↑↓ move · Enter choose · Esc dismiss (pauses changes)
+──────────────────────────────────────────────
+```
 
-From this repository:
+That is the whole idea: the agent works in small, reviewable steps instead of
+disappearing for twenty tool calls and handing you a diff you have to reverse
+engineer.
+
+## Install
 
 ```sh
-npm install
-pi install "$(git rev-parse --show-toplevel)"
-# or load without installing:
-pi -e ./adapters/pi/extensions/pear.ts
+pi install /path/to/pear
+# or, without installing:
+pi -e /path/to/pear/adapters/pi/extensions/pear.ts
 ```
 
-In-session: `/pear-mode [off|human-driver|agent-driver]`, `/pear-config`, `/pear-status`
+Then turn it on in your project:
 
-## Install (omp)
-
-From this repository:
-
-```sh
-npm install
-omp plugin link "$(git rev-parse --show-toplevel)" --scope user
-# or load without installing:
-omp --extension ./adapters/omp/extensions/pear.ts
+```
+/pear-mode agent-driver
 ```
 
-In-session: `/pear-mode [off|human-driver|agent-driver]`, `/pear-config`, `/pear-status`
+Requires Node >= 22.19 (`.tool-versions` pins the version used here).
 
-## Install (Claude Code)
+## Modes
 
-From this repository:
+| Mode | Behaviour |
+| --- | --- |
+| `off` (default) | pear does nothing |
+| `agent-driver` | The agent checkpoints after each logical change |
 
-```sh
-claude plugin marketplace add "$(git rev-parse --show-toplevel)"
-claude plugin install pear-claude-code@pear
-```
+Mode is per-project, stored in `.pear/config.json`.
 
-Restart Claude Code (or run `/reload-plugins`) to activate it. No in-chat commands — Claude Code has no command surface, so configure via `.pear/config.json` (see [Configuration](#configuration) below). Details: [adapters/claude-code/README.md](adapters/claude-code/README.md).
+> An earlier version also had a `human-driver` mode, where a background
+> reviewer critiqued *your* uncommitted changes. It is not in this version. If
+> your config still says `human-driver`, pear runs `off`, tells you so, and
+> **leaves your config file untouched** so nothing is lost.
 
-## Install (Cursor)
+## Commands
 
-Copy `adapters/cursor/hooks.json` into your project's `.cursor/hooks.json` (schema version 1), adjusting the hook command paths to point at this checkout. Requires Node >= 22.19 with `--experimental-strip-types` on `PATH`.
+| Command | What it does |
+| --- | --- |
+| `/pear-mode [off\|agent-driver]` | Switch mode |
+| `/pear-status` | Mode, change budget, and what's outstanding |
+| `/pear-checkpoint` | Open a checkpoint yourself, without waiting for the agent |
+| `/pear-config [n]` | How many changes may pass between checkpoints (default 5) |
 
-No in-chat commands — configure via `.pear/config.json` (see [Configuration](#configuration) below). Details: [adapters/cursor/README.md](adapters/cursor/README.md).
+## How the loop is enforced
 
-## Install (OpenCode)
+The agent is *asked* to checkpoint after each logical change, and mostly will.
+The prompt is not the enforcement, though — two things back it up:
 
-OpenCode auto-loads local plugin files from `.opencode/plugins/*.ts` in your project — no `plugin` array entry needed for local files; that array resolves npm packages (or explicit `file://` URLs), and a bare `"pear"` entry would fail to resolve a local symlink. Symlink this checkout's `index.ts` in instead:
+**A change budget.** Mutating tool calls (`write`, `edit`, and `bash` commands
+that aren't provably read-only) are counted. Once `maxChangesPerCheckpoint` is
+reached, further mutations are blocked with an explanation telling the agent to
+check in first. The blocked call did not run, and the agent is told so, so it
+can simply re-issue it afterwards.
 
-```sh
-mkdir -p .opencode/plugins
-ln -s /path/to/pear/adapters/opencode/index.ts .opencode/plugins/pear.ts
-```
+**Stop actually stops.** Choosing Stop ends the agent's current work loop and
+blocks further changes until you say something. Read-only commands still work,
+so you can keep looking around.
 
-Then merge just the `permission` block from `adapters/opencode/opencode.json` into your project's `opencode.json`, so `write`/`edit`/`bash` use `ask` permission:
+Two things are deliberately never blocked: the checkpoint tool itself, and
+`/pear-checkpoint`. Whatever state the loop gets into, you can always open a
+checkpoint and clear it — which is why an exhausted budget can't wedge the
+session.
 
-```json
-{ "permission": { "edit": "ask", "bash": "ask" } }
-```
+### Why not checkpoint after literally every edit?
 
-Restart OpenCode and check its logs to confirm the plugin loaded before relying on it.
+Because a logical change is often three edits and a test run, and interrupting
+mid-thought is worse than useless. The agent decides where the seams are; the
+budget bounds how wrong it can be about that. Set `/pear-config 1` if you want
+one checkpoint per mutation.
 
-No in-chat commands — configure via `.pear/config.json` (see [Configuration](#configuration) below). `human-driver` review is a stub for OpenCode (no real model call yet). Details: [adapters/opencode/README.md](adapters/opencode/README.md).
+## What the file list means
+
+The checkpoint shows a **git-derived** list of what actually changed since the
+last checkpoint, next to the files the agent *claims* it touched. If the agent
+under-reports, you see it.
+
+That list is labelled best-effort on purpose. It comes from
+`git status --porcelain=v2`, including the index object id, so a staged-only
+change is visible and a file that changed twice isn't listed twice. Files that
+can't be read are reported as changed rather than assumed clean. Outside a git
+repo the list is marked unverified and you see only the agent's claim.
+
+Nothing about this list affects the budget — it is there for you to read, and a
+wrong file list can never wedge or bypass the loop.
+
+## Interactivity
+
+A checkpoint needs a human, so pear only runs where one can answer:
+
+| pi mode | Checkpoint |
+| --- | --- |
+| TUI | Full card, inline editor for steering |
+| RPC | Select/input dialogs; steering offered only if input is available |
+| print / json | pear runs `off` for that session, with a warning |
+
+pear **never** auto-approves a checkpoint. If nobody can answer, it doesn't
+pretend one happened.
 
 ## Configuration
 
-`.pear/` holds runtime state for every host — `config.json`, plus `checkpoint.json`/`findings.pending`/`findings.log`/`daemon.pid` where applicable. None of the install steps above add it to git for you; do it once per project:
+`.pear/config.json`, per project:
 
-```sh
-echo '.pear/' >> .gitignore
+```json
+{
+  "mode": "agent-driver",
+  "maxChangesPerCheckpoint": 5
+}
 ```
 
-Pi and omp read/write `.pear/config.json` in the project root via `/pear-mode` and `/pear-config`. Fields and defaults:
+- `maxChangesPerCheckpoint` must be a whole number from 1 to 1000.
+- Unknown keys are **preserved** across writes, so a newer pear's settings
+  survive an older pear touching the file.
+- A file that can't be parsed is backed up to `config.json.corrupt-<timestamp>`
+  before anything replaces it.
+- Writes go to a temp file and are renamed into place, so an interrupted write
+  can't truncate your config.
+- pear assumes one writer. Two processes editing the config at once is
+  last-write-wins, and one may drop the other's fields.
 
-| Field | Default | Applies to |
-|---|---|---|
-| `mode` | `"off"` | all — `"off" \| "human-driver" \| "agent-driver"` |
-| `reviewModel` | `openai/gpt-5.6-terra` | `human-driver` — small/fast model that generates findings |
-| `filterModel` | `openai/gpt-5.6-sol` | `human-driver` — larger model that filters those findings |
-| `checkpointModel` | `openai/gpt-5.6-terra` | `agent-driver` (pi/omp only) — fast model that judges whether the current diff is a good stopping point; if this default or an explicitly-set model can't be resolved in the registry, falls back to the deterministic cadence below |
-| `minLines` | `50` | `human-driver` — min changed lines before a review fires |
-| `debounceSeconds` | `10` | `human-driver` — quiet period after the last edit |
-| `intervalSeconds` | `60` | `human-driver` — min seconds between reviews |
-| `checkpointSeconds` | `300` | `agent-driver` — wall-clock cadence before a forced pause (also the checkpoint judge's hard backstop on pi/omp) |
-| `maxChangesPerCheckpoint` | `5` | `agent-driver` — mutating tool calls before pausing (pi/omp: before consulting the checkpoint judge) |
-
-`mode` and the cadence fields are project-scoped only (no global fallback). `reviewModel`/`filterModel`/`checkpointModel` fall back to `~/.pear/config.json` (global), then to the defaults above.
-
-Claude Code and Cursor have no in-chat command surface: they read the same `.pear/config.json` (project) plus `~/.pear/config.json` (global model fallback), and each nudges once with the setup command when nothing is configured. OpenCode reads the same `.pear/config.json`/`~/.pear/config.json` but has no such nudge — edit the file directly or run setup yourself. Run setup **from the target project**, pointing at this checkout by absolute path:
-
-```sh
-cd /path/to/your/project
-node --experimental-strip-types /path/to/pear/adapters/shared/setup.ts
-```
-
-`npm run setup` runs the identical script but only works when your target project *is* this pear checkout — it saves `.pear/config.json` into whatever directory it's run from, so running it from inside the pear checkout configures the checkout itself, not some other project.
+There is no global `~/.pear/config.json`; it only ever held model choices, and
+this version makes no model calls at all.
 
 ## Development
 
 ```sh
+npm ci          # exact, pinned installs
 npm test
 npm run typecheck
 npm run smoke:pi
-npm run smoke:claude
-npm run smoke:omp
 ```
 
-Architecture and contribution guidance: [AGENTS.md](AGENTS.md). Host-specific notes live under `adapters/*/README.md`.
+Dependencies are pinned exactly (`.npmrc` sets `save-exact=true`) and the API
+surface pear relies on is verified against the pinned pi version in
+[`docs/pi-api-notes.md`](docs/pi-api-notes.md). `probe/probe.ts` is a standalone
+extension that re-checks those API facts against a real pi session.
+
+## Layout
+
+```
+core/                     host-free logic (no pi imports)
+  config.ts               .pear/config.json, gate arithmetic
+  checkpoint.ts           change accounting + file provenance
+  git.ts                  porcelain v2 -> file state tokens
+  bash.ts                 is this command provably read-only?
+  prompts.ts              every string the model or human reads
+adapters/pi/
+  runtime.ts              session state machine (still host-free)
+  extensions/pear.ts      the only pi-specific file
+  extensions/checkpoint-card.ts   the TUI card
+skills/pear-pairing/      the discipline, as a portable prompt
+probe/probe.ts            standalone pi API probe
+```
+
+Porting pear to another harness means rewriting `extensions/` — everything else
+comes along unchanged.
