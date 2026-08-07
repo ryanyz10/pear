@@ -40,6 +40,17 @@ describe("loadUserConfig", () => {
     });
   });
 
+  it("drops an invalid checkpointModel spec but keeps the rest of a valid file", () => {
+    withDir((dir) => {
+      mkdirSync(join(dir, ".pear"), { recursive: true });
+      writeFileSync(
+        join(dir, ".pear", "config.json"),
+        JSON.stringify({ checkpointModel: "bad", mode: "agent-driver", checkpointSeconds: 60 }),
+      );
+      assert.deepEqual(loadUserConfig(dir), { mode: "agent-driver", checkpointSeconds: 60 });
+    });
+  });
+
   it("drops an invalid mode but keeps the rest of a valid file", () => {
     withDir((dir) => {
       mkdirSync(join(dir, ".pear"), { recursive: true });
@@ -117,6 +128,18 @@ describe("resolveConfig", () => {
       withDir((home) => {
         saveUserConfig(home, { filterModel: "openai/gpt-test" });
         assert.equal(resolveConfig(project, home).filterModel, "openai/gpt-test");
+      }),
+    );
+  });
+
+  it("checkpointModel follows the same project-then-global-then-default chain as reviewModel", () => {
+    withDir((project) =>
+      withDir((home) => {
+        assert.equal(resolveConfig(project, home).checkpointModel, DEFAULTS.checkpointModel);
+        saveUserConfig(home, { checkpointModel: "openai/gpt-test" });
+        assert.equal(resolveConfig(project, home).checkpointModel, "openai/gpt-test");
+        saveUserConfig(project, { checkpointModel: "anthropic/claude-opus-4" });
+        assert.equal(resolveConfig(project, home).checkpointModel, "anthropic/claude-opus-4");
       }),
     );
   });

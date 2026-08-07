@@ -7,22 +7,24 @@ export type PearConfig = {
   mode?: Mode;
   reviewModel?: string; // human-driver: small/fast model that generates findings
   filterModel?: string; // human-driver: large model that filters those findings
+  checkpointModel?: string; // agent-driver (pi/omp only): fast model that judges whether the current diff is a good stopping point (optional — unset resolves to the same default as reviewModel/filterModel; if that default or an explicitly-set model is unresolvable in the registry, falls back to today's deterministic pause)
   minLines?: number; // human-driver: min changed lines before a review fires
   debounceSeconds?: number; // human-driver: quiet period after last edit
   intervalSeconds?: number; // human-driver: min seconds between reviews
   checkpointSeconds?: number; // agent-driver: wall-clock cadence before forced pause
-  maxChangesPerCheckpoint?: number; // agent-driver: mutating tool-calls per checkpoint
+  maxChangesPerCheckpoint?: number; // agent-driver: mutating tool-calls before consulting the checkpoint judge, or pausing directly if no judge is configured/resolves
 };
 
 export const DEFAULTS = {
   mode: "off",
   reviewModel: "openai/gpt-5.6-terra",
   filterModel: "openai/gpt-5.6-sol",
+  checkpointModel: "openai/gpt-5.6-terra",
   minLines: 50,
   debounceSeconds: 10,
   intervalSeconds: 60,
   checkpointSeconds: 300,
-  maxChangesPerCheckpoint: 3,
+  maxChangesPerCheckpoint: 5,
 } as const satisfies Required<PearConfig>;
 
 /** Pure OR gate for the agent-driver checkpoint cadence. */
@@ -75,7 +77,7 @@ const POSITIVE_INT_FIELDS = [
   "checkpointSeconds",
   "maxChangesPerCheckpoint",
 ] as const;
-const MODEL_FIELDS = ["reviewModel", "filterModel"] as const;
+const MODEL_FIELDS = ["reviewModel", "filterModel", "checkpointModel"] as const;
 
 function isPositiveInt(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v > 0;
@@ -151,6 +153,7 @@ export function resolveConfig(projectDir: string, homeDir: string): Required<Pea
     mode: project.mode ?? DEFAULTS.mode,
     reviewModel: project.reviewModel ?? global.reviewModel ?? DEFAULTS.reviewModel,
     filterModel: project.filterModel ?? global.filterModel ?? DEFAULTS.filterModel,
+    checkpointModel: project.checkpointModel ?? global.checkpointModel ?? DEFAULTS.checkpointModel,
     minLines: project.minLines ?? DEFAULTS.minLines,
     debounceSeconds: project.debounceSeconds ?? DEFAULTS.debounceSeconds,
     intervalSeconds: project.intervalSeconds ?? DEFAULTS.intervalSeconds,

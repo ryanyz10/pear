@@ -13,6 +13,7 @@ import {
   createPearSession,
   ensureModelsConfigured,
   resolveNavComplete,
+  type Complete,
   type PearSession,
   type ReviewCompletions,
 } from "../runtime.ts";
@@ -22,6 +23,7 @@ type ConfigField =
   | "mode"
   | "reviewModel"
   | "filterModel"
+  | "checkpointModel"
   | "minLines"
   | "debounceSeconds"
   | "intervalSeconds"
@@ -54,6 +56,21 @@ export default function (pi: ExtensionAPI) {
       resolveNavComplete(ctx.modelRegistry, cfg.filterModel, streamSimple as any),
     ]);
     return { small, large };
+  }
+
+  async function resolveCheckpointJudge(
+    cfg: Required<PearConfig>,
+    ctx: { modelRegistry: Parameters<typeof resolveNavComplete>[0] },
+  ): Promise<Complete | null> {
+    if (!cfg.checkpointModel) return null;
+    // Best-effort: agent-driver never requires a model, so a registry/auth
+    // exception here must degrade to today's deterministic behavior, not
+    // crash session startup/mode switching.
+    try {
+      return await resolveNavComplete(ctx.modelRegistry, cfg.checkpointModel, streamSimple as any);
+    } catch {
+      return null;
+    }
   }
 
   async function applyMode(
@@ -96,7 +113,8 @@ export default function (pi: ExtensionAPI) {
     } else {
       saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), mode: target });
       const resolvedCfg = resolveConfig(ctx.cwd, homeDir);
-      session?.setMode(target, resolvedCfg, { small: null, large: null });
+      const checkpointJudge = target === "agent-driver" ? await resolveCheckpointJudge(resolvedCfg, ctx) : null;
+      session?.setMode(target, resolvedCfg, { small: null, large: null, checkpointJudge });
     }
     ctx.ui.notify(`pear: mode set to ${target}`, "info");
   }
@@ -105,15 +123,18 @@ export default function (pi: ExtensionAPI) {
     const homeDir = homedir();
     const cfg = resolveConfig(ctx.cwd, homeDir);
 
-    let completions: ReviewCompletions = { small: null, large: null };
+    let completions: ReviewCompletions = { small: null, large: null, checkpointJudge: null };
     if (cfg.mode === "human-driver") {
-      completions = await resolveCompletions(cfg, ctx);
-      if (!completions.small || !completions.large) {
+      const { small, large } = await resolveCompletions(cfg, ctx);
+      completions = { small, large, checkpointJudge: null };
+      if (!small || !large) {
         ctx.ui.notify(
           "pear: human-driver needs reviewModel and filterModel available — check /pear-config",
           "warning",
         );
       }
+    } else if (cfg.mode === "agent-driver") {
+      completions = { small: null, large: null, checkpointJudge: await resolveCheckpointJudge(cfg, ctx) };
     }
 
     session = createPearSession({
@@ -217,6 +238,7 @@ export default function (pi: ExtensionAPI) {
         { key: "mode", label: `mode (${cfgNow.mode})` },
         { key: "reviewModel", label: `reviewModel (${cfgNow.reviewModel})` },
         { key: "filterModel", label: `filterModel (${cfgNow.filterModel})` },
+        { key: "checkpointModel", label: `checkpointModel (${cfgNow.checkpointModel})` },
         ...NUMERIC_FIELDS.map((key) => ({ key, label: `${key} (${cfgNow[key]})` })),
       ];
       const choice = await ctx.ui.select(
@@ -253,6 +275,26 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (field === "checkpointModel") {
+        const choiceModel = await ctx.ui.select(`Pick ${field}:`, availableModels);
+        if (choiceModel === undefined) return;
+        const candidateCfg: Required<PearConfig> = { ...cfgNow, checkpointModel: choiceModel };
+        saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), checkpointModel: choiceModel });
+        if (candidateCfg.mode === "agent-driver") {
+          const checkpointJudge = await resolveCheckpointJudge(candidateCfg, ctx);
+          if (!checkpointJudge) {
+            ctx.ui.notify(
+              `pear: saved checkpointModel=${choiceModel}, but it didn't resolve — checkpoints will keep pausing on cadence alone until it does`,
+              "warning",
+            );
+          }
+          session?.setMode("agent-driver", candidateCfg, { small: null, large: null, checkpointJudge });
+        } else {
+          ctx.ui.notify(`pear: checkpointModel set to ${choiceModel}`, "info");
+        }
+        return;
+      }
+
       // Numeric field.
       const raw = await ctx.ui.input(`New value for ${field} (positive integer):`);
       if (raw === undefined) return;
@@ -273,7 +315,8 @@ export default function (pi: ExtensionAPI) {
       } else {
         saveUserConfig(ctx.cwd, { ...loadUserConfig(ctx.cwd), [field]: n });
         if (candidateCfg.mode === "agent-driver") {
-          session?.setMode("agent-driver", candidateCfg, { small: null, large: null });
+          const checkpointJudge = await resolveCheckpointJudge(candidateCfg, ctx);
+          session?.setMode("agent-driver", candidateCfg, { small: null, large: null, checkpointJudge });
         }
       }
       ctx.ui.notify(`pear: ${field} set to ${n}`, "info");
