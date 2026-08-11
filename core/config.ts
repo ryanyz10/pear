@@ -27,6 +27,7 @@ import {
   writeFileSync as realWriteFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { FILE_POINTS } from "./load.ts";
 
 /** Modes this version can actually run. */
 export type Mode = "off" | "agent-driver";
@@ -42,31 +43,76 @@ export const LEGACY_MODES: readonly string[] = ["human-driver"];
 export type PearConfig = {
   mode?: Mode;
   /**
-   * Mutating tool calls allowed between checkpoints before the gate closes.
-   * The agent is expected to checkpoint after each logical change well before
-   * this; it is a backstop against drift, not the primary mechanism.
+   * Review-load points allowed between checkpoints before one is due.
+   * See `core/load.ts` for how points are priced.
+   *
+   * The agent is expected to checkpoint at coherent boundaries well before
+   * this; the budget nags and then blocks as a backstop against drift, it is
+   * not the primary mechanism.
    */
-  maxChangesPerCheckpoint?: number;
+  reviewBudget?: number;
+  /** Start each session in the scoping phase rather than going straight to building. */
+  planPhase?: boolean;
+  /** Prune tools that are neither pi built-ins nor pear's at session start. */
+  exclusive?: boolean;
 };
 
 export const DEFAULTS = {
   mode: "off",
-  maxChangesPerCheckpoint: 5,
+  reviewBudget: 200,
+  planPhase: true,
+  exclusive: false,
 } as const satisfies Required<PearConfig>;
 
-/** Inclusive bounds for `maxChangesPerCheckpoint`. */
-export const MIN_CHANGES = 1;
-export const MAX_CHANGES = 1000;
+/**
+ * Inclusive bounds for `reviewBudget`.
+ *
+ * The floor is one file charge: below that, the very first edit is always
+ * over budget and the loop would checkpoint after every call.
+ */
+export const MIN_BUDGET = FILE_POINTS;
+export const MAX_BUDGET = 100_000;
 
 /**
- * The entire gate rule, as a pure function.
- *
- * `max = 5` allows five mutating calls and blocks the sixth: the gate is
- * consulted *before* admitting a call, so it closes once `count` has already
- * reached `max`.
+ * The key older versions used, in mutating-tool-calls. Still read (migrated to
+ * points) and still left on disk untouched, so downgrading is non-destructive.
  */
-export function gateClosed(count: number, max: number): boolean {
-  return count >= max;
+export const LEGACY_BUDGET_KEY = "maxChangesPerCheckpoint";
+
+/**
+ * How much review load one "change" was worth under the old call-counting
+ * budget. A file charge is the closest honest equivalent: the old unit was
+ * roughly "one edit somewhere".
+ */
+export const LEGACY_CHANGE_POINTS = FILE_POINTS;
+
+/**
+ * How much of the budget must be used before pear starts nagging, and how far
+ * past it the agent gets before mutating tools are blocked outright.
+ */
+export const SOFT_FRACTION = 0.5;
+export const BLOCK_MULTIPLE = 2;
+
+/**
+ * What pear does at a given review load.
+ *
+ * - `quiet`  — say nothing.
+ * - `soft`   — mention it in passing on mutating tool results.
+ * - `due`    — say plainly that a checkpoint is expected next.
+ * - `blocked`— refuse further mutating calls until a checkpoint happens.
+ *
+ * The gate is *admit-first*: this is consulted with the load accumulated
+ * **before** the call being considered, so a single oversized change always
+ * executes and the block lands on the one after it. Blocking a call on its own
+ * estimated cost would force a checkpoint with nothing yet to review.
+ */
+export type LoadTier = "quiet" | "soft" | "due" | "blocked";
+
+export function loadTier(points: number, budget: number): LoadTier {
+  if (points >= budget * BLOCK_MULTIPLE) return "blocked";
+  if (points >= budget) return "due";
+  if (points >= budget * SOFT_FRACTION) return "soft";
+  return "quiet";
 }
 
 export function isMode(v: unknown): v is Mode {
@@ -78,13 +124,18 @@ export function isLegacyMode(v: unknown): v is string {
 }
 
 /** Positive integer within the documented range. Rejects NaN, floats, strings. */
-export function isValidMaxChanges(v: unknown): v is number {
+export function isValidBudget(v: unknown): v is number {
   return (
     typeof v === "number" &&
     Number.isInteger(v) &&
-    v >= MIN_CHANGES &&
-    v <= MAX_CHANGES
+    v >= MIN_BUDGET &&
+    v <= MAX_BUDGET
   );
+}
+
+/** The old key's bounds, kept only so a legacy value can be recognised. */
+export function isValidLegacyBudget(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 1000;
 }
 
 export type LoadedConfig = {
@@ -102,6 +153,12 @@ export type LoadedConfig = {
   malformed: boolean;
   /** No config file present. */
   missing: boolean;
+  /**
+   * Set when `reviewBudget` was derived from the legacy
+   * `maxChangesPerCheckpoint` key, so the caller can explain the new units
+   * once. The legacy key is left on disk.
+   */
+  migratedBudgetFrom?: number;
 };
 
 export type ConfigFs = {
@@ -176,6 +233,7 @@ export function loadConfig(projectDir: string, fs: ConfigFs = nodeFs): LoadedCon
   const raw = parsed as Record<string, unknown>;
   const config: Required<PearConfig> = { ...DEFAULTS };
   let legacyMode: string | undefined;
+  let migratedBudgetFrom: number | undefined;
 
   if (isMode(raw.mode)) {
     config.mode = raw.mode;
@@ -183,13 +241,28 @@ export function loadConfig(projectDir: string, fs: ConfigFs = nodeFs): LoadedCon
     legacyMode = raw.mode;
   }
 
-  if (isValidMaxChanges(raw.maxChangesPerCheckpoint)) {
-    config.maxChangesPerCheckpoint = raw.maxChangesPerCheckpoint;
+  // An explicit reviewBudget always wins. Only fall back to the legacy key when
+  // there is no new one to honour, so a config carrying both is unambiguous.
+  if (isValidBudget(raw.reviewBudget)) {
+    config.reviewBudget = raw.reviewBudget;
+  } else if (isValidLegacyBudget(raw[LEGACY_BUDGET_KEY])) {
+    const legacy = raw[LEGACY_BUDGET_KEY] as number;
+    config.reviewBudget = clampBudget(legacy * LEGACY_CHANGE_POINTS);
+    migratedBudgetFrom = legacy;
   }
 
-  return legacyMode === undefined
-    ? { config, raw, malformed: false, missing: false }
-    : { config, raw, malformed: false, missing: false, legacyMode };
+  if (typeof raw.planPhase === "boolean") config.planPhase = raw.planPhase;
+  if (typeof raw.exclusive === "boolean") config.exclusive = raw.exclusive;
+
+  const loaded: LoadedConfig = { config, raw, malformed: false, missing: false };
+  if (legacyMode !== undefined) loaded.legacyMode = legacyMode;
+  if (migratedBudgetFrom !== undefined) loaded.migratedBudgetFrom = migratedBudgetFrom;
+  return loaded;
+}
+
+/** Keeps a derived budget inside the documented range. */
+function clampBudget(points: number): number {
+  return Math.min(MAX_BUDGET, Math.max(MIN_BUDGET, points));
 }
 
 /** Thrown when a config write could not be completed. Callers must surface it. */
@@ -229,12 +302,21 @@ export function saveConfig(
   if (patch.mode !== undefined && !isMode(patch.mode)) {
     throw new ConfigWriteError(`refusing to persist invalid mode ${JSON.stringify(patch.mode)}`, undefined);
   }
-  if (patch.maxChangesPerCheckpoint !== undefined && !isValidMaxChanges(patch.maxChangesPerCheckpoint)) {
+  if (patch.reviewBudget !== undefined && !isValidBudget(patch.reviewBudget)) {
     throw new ConfigWriteError(
-      `refusing to persist invalid maxChangesPerCheckpoint ${JSON.stringify(patch.maxChangesPerCheckpoint)}` +
-        ` (want an integer in [${MIN_CHANGES}, ${MAX_CHANGES}])`,
+      `refusing to persist invalid reviewBudget ${JSON.stringify(patch.reviewBudget)}` +
+        ` (want an integer in [${MIN_BUDGET}, ${MAX_BUDGET}])`,
       undefined,
     );
+  }
+  for (const key of ["planPhase", "exclusive"] as const) {
+    const value = patch[key];
+    if (value !== undefined && typeof value !== "boolean") {
+      throw new ConfigWriteError(
+        `refusing to persist invalid ${key} ${JSON.stringify(value)} (want a boolean)`,
+        undefined,
+      );
+    }
   }
 
   const dir = configDir(projectDir);
@@ -260,11 +342,14 @@ export function saveConfig(
     }
   }
 
+  // Only keys explicitly present in the patch are written. Everything else in
+  // the file — including the legacy budget key and settings from other pear
+  // versions — round-trips verbatim.
   const merged: Record<string, unknown> = { ...existing.raw };
   if (patch.mode !== undefined) merged.mode = patch.mode;
-  if (patch.maxChangesPerCheckpoint !== undefined) {
-    merged.maxChangesPerCheckpoint = patch.maxChangesPerCheckpoint;
-  }
+  if (patch.reviewBudget !== undefined) merged.reviewBudget = patch.reviewBudget;
+  if (patch.planPhase !== undefined) merged.planPhase = patch.planPhase;
+  if (patch.exclusive !== undefined) merged.exclusive = patch.exclusive;
 
   const tmp = join(dir, `config.json.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
   try {

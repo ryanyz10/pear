@@ -2,10 +2,13 @@
 
 ## Project overview
 
-`pear` is a pair-programming checkpoint loop for the **pi** harness. In
-`agent-driver` mode the agent pauses after each logical change and asks the
-human to continue, steer, or stop, via a `pear_checkpoint` tool that renders an
-interactive card. A change budget backstops the prompt so drift is bounded.
+`pear` is a pair-programming loop for the **pi** harness. In `agent-driver`
+mode you and the agent agree an approach first (the **scoping** phase, gated by
+`pear_plan`), then it builds in digestible increments (the **building** phase,
+punctuated by `pear_checkpoint`). At each checkpoint you can keep going, have a
+file walked through, change direction, or stop. A review-load budget nags in
+band and then blocks, so drift is bounded without the prompt being the only
+thing holding the line.
 
 - Runtime: Node.js **>= 22.19.0** (`.tool-versions` pins the local version).
 - Language: TypeScript in native ESM / `NodeNext`, run directly via Node's
@@ -18,14 +21,21 @@ interactive card. A change budget backstops the prompt so drift is bounded.
 ## Repository layout
 
 - `core/` — host-free logic. **Nothing here may import a host SDK.**
-  - `config.ts` — `.pear/config.json` I/O, validation, `gateClosed`
-  - `checkpoint.ts` — change accounting, file-state provenance
+  - `config.ts` — `.pear/config.json` I/O, validation, `loadTier`
+  - `load.ts` — pricing a tool call in review-load points
+  - `checkpoint.ts` — review-load accounting, file-state provenance
   - `git.ts` — `git status --porcelain=v2 -z` → state tokens
   - `bash.ts` — "is this command provably read-only?"
   - `prompts.ts` — every string the model or human reads
-- `adapters/pi/runtime.ts` — session state machine. Still host-free and fully
-  injectable; the pi extension is a thin wiring layer over it.
-- `adapters/pi/extensions/` — the only pi-specific code.
+- `adapters/pi/runtime.ts` — session state machine (phases, holds, accounting).
+  Still host-free and fully injectable; the pi extension is a thin wiring layer
+  over it.
+- `adapters/pi/cards/` — the TUI cards and their dialog fallback. A card is
+  **data** (`CardSpec`); `card.ts` renders it in a terminal and `dialogs.ts`
+  renders the same spec through `ui.select`/`ui.input`, so the two cannot drift.
+  Lives outside `extensions/` on purpose (see invariant below).
+- `adapters/pi/extensions/` — the only pi-specific code. **Only files meant to
+  be loaded as extensions may live here** (see invariant below).
 - `skills/pear-pairing/` — the same discipline as a portable prompt.
 - `probe/probe.ts` — standalone API probe, not part of the extension.
 - `docs/pi-api-notes.md` — verified pi API facts. **Read this before changing
@@ -81,18 +91,56 @@ A `tool_call` handler must never await a human. It computes a decision and
 returns. Waiting for a person happens inside `pear_checkpoint.execute`, which
 is allowed to take as long as it takes.
 
+### Only loadable extensions live in `extensions/`
+
+pi loads *every* file in a directory listed under the manifest's
+`"pi".extensions` key. A helper without a default export sitting there is a
+load error waiting to happen, so cards, the runtime, and anything else shared
+live one level up in `adapters/pi/`.
+
 ### The loop can always be unwedged
 
-`pear_checkpoint` is never gated and never counted, and `/pear-checkpoint`
-opens the same card without the model's involvement. Any change that could make
-opening a checkpoint fail because of checkpoint state is wrong.
+`pear_ask` and `pear_checkpoint` are never gated and never counted, and
+`/pear-checkpoint` opens the same card without the model's involvement. Any
+change that could make opening a checkpoint fail because of checkpoint state is
+wrong.
+
+### No card answer parks the agent
+
+Every option on every card resolves its tool immediately. "Walk me through a
+file" is an *answer*, not a pause: it returns an instruction and relies on the
+agent calling `pear_checkpoint` again. Holding a tool open while a human reads
+is the failure this design exists to avoid — the agent cannot answer questions
+while it is parked inside `execute`.
+
+### The gate is admit-first
+
+`tool_call` compares the load accrued **before** the call it is considering,
+then admits. A call is never blocked on its own estimated cost, so a single
+oversized change always runs and the block lands on the next one. Blocking the
+first write of a window would force a checkpoint with nothing to review.
+
+### The tool-result override appends, never replaces
+
+`ToolResultEventResult.content` **replaces** what the model sees. The budget nag
+must return `[...event.content, note]`. Dropping the original blinds the model
+to its own tool output.
+
+### `setActiveTools` restores what was observed
+
+Scoping removes `edit` and `write`. Restoring adds back exactly the names pear
+removed, on top of whatever is active now — never a hardcoded list and never a
+stale snapshot. Another extension may legitimately have changed the tool set
+while pear was scoping.
 
 ### Accounting errs toward more oversight
 
-- Admitted on `tool_call`, settled on `tool_result`, exactly once.
-- A failed call frees its budget; a call that never reports back becomes
-  `stale` and **still counts**. Never promote an unknown result to "confirmed
-  success".
+- Admitted and priced on `tool_call`, settled on `tool_result`, exactly once.
+- A failed call frees its cost; a call that never reports back becomes `stale`
+  and **still counts**. Never promote an unknown result to "confirmed success".
+- The window total is **recomputed** from surviving entries, never accumulated.
+  That is what makes a released file charge correct without refcounting, and
+  what makes the total independent of admission order.
 - Sweeping happens on `agent_settled` only — `agent_end` can be followed by
   retries or queued continuations.
 - Reused call ids **fail closed**: the older entry is settled before the new one
@@ -122,9 +170,14 @@ requires `ctx.mode === "tui"`; RPC uses dialogs; print/json fail closed to
 
 ### Acknowledgement semantics
 
-`continue` and `steer` re-baseline (the human saw the git-verified list before
-answering). `cancelled` and a failed checkpoint do **not** — unreviewed files
-must still appear next time. `mode-off` neither acknowledges nor stops.
+`continue`, `steer`, and an approved plan re-baseline (the human saw the
+git-verified list before answering). `explain`, `dismissed`, and a failed
+checkpoint do **not** — unreviewed files must still appear next time.
+`mode-off` neither acknowledges nor stops.
+
+Stop and dismiss are different holds. **Stop** latches until real user input.
+**Dismiss** is run-scoped and expires at `agent_settled`, because the human
+never said stop — they just walked away. Neither ends the session.
 
 ### The file list is display-only
 
@@ -149,11 +202,15 @@ textconv helpers. When in doubt, mutating.
 
 `node:test` + `node:assert/strict`. Temp git repos via `mkdtempSync` + `git init`.
 
-Cover in particular: gate boundaries (`max=1`, `max=5`); every resolution path
-of the pending-checkpoint state machine and their races; stop-latch provenance;
-orphaned calls; id reuse; staged-vs-worktree and rename/delete/symlink/unmerged
-git states; unreadable files; config failure paths via the injected `fs` seam
-(not chmod, which behaves differently as root); TUI/RPC/headless tiers.
+Cover in particular: tier boundaries and admit-first; every resolution path of
+the pending-card state machine and their races; phase transitions and
+out-of-phase calls; stop-latch provenance; orphaned calls; id reuse;
+staged-vs-worktree and rename/delete/symlink/unmerged git states; unreadable
+files; config failure paths via the injected `fs` seam (not chmod, which
+behaves differently as root); TUI/RPC/headless tiers.
+
+Card content is pure data, so `test/cards.test.ts` asserts on it without a
+terminal. Prefer adding a case there over reaching into the renderer.
 
 `test/pi-lifecycle.test.ts` drives the real extension through a fake
 `ExtensionAPI` — no pi runtime needed.

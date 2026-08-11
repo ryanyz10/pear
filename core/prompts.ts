@@ -4,55 +4,161 @@
  * behaviour.
  *
  * Control flow is never derived from these strings. The runtime acts on a
- * structured outcome chosen from a picker; the text below only *describes*
- * that outcome to the model. This is what makes it safe for the human's own
- * words to be passed through verbatim.
+ * structured outcome chosen from a picker; the text below only *describes* that
+ * outcome to the model. This is what makes it safe for the human's own words to
+ * be passed through verbatim.
  */
 
-/** Cap on steering text handed to the model, to bound a pathological paste. */
+/** Cap on free text handed to the model, to bound a pathological paste. */
 export const MAX_STEERING_CHARS = 2000;
 
+export const ASK_TOOL_NAME = "pear_ask";
+export const PLAN_TOOL_NAME = "pear_plan";
 export const CHECKPOINT_TOOL_NAME = "pear_checkpoint";
 
-export const CHECKPOINT_TOOL_DESCRIPTION = `Pause and show the human what you just changed, then get their decision before continuing.
+// ---------------------------------------------------------------------------
+// Tool descriptions
+// ---------------------------------------------------------------------------
 
-Call this after finishing each logical change (one coherent unit of work, which may span a few edits), and always before ending a turn in which you edited anything. The human answers: continue, make changes, or stop.
+export const ASK_TOOL_DESCRIPTION = `Ask your navigator a question and get an answer back.
 
-This is not optional bookkeeping — it is how your pair stays oriented. Calling it is never blocked, and calling it clears the change budget.`;
+Give 2-4 concrete options you would actually be happy to act on — the point is to save them from typing, so a good option set is most of the work. They can always answer in their own words instead.
+
+Use this whenever a decision is genuinely theirs to make: an ambiguous requirement, a tradeoff with no obvious winner, a missing piece of context only they have. Do not use it for things you can find out by reading the code.`;
+
+export const PLAN_TOOL_DESCRIPTION = `Propose how you intend to solve the problem, and get the navigator's approval before you start building.
+
+Keep it short and concrete: what you are going to do, in the order you will do it. Steps should be things they can recognise happening, not internal bookkeeping.
+
+Nothing can be edited until a plan is approved. Once it is, the plan becomes the shared frame for the rest of the session — every later checkpoint is reported against it.`;
+
+export const CHECKPOINT_TOOL_DESCRIPTION = `Show the navigator what you just changed, then get their decision before continuing.
+
+Call this when you reach a coherent stopping point — one recognisable piece of the plan is done, whether that took one edit or several. Always call it before ending a turn in which you changed anything.
+
+Pass:
+- \`summary\`: what you changed and *why*, in plain language, in terms of the plan
+- \`files\`: the files you touched, so they can review
+- \`next\`: what you intend to do next
+
+They answer: keep going, walk me through a file, change direction, or stop. Calling this is never blocked, and it clears the review budget.`;
+
+// ---------------------------------------------------------------------------
+// Personas
+// ---------------------------------------------------------------------------
 
 /**
- * Appended to the system prompt in agent-driver mode.
+ * Shared voice rules.
  *
- * Deliberately short: long personas get diluted. It states the role, the
- * cadence, and the three answers, and nothing else.
+ * The failure mode being designed against is the agent filing status reports:
+ * headed sections, bulleted change lists, and narration of its own tooling.
+ * A real pair says a sentence or two and keeps working.
  */
-export const AGENT_DRIVER_PERSONA = `## Pair programming: you are the driver
+const VOICE = `## How to talk
+
+- Plain, conversational sentences. No headers, no bullet lists, no bold labels.
+- Short. One to three sentences is usually right.
+- Say *why*, not just what. The what is visible in the diff; the why is not.
+- Do not list the files you touched in prose — the card already shows them.
+- Never narrate your own tooling ("I will now call the checkpoint tool"). Just call it.`;
+
+/**
+ * Appended to the system prompt during the scoping phase.
+ *
+ * Deliberately short: long personas get diluted.
+ */
+export const SCOPING_PERSONA = `## Pair programming: agree the approach first
+
+A human is your navigator. You are about to work on their problem together, and right now you are still deciding *what* to do — not doing it.
+
+- You cannot edit anything yet. Read, search, and run read-only commands to understand the problem.
+- If something is genuinely ambiguous and only they can settle it, ask with \`${ASK_TOOL_NAME}\`. Offer real options.
+- When you know what you would do, call \`${PLAN_TOOL_NAME}\` with a short summary and the steps in order.
+- If they send you back to explore more, do that and propose again. Do not argue for your first plan.
+
+${VOICE}`;
+
+/** What the agent proposed and the human approved. */
+export type PlanSpec = {
+  summary: string;
+  steps: string[];
+  risks?: string[];
+};
+
+/**
+ * Render a plan for the model and for `/pear-plan`.
+ *
+ * One rendering for both audiences on purpose: what the human approved and what
+ * the agent is reminded of must not be able to drift apart.
+ */
+export function formatPlan(plan: PlanSpec): string {
+  const lines = [plan.summary.trim()];
+  if (plan.steps.length > 0) {
+    lines.push("");
+    plan.steps.forEach((step, i) => lines.push(`${i + 1}. ${step.trim()}`));
+  }
+  if (plan.risks !== undefined && plan.risks.length > 0) {
+    lines.push("", "Watch out for:");
+    for (const risk of plan.risks) lines.push(`- ${risk.trim()}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Appended to the system prompt during the building phase.
+ *
+ * Carries the approved plan verbatim: this is what makes later checkpoint
+ * summaries land against a frame the human already agreed to, rather than
+ * floating free.
+ */
+export function buildPersona(planText: string): string {
+  return `## Pair programming: you are the driver
 
 A human is your navigator. They are not watching every edit, so you keep them oriented by checkpointing.
 
-- Before starting a batch of related work, say what you are going for in a sentence or two.
-- After each **logical change** — one coherent unit of work, which may span several edits — call \`${CHECKPOINT_TOOL_NAME}\` with:
-  - \`summary\`: what you changed and *why*, in plain language
-  - \`files\`: the files you touched, so they can review
-  - \`next\`: what you plan to do next
-- Always checkpoint before ending a turn in which you changed anything.
-- Then follow the answer you get:
-  - **continue** — proceed with the next step you described
-  - **steering** — the human's words are the new direction; do that instead, and do not assume your previous plan still holds
-  - **stop** — make no further changes
-- If a tool call is blocked because a checkpoint is overdue, call \`${CHECKPOINT_TOOL_NAME}\` and then continue. The block is not an error and nothing was executed.
-- Be succinct. The checkpoint is the conversation, not a status report.`;
+This is the plan you both agreed to:
 
-/** Truncate steering text, marking it so the model knows it was cut. */
+${planText}
+
+- Say what you are going for in a sentence before starting a chunk of work.
+- When one recognisable piece of the plan is done, call \`${CHECKPOINT_TOOL_NAME}\`. That may be one edit or several — stop at a coherent boundary, not mid-thought.
+- Always checkpoint before ending a turn in which you changed anything.
+- Then do what the answer says:
+  - **keep going** — carry on with the next step you described
+  - **walk me through a file** — explain that file, make no edits, then checkpoint again
+  - **change direction** — their words replace your plan for what comes next; do not assume the rest of your intended sequence still holds
+  - **stop** — make no further changes
+- If a call is blocked because the review budget is spent, that is not an error and nothing was executed. Checkpoint, then re-issue the call.
+- If the work turns out to need a different approach than the plan above, say so and call \`${PLAN_TOOL_NAME}\` rather than quietly diverging.
+
+${VOICE}`;
+}
+
+/** Truncate free text from the human, marking it so the model knows it was cut. */
 export function clampSteering(text: string): string {
   const trimmed = text.trim();
   if (trimmed.length <= MAX_STEERING_CHARS) return trimmed;
   return `${trimmed.slice(0, MAX_STEERING_CHARS)}\n[…truncated by pear at ${MAX_STEERING_CHARS} characters]`;
 }
 
-/** Tool results, keyed by the structured outcome the human picked. */
+// ---------------------------------------------------------------------------
+// Checkpoint results, keyed by the structured outcome the human picked
+// ---------------------------------------------------------------------------
+
 export const RESULT_CONTINUE =
-  "NAVIGATOR: continue — proceed with the next step you described.";
+  "NAVIGATOR: keep going — proceed with the next step you described.";
+
+/**
+ * The "dive deeper" result. It has to be explicit that this is not a
+ * checkpoint answer but a detour, because the agent must come back and ask
+ * again rather than treating the explanation as permission to continue.
+ */
+export function resultExplain(file: string): string {
+  return (
+    `NAVIGATOR: walk me through \`${file}\` — explain what you changed there and why, in terms of the plan. ` +
+    `Make no edits. Then call ${CHECKPOINT_TOOL_NAME} again with the same summary so they can answer properly.`
+  );
+}
 
 export function resultSteering(text: string): string {
   return `NAVIGATOR STEERING: ${clampSteering(text)}`;
@@ -63,10 +169,10 @@ export function resultSteering(text: string): string {
  * tools stay blocked), so this text does not ask the model to police itself.
  */
 export const RESULT_STOP =
-  "NAVIGATOR: stop — the human is taking over. Make no further changes.";
+  "NAVIGATOR: stop — the human is taking over. Make no further changes and end your turn.";
 
-export const RESULT_CANCELLED =
-  "NAVIGATOR: no answer — the human dismissed the checkpoint and is likely about to type. Make no further changes; wait for their message.";
+export const RESULT_DISMISSED =
+  "NAVIGATOR: no answer — they stepped away from the checkpoint and are likely about to type. Make no further changes and end your turn; wait for their message.";
 
 export const RESULT_MODE_OFF =
   "pear: mode switched off mid-checkpoint — no checkpoint was recorded. Continue as you were.";
@@ -78,18 +184,70 @@ export const RESULT_ALREADY_PENDING =
   "pear: a checkpoint is already open and awaiting the navigator. Do not call it again; wait for the answer to the first one.";
 
 /**
- * Returned when the checkpoint could not be shown (git failure, UI failure).
- * Returned as a normal result rather than thrown, so the model reliably
- * receives actionable guidance instead of a bare host error string.
+ * Returned when a card could not be shown (git failure, UI failure). Returned
+ * as a normal result rather than thrown, so the model reliably receives
+ * actionable guidance instead of a bare host error string.
  */
 export function resultCheckpointFailed(detail: string): string {
   return `pear: the checkpoint could not be shown (${detail}). Nothing was recorded. Stop making changes and tell the human what you were about to do, so they can review manually.`;
 }
 
-/** Reasons attached to blocked tool calls. */
-export function blockOverdue(count: number, max: number): string {
+// ---------------------------------------------------------------------------
+// Plan results
+// ---------------------------------------------------------------------------
+
+/**
+ * `before_agent_start` fires per run, so the run in which the plan is approved
+ * is still carrying the scoping persona ("you cannot edit anything yet") in its
+ * system prompt. This result has to explicitly supersede it, or the model is
+ * reading two contradictory instructions at the exact moment it should start.
+ */
+export const RESULT_PLAN_APPROVED =
+  "NAVIGATOR: plan approved — the scoping instructions no longer apply and editing is open. " +
+  "Start on the first step now, and checkpoint when it is done.";
+
+export function resultPlanRevise(text: string): string {
+  return `NAVIGATOR wants the plan changed: ${clampSteering(text)}\n\nRevise it and call ${PLAN_TOOL_NAME} again. Do not start building.`;
+}
+
+export const RESULT_PLAN_KEEP_EXPLORING =
+  `NAVIGATOR: not yet — keep looking into it before proposing again. Do not start building; call ${PLAN_TOOL_NAME} when you have a better proposal.`;
+
+export const RESULT_PLAN_DISMISSED =
+  "NAVIGATOR: no answer — they stepped away from the plan. End your turn and wait for their message. Do not start building.";
+
+// ---------------------------------------------------------------------------
+// Ask results
+// ---------------------------------------------------------------------------
+
+export function resultAnswer(text: string): string {
+  return `NAVIGATOR: ${clampSteering(text)}`;
+}
+
+export const RESULT_ASK_DISMISSED =
+  "NAVIGATOR: no answer — they stepped away from the question. End your turn and wait for their message rather than guessing.";
+
+// ---------------------------------------------------------------------------
+// Out-of-phase results
+//
+// pi has no way to unregister a tool, so all three exist in every phase. An
+// out-of-phase call is a mistake, not an error: say what to do instead and let
+// the model recover, rather than throwing.
+// ---------------------------------------------------------------------------
+
+export const RESULT_PLAN_ALREADY_APPROVED =
+  `pear: a plan is already approved and you are building against it. If the approach genuinely needs to change, explain why and call ${PLAN_TOOL_NAME} again — otherwise use ${CHECKPOINT_TOOL_NAME}.`;
+
+export const RESULT_CHECKPOINT_NO_PLAN =
+  `pear: no plan is approved yet, so there is nothing to check in against. Propose one with ${PLAN_TOOL_NAME} first.`;
+
+// ---------------------------------------------------------------------------
+// Blocked tool calls
+// ---------------------------------------------------------------------------
+
+export function blockOverBudget(points: number, budget: number): string {
   return (
-    `pear: checkpoint overdue — ${count} of ${max} changes used since the human last looked. ` +
+    `pear: checkpoint overdue — ${points} of ${budget} review points used since the human last looked. ` +
     `NOT EXECUTED. Call ${CHECKPOINT_TOOL_NAME} (summary, files, next) to check in, then re-issue this call.`
   );
 }
@@ -98,8 +256,52 @@ export const BLOCK_STOPPED =
   `pear: the navigator asked you to stop. NOT EXECUTED. Make no further changes and end your turn; ` +
   `they will tell you when to resume.`;
 
+export const BLOCK_PAUSED =
+  `pear: the navigator stepped away from a checkpoint. NOT EXECUTED. End your turn and wait for them.`;
+
+export function blockExplaining(file: string): string {
+  return (
+    `pear: the navigator is reviewing \`${file}\`. NOT EXECUTED. Explain the file, then call ` +
+    `${CHECKPOINT_TOOL_NAME} again — no edits until they answer.`
+  );
+}
+
+export const BLOCK_SCOPING =
+  `pear: no plan is approved yet, so nothing can be changed. NOT EXECUTED. Finish understanding the problem and call ${PLAN_TOOL_NAME}.`;
+
+// ---------------------------------------------------------------------------
+// In-band budget nags
+//
+// Appended to mutating tool results. Cheap (no turn of its own) and impossible
+// to miss (attached to the thing the model just did). This is the tier that v2
+// lacked entirely: it went from silence straight to a hard block.
+// ---------------------------------------------------------------------------
+
+export function nagSoft(points: number, budget: number): string {
+  return `pear: ${points}/${budget} review points used — look for a good place to check in.`;
+}
+
+export function nagDue(points: number, budget: number): string {
+  return `pear: ${points}/${budget} review points used. Call ${CHECKPOINT_TOOL_NAME} before the next edit.`;
+}
+
+// ---------------------------------------------------------------------------
+// Human-facing status
+// ---------------------------------------------------------------------------
+
 /** Status-bar text. */
-export function statusLine(mode: string, total: number, max: number, extra?: string): string {
-  const base = mode === "agent-driver" ? `pear: driver ${total}/${max}` : `pear: ${mode}`;
+export function statusLine(
+  mode: string,
+  phase: string,
+  points: number,
+  budget: number,
+  extra?: string,
+): string {
+  const base =
+    mode !== "agent-driver"
+      ? `pear: ${mode}`
+      : phase === "building"
+        ? `pear: driver ${points}/${budget}`
+        : `pear: ${phase}`;
   return extra === undefined ? base : `${base} · ${extra}`;
 }

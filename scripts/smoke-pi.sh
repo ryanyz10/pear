@@ -109,16 +109,29 @@ rm -f .pear/config.json
 if ! "$PI" -e "$EXT" --no-session \
       -p "/pear-mode agent-driver" \
       -p "/pear-status" \
-      -p "/pear-config 3" \
+      -p "/pear-config 120" \
       -p "/pear-status" >"$WORKDIR/live.txt" 2>&1; then
   cat "$WORKDIR/live.txt" >&2
   fail "pi did not survive a sequence of pear commands"
 fi
 node -e '
   const c = JSON.parse(require("fs").readFileSync(".pear/config.json","utf8"));
-  if (c.maxChangesPerCheckpoint !== 3) { console.error("later command did not take effect:", c); process.exit(1); }
+  if (c.reviewBudget !== 120) { console.error("later command did not take effect:", c); process.exit(1); }
 ' || fail "a command after the first did not run — session did not stay live"
 echo "ok: multiple sequential commands all ran"
+
+echo "== leg e2: a legacy change-count budget is migrated, not overwritten =="
+rm -f .pear/config.json
+mkdir -p .pear
+printf '{\n  "mode": "agent-driver",\n  "maxChangesPerCheckpoint": 5\n}\n' > .pear/config.json
+"$PI" -e "$EXT" --no-session -p "/pear-status" >"$WORKDIR/migrate.txt" 2>&1 \
+  || { cat "$WORKDIR/migrate.txt" >&2; fail "session with a legacy budget failed"; }
+node -e '
+  const c = JSON.parse(require("fs").readFileSync(".pear/config.json","utf8"));
+  if (c.maxChangesPerCheckpoint !== 5) { console.error("legacy key lost:", c); process.exit(1); }
+  if ("reviewBudget" in c) { console.error("must not write a derived value:", c); process.exit(1); }
+' || fail "the legacy budget key must survive untouched"
+echo "ok: legacy budget read, file left untouched"
 
 echo "== leg f: no ctx.abort() in shipped adapter code =="
 # Comments may discuss ctx.abort(); code may not call it. Strip comments first,

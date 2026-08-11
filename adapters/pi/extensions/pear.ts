@@ -2,35 +2,67 @@
  * pear as a pi extension.
  *
  * This file is the only pi-specific code in the project; everything it calls
- * lives in `core/` or `adapters/pi/runtime.ts`. Porting pear to another
- * harness means rewriting this file alone.
+ * lives in `core/`, `adapters/pi/runtime.ts`, or `adapters/pi/cards/`. Porting
+ * pear to another harness means rewriting this file alone.
  *
  * API facts relied on here are recorded in `docs/pi-api-notes.md`, verified
  * against the pinned pi version.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { captureGitState } from "../../../core/git.ts";
 import {
   ConfigWriteError,
-  MAX_CHANGES,
-  MIN_CHANGES,
+  MAX_BUDGET,
+  MIN_BUDGET,
   MODES,
-  isValidMaxChanges,
+  isValidBudget,
   loadConfig,
   saveConfig,
   type Mode,
 } from "../../../core/config.ts";
 import {
-  AGENT_DRIVER_PERSONA,
+  ASK_TOOL_DESCRIPTION,
+  ASK_TOOL_NAME,
   CHECKPOINT_TOOL_DESCRIPTION,
   CHECKPOINT_TOOL_NAME,
+  PLAN_TOOL_DESCRIPTION,
+  PLAN_TOOL_NAME,
+  SCOPING_PERSONA,
+  buildPersona,
+  formatPlan,
   resultCheckpointFailed,
+  type PlanSpec,
 } from "../../../core/prompts.ts";
-import { createRuntime, type CheckpointOutcome, type PearRuntime } from "../runtime.ts";
-import { renderCheckpointCard, type CardAnswer } from "./checkpoint-card.ts";
+import { askCard } from "../cards/ask.ts";
+import { renderCard, type CardSpec } from "../cards/card.ts";
+import { checkpointCard, type CheckpointView } from "../cards/checkpoint.ts";
+import { runCardViaDialogs } from "../cards/dialogs.ts";
+import { planCard } from "../cards/plan.ts";
+import { createRuntime, type PearRuntime, type Resolution } from "../runtime.ts";
+
+// --------------------------------------------------------------- tool schemas
+
+const AskParams = Type.Object({
+  question: Type.String({ description: "What you need the navigator to decide." }),
+  options: Type.Array(
+    Type.Object({
+      label: Type.String({ description: "A concrete answer they can pick." }),
+      description: Type.Optional(Type.String({ description: "Why they might pick it." })),
+    }),
+    { description: "2-4 answers you would actually be happy to act on." },
+  ),
+});
+
+const PlanParams = Type.Object({
+  summary: Type.String({ description: "How you intend to solve it, in a sentence or two." }),
+  steps: Type.Array(Type.String(), { description: "The steps, in the order you will do them." }),
+  risks: Type.Optional(
+    Type.Array(Type.String(), { description: "Anything that might go wrong or need a decision." }),
+  ),
+});
 
 const CheckpointParams = Type.Object({
   summary: Type.String({ description: "What you changed and why, in plain language." }),
@@ -38,13 +70,39 @@ const CheckpointParams = Type.Object({
   next: Type.String({ description: "What you plan to do next." }),
 });
 
-type CheckpointDetails = {
-  summary: string;
-  claimedFiles: string[];
-  gitFiles: string[];
-  verified: boolean;
+type CardDetails = {
+  kind: "ask" | "plan" | "checkpoint";
+  headline: string;
   answer: string;
 };
+
+/** Session entry type used to persist the approved plan across reloads. */
+const PLAN_ENTRY = "pear-plan";
+
+/** Tools removed while scoping. `bash` stays, gated per-command by the hook. */
+const WRITE_TOOLS = new Set(["edit", "write"]);
+
+/**
+ * pi's own tools. Used only by `exclusive`, and by name on purpose: `SourceInfo`
+ * carries `{ path, source, scope, origin }` where `origin` is
+ * `"package" | "top-level"`, which does not separate a built-in from a
+ * third-party extension's tool. Names do.
+ */
+const PI_BUILTIN_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find", "ls"]);
+
+const PEAR_TOOLS = new Set([ASK_TOOL_NAME, PLAN_TOOL_NAME, CHECKPOINT_TOOL_NAME]);
+
+function isPlanSpec(value: unknown): value is PlanSpec {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.summary === "string" &&
+    Array.isArray(v.steps) &&
+    v.steps.every((s) => typeof s === "string") &&
+    (v.risks === undefined ||
+      (Array.isArray(v.risks) && v.risks.every((s) => typeof s === "string")))
+  );
+}
 
 export default function pear(pi: ExtensionAPI) {
   // `runtime.mode` is the single source of truth for the mode this session is
@@ -52,12 +110,19 @@ export default function pear(pi: ExtensionAPI) {
   // policy below). Deliberately not mirrored in a second variable.
   let runtime: PearRuntime | null = null;
 
+  /**
+   * Tools pear took away when it entered scoping, so it can put back exactly
+   * those and nothing else. Never a hardcoded restore list: another extension
+   * may legitimately have changed the tool set in the meantime.
+   */
+  let suppressedTools: string[] = [];
+
   const captureFiles = (cwd: string) => () => {
     const state = captureGitState(cwd);
     return state.ok ? state.files : null;
   };
 
-  const refreshStatus = (ctx: { ui: { setStatus: (k: string, t: string | undefined) => void } }) => {
+  const refreshStatus = (ctx: ExtensionContext) => {
     if (runtime === null) return;
     try {
       ctx.ui.setStatus("pear", runtime.statusText());
@@ -68,13 +133,61 @@ export default function pear(pi: ExtensionAPI) {
 
   /**
    * `ui.custom` only works in the TUI. `hasUI` is also true in RPC, where it
-   * silently no-ops, so tiering on `hasUI` would degrade the checkpoint to
-   * nothing. See docs/pi-api-notes.md.
+   * silently no-ops, so tiering on `hasUI` would degrade a card to nothing.
+   * See docs/pi-api-notes.md.
    */
   const canShowCard = (ctx: ExtensionContext) => ctx.mode === "tui";
   const canShowDialogs = (ctx: ExtensionContext) => ctx.hasUI;
 
-  // ---------------------------------------------------------------- session
+  // ------------------------------------------------------------- tool gating
+
+  const suppressWriteTools = () => {
+    const active = pi.getActiveTools();
+    suppressedTools = active.filter((t) => WRITE_TOOLS.has(t));
+    if (suppressedTools.length === 0) return;
+    pi.setActiveTools(active.filter((t) => !WRITE_TOOLS.has(t)));
+  };
+
+  /**
+   * Put back exactly what scoping removed.
+   *
+   * This runs **inside `pear_plan.execute`**, mid-run. pi supports that, but
+   * only for a *purely additive* change: it detects the addition, records the
+   * new names on the tool result, and exposes the definitions before the next
+   * model request (docs `extensions.md`, "Dynamic Tool Loading"). Removing a
+   * currently-active tool in the same call forfeits that, which is why this
+   * starts from the live list and only ever appends.
+   */
+  const restoreWriteTools = () => {
+    if (suppressedTools.length === 0) return;
+    const restored = [...pi.getActiveTools()];
+    for (const name of suppressedTools) {
+      if (!restored.includes(name)) restored.push(name);
+    }
+    suppressedTools = [];
+    pi.setActiveTools(restored);
+  };
+
+  /** Tools that are neither pi's nor pear's. */
+  const foreignTools = (): string[] =>
+    pi.getActiveTools().filter((n) => !PI_BUILTIN_TOOLS.has(n) && !PEAR_TOOLS.has(n));
+
+  const applyExclusive = (ctx: ExtensionContext): string[] => {
+    const foreign = foreignTools();
+    if (foreign.length === 0) return [];
+    pi.setActiveTools(pi.getActiveTools().filter((n) => !foreign.includes(n)));
+    refreshStatus(ctx);
+    return foreign;
+  };
+
+  /** Keep the tool set consistent with the phase pear is actually in. */
+  const syncPhaseTools = () => {
+    if (runtime === null) return;
+    if (runtime.mode === "agent-driver" && runtime.phase === "scoping") suppressWriteTools();
+    else restoreWriteTools();
+  };
+
+  // ----------------------------------------------------------------- session
 
   pi.on("session_start", (_event, ctx) => {
     const loaded = loadConfig(ctx.cwd);
@@ -93,6 +206,14 @@ export default function pear(pi: ExtensionAPI) {
         "warning",
       );
     }
+    if (loaded.migratedBudgetFrom !== undefined) {
+      ctx.ui.notify(
+        `pear: checkpoints are now paced by review load, not change count. Your ` +
+          `maxChangesPerCheckpoint=${loaded.migratedBudgetFrom} reads as reviewBudget=` +
+          `${loaded.config.reviewBudget}. Tune it with /pear-config; the old key is untouched.`,
+        "info",
+      );
+    }
 
     // Headless fail-closed: never approve changes without a human present.
     let startMode: Mode = loaded.config.mode;
@@ -106,27 +227,76 @@ export default function pear(pi: ExtensionAPI) {
     }
 
     runtime = createRuntime({
-      cwd: ctx.cwd,
       mode: startMode,
-      maxChangesPerCheckpoint: loaded.config.maxChangesPerCheckpoint,
+      reviewBudget: loaded.config.reviewBudget,
+      planPhase: loaded.config.planPhase,
       captureFiles: captureFiles(ctx.cwd),
     });
+
+    // A plan approved earlier in this session survives a reload, so the loop
+    // does not silently drop back into scoping and re-litigate it.
+    if (startMode === "agent-driver" && loaded.config.planPhase) {
+      const recovered = recoverPlan(ctx);
+      if (recovered !== undefined) {
+        runtime.restorePlan(recovered);
+        ctx.ui.notify("pear: picked up the plan you already approved.", "info");
+      }
+    }
+
+    syncPhaseTools();
+
+    if (startMode === "agent-driver") {
+      if (loaded.config.exclusive) {
+        const dropped = applyExclusive(ctx);
+        if (dropped.length > 0) {
+          ctx.ui.notify(`pear: exclusive mode — disabled ${dropped.join(", ")}.`, "info");
+        }
+      } else {
+        const foreign = foreignTools();
+        if (foreign.length > 0) {
+          ctx.ui.notify(
+            `pear: ${foreign.length} tool(s) from other extensions are active (${foreign.slice(0, 5).join(", ")}). ` +
+              `pear is prescriptive and works best alone — /pear-exclusive turns them off.`,
+            "info",
+          );
+        }
+      }
+    }
+
     refreshStatus(ctx);
   });
 
+  /** The newest valid plan recorded in this session, if any. */
+  function recoverPlan(ctx: ExtensionContext): PlanSpec | undefined {
+    let found: PlanSpec | undefined;
+    try {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (entry.type !== "custom" || entry.customType !== PLAN_ENTRY) continue;
+        if (isPlanSpec(entry.data)) found = entry.data;
+      }
+    } catch {
+      /* session history is a convenience here, never a requirement */
+    }
+    return found;
+  }
+
   // A pending card must not outlive the session (quit, reload, fork, ...).
   pi.on("session_shutdown", () => {
-    runtime?.resolvePending({ kind: "cancelled" });
+    runtime?.resolvePending({ kind: "dismissed" });
   });
 
-  // --------------------------------------------------------------- persona
+  // ----------------------------------------------------------------- persona
 
   pi.on("before_agent_start", (event) => {
     if (runtime === null || runtime.mode !== "agent-driver") return undefined;
-    return { systemPrompt: `${event.systemPrompt}\n\n${AGENT_DRIVER_PERSONA}` };
+    const persona =
+      runtime.phase === "scoping"
+        ? SCOPING_PERSONA
+        : buildPersona(runtime.planText() ?? "(no plan was recorded — ask what they want.)");
+    return { systemPrompt: `${event.systemPrompt}\n\n${persona}` };
   });
 
-  // ------------------------------------------------------------ the gate
+  // -------------------------------------------------------------- the gate
 
   pi.on("tool_call", (event, ctx) => {
     if (runtime === null) return undefined;
@@ -136,21 +306,27 @@ export default function pear(pi: ExtensionAPI) {
       event.input as Record<string, unknown>,
     );
     refreshStatus(ctx);
-    // NOTE: no ctx.abort(). Returning the block is what lets the model read
-    // the reason and recover; aborting is what broke the previous version.
+    // NOTE: no ctx.abort(). Returning the block is what lets the model read the
+    // reason and recover; aborting is what broke the first version. Also note
+    // there is no `await` anywhere in this handler.
     return decision;
   });
 
   pi.on("tool_result", (event, ctx) => {
-    if (runtime === null) return;
-    runtime.onToolResult(event.toolCallId, event.isError);
+    if (runtime === null) return undefined;
+    const note = runtime.onToolResult(event.toolCallId, event.isError);
     refreshStatus(ctx);
+    if (note === undefined) return undefined;
+    // `content` REPLACES what the model sees, so the original blocks must be
+    // carried through. Dropping them would silently blind the model to its own
+    // tool output.
+    return { content: [...event.content, { type: "text" as const, text: note }] };
   });
 
   /**
-   * Only genuine user input clears a stop. `source === "extension"` is a
-   * message injected by an extension via sendUserMessage, which must not be
-   * able to override the human.
+   * Only genuine user input clears a hold. `source === "extension"` is a message
+   * injected by an extension via sendUserMessage, which must not be able to
+   * override the human.
    */
   pi.on("input", (event, ctx) => {
     if (runtime === null) return undefined;
@@ -167,143 +343,256 @@ export default function pear(pi: ExtensionAPI) {
    */
   pi.on("agent_settled", (_event, ctx) => {
     if (runtime === null || runtime.mode !== "agent-driver") return;
-    const outstanding = runtime.onAgentSettled();
-    if (outstanding > 0) {
+    const report = runtime.onAgentSettled();
+
+    if (report.awaitingExplanation !== null) {
       ctx.ui.notify(
-        `pear: ${outstanding} change${outstanding === 1 ? "" : "s"} not yet checkpointed. ` +
-          `Run /pear-checkpoint to review them.`,
+        `pear: you asked about ${report.awaitingExplanation} but the turn ended without a follow-up. ` +
+          `Run /pear-checkpoint to get your options back.`,
+        "warning",
+      );
+    } else if (report.points > 0 && runtime.phase === "building") {
+      ctx.ui.notify(
+        `pear: ${report.points} review point(s) not yet checkpointed. Run /pear-checkpoint to review them.`,
         "info",
       );
     }
     refreshStatus(ctx);
   });
 
-  // ------------------------------------------------------ checkpoint tool
+  // ------------------------------------------------------------------- cards
 
-  /** Ask the human, by whatever means this host supports right now. */
-  async function askHuman(ctx: ExtensionContext, view: {
-    summary: string;
-    next: string;
-    claimedFiles: string[];
-    gitFiles: string[];
-    verified: boolean;
-    verifyDetail?: string;
-  }): Promise<CheckpointOutcome> {
+  /**
+   * Show a card and return the human's answer, or `null` if they walked away.
+   *
+   * Throws only if the host UI itself fails; callers turn that into a normal
+   * tool result rather than letting it surface as a bare host error.
+   */
+  async function show<A>(ctx: ExtensionContext, spec: CardSpec<A>): Promise<A | null> {
     if (canShowCard(ctx)) {
-      const answer: CardAnswer | null = await ctx.ui.custom((tui, theme, _kb, done) =>
-        renderCheckpointCard(tui, theme, done, view),
+      return await ctx.ui.custom<A | null>((tui, theme, _kb, done) =>
+        renderCard(tui, theme, done, spec),
       );
-      if (answer === null) return { kind: "cancelled" };
-      if (answer.kind === "steer") return { kind: "steer", text: answer.text };
-      return answer.kind === "stop" ? { kind: "stop" } : { kind: "continue" };
     }
-
-    // RPC: ui.custom no-ops, but dialogs work. Only offer outcomes we can
-    // actually complete here — an unavailable option must not silently
-    // become "cancelled".
-    const CONTINUE = "continue — looks good, keep going";
-    const STEER = "make changes — I'll type what to do";
-    const STOP = "stop — I'm taking over";
-    const options = [CONTINUE, STEER, STOP];
-
-    const picked = await ctx.ui.select(
-      `pear checkpoint: ${view.summary}\nNext: ${view.next}`,
-      options,
-    );
-    if (picked === undefined) return { kind: "cancelled" };
-    if (picked === STOP) return { kind: "stop" };
-    if (picked === STEER) {
-      const text = await ctx.ui.input("What should I do instead?");
-      if (text === undefined || text.trim() === "") return { kind: "cancelled" };
-      return { kind: "steer", text };
-    }
-    return { kind: "continue" };
+    return await runCardViaDialogs(ctx, spec);
   }
 
-  /** Shared by the tool and the /pear-checkpoint command. */
-  async function runCheckpoint(
+  /**
+   * The whole lifecycle of one card: open a slot, race the human against every
+   * teardown path, apply the answer.
+   *
+   * `begin` returns either a slot or an immediate result (wrong phase, mode off,
+   * another card already open). `apply` turns an answer into the model-visible
+   * result and the state change that goes with it.
+   */
+  async function runCard<A>(
     ctx: ExtensionContext,
-    claimed: { summary: string; files: string[]; next: string },
-  ): Promise<{ text: string; terminate: boolean; details: CheckpointDetails }> {
+    kind: CardDetails["kind"],
+    headline: string,
+    begin: (rt: PearRuntime) => ReturnType<PearRuntime["beginCheckpoint"]> | unknown,
+    spec: () => CardSpec<A>,
+    dismissed: A,
+    apply: (rt: PearRuntime, answer: A) => Resolution,
+  ): Promise<{ text: string; terminate: boolean; details: CardDetails }> {
     const rt = runtime;
+    const detail = (answer: string): CardDetails => ({ kind, headline, answer });
+
     if (rt === null) {
       return {
         text: resultCheckpointFailed("pear is not initialised"),
         terminate: false,
-        details: { summary: claimed.summary, claimedFiles: claimed.files, gitFiles: [], verified: false, answer: "error" },
+        details: detail("error"),
       };
     }
 
-    const started = rt.beginCheckpoint();
+    const started = begin(rt) as
+      | { pending: { promise: Promise<A>; settle: (a: A) => void } }
+      | { immediate: Resolution };
+
     if ("immediate" in started) {
       return {
         text: started.immediate.text,
         terminate: started.immediate.terminate,
-        details: {
-          summary: claimed.summary,
-          claimedFiles: claimed.files,
-          gitFiles: [],
-          verified: false,
-          answer: "not-run",
-        },
+        details: detail("not-run"),
       };
     }
 
-    const { files: gitFiles, verified } = rt.filesSinceBaseline();
-
-    let outcome: CheckpointOutcome;
+    let answer: A;
     try {
       // Race the human against every way this can be torn down. Whichever
-      // resolves first wins; the loser is a no-op because resolvePending and
-      // the promise itself are both idempotent.
-      const answered = askHuman(ctx, {
-        summary: claimed.summary,
-        next: claimed.next,
-        claimedFiles: claimed.files,
-        gitFiles,
-        verified,
-      }).then((o) => {
-        rt.resolvePending(o);
-        return o;
+      // resolves first wins; the loser is a no-op because `settle` and the
+      // promise are both idempotent.
+      const answered = show(ctx, spec()).then((a) => {
+        const resolved = a ?? dismissed;
+        started.pending.settle(resolved);
+        return resolved;
       });
-      outcome = await Promise.race([started.pending.promise, answered]);
+      answer = await Promise.race([started.pending.promise, answered]);
     } catch (e) {
       // A UI failure must not leave the card pending or the baseline moved.
-      rt.resolvePending({ kind: "cancelled" });
-      const detail = e instanceof Error ? e.message : String(e);
-      const resolution = rt.applyOutcome({ kind: "cancelled" });
+      rt.resolvePending({ kind: "dismissed" });
+      const message = e instanceof Error ? e.message : String(e);
+      const resolution = apply(rt, dismissed);
+      refreshStatus(ctx);
       return {
-        text: `${resultCheckpointFailed(detail)}\n\n${resolution.text}`,
+        text: `${resultCheckpointFailed(message)}\n\n${resolution.text}`,
         terminate: resolution.terminate,
-        details: { summary: claimed.summary, claimedFiles: claimed.files, gitFiles, verified, answer: "error" },
+        details: detail("error"),
       };
     }
 
-    const resolution = rt.applyOutcome(outcome);
+    const resolution = apply(rt, answer);
+    syncPhaseTools();
     refreshStatus(ctx);
     return {
       text: resolution.text,
       terminate: resolution.terminate,
-      details: {
-        summary: claimed.summary,
-        claimedFiles: claimed.files,
-        gitFiles,
-        verified,
-        answer: outcome.kind,
-      },
+      details: detail((answer as { kind?: string }).kind ?? "unknown"),
     };
   }
+
+  /** Shared by the checkpoint tool and the /pear-checkpoint command. */
+  async function runCheckpoint(
+    ctx: ExtensionContext,
+    claimed: { summary: string; files: string[]; next: string },
+  ) {
+    let view: CheckpointView = {
+      summary: claimed.summary,
+      next: claimed.next,
+      claimedFiles: claimed.files,
+      gitFiles: [],
+      verified: false,
+    };
+    return await runCard(
+      ctx,
+      "checkpoint",
+      claimed.summary,
+      (rt) => {
+        const started = rt.beginCheckpoint();
+        // Capture the file list only once a card is actually going to be shown.
+        if ("pending" in started) {
+          const { files, verified } = rt.filesSinceBaseline();
+          view = { ...view, gitFiles: files, verified };
+        }
+        return started;
+      },
+      () => checkpointCard(view),
+      { kind: "dismissed" },
+      (rt, answer) => rt.applyCheckpointAnswer(answer),
+    );
+  }
+
+  // ------------------------------------------------------------------- tools
+
+  const renderCardCall = (
+    theme: Theme,
+    label: string,
+    headline: string,
+    count: number | undefined,
+    unit = "file",
+  ): Text => {
+    const head = theme.fg("toolTitle", theme.bold(`${label} `));
+    const body = theme.fg("muted", headline);
+    const tail =
+      count === undefined || count === 0
+        ? ""
+        : theme.fg("dim", `\n  ${count} ${unit}${count === 1 ? "" : "s"}`);
+    return new Text(head + body + tail, 0, 0);
+  };
+
+  pi.registerTool({
+    name: ASK_TOOL_NAME,
+    label: "Ask",
+    description: ASK_TOOL_DESCRIPTION,
+    parameters: AskParams,
+    executionMode: "sequential",
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const onAbort = () => runtime?.resolvePending({ kind: "dismissed" });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        const { text, terminate, details } = await runCard(
+          ctx,
+          "ask",
+          params.question,
+          (rt) => rt.beginAsk(),
+          () => askCard({ question: params.question, choices: params.options }),
+          { kind: "dismissed" as const },
+          (rt, answer) => rt.applyAskAnswer(answer),
+        );
+        return { content: [{ type: "text" as const, text }], details, terminate };
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
+    },
+
+    renderCall: (args, theme) => renderCardCall(theme, "ask", String(args.question ?? ""), undefined),
+    renderResult: (result, _options, theme) => renderAnswer(result.details, theme),
+  });
+
+  pi.registerTool({
+    name: PLAN_TOOL_NAME,
+    label: "Plan",
+    description: PLAN_TOOL_DESCRIPTION,
+    parameters: PlanParams,
+    executionMode: "sequential",
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const onAbort = () => runtime?.resolvePending({ kind: "dismissed" });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const proposed: PlanSpec =
+        params.risks === undefined
+          ? { summary: params.summary, steps: params.steps }
+          : { summary: params.summary, steps: params.steps, risks: params.risks };
+      try {
+        const { text, terminate, details } = await runCard(
+          ctx,
+          "plan",
+          params.summary,
+          (rt) => rt.beginPlan(),
+          () => planCard(proposed),
+          { kind: "dismissed" as const },
+          (rt, answer) => {
+            const resolution = rt.applyPlanAnswer(answer, proposed);
+            // Persist only what the human actually approved, and only after the
+            // runtime has accepted it, so history cannot claim more than state.
+            if (answer.kind === "approve") {
+              try {
+                pi.appendEntry(PLAN_ENTRY, proposed);
+              } catch {
+                /* the plan still holds for this session */
+              }
+            }
+            return resolution;
+          },
+        );
+        return { content: [{ type: "text" as const, text }], details, terminate };
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
+    },
+
+    renderCall: (args, theme) =>
+      renderCardCall(
+        theme,
+        "plan",
+        String(args.summary ?? ""),
+        Array.isArray(args.steps) ? args.steps.length : undefined,
+        "step",
+      ),
+    renderResult: (result, _options, theme) => renderAnswer(result.details, theme),
+  });
 
   pi.registerTool({
     name: CHECKPOINT_TOOL_NAME,
     label: "Checkpoint",
     description: CHECKPOINT_TOOL_DESCRIPTION,
     parameters: CheckpointParams,
-    // Keeps the card from opening while sibling mutations are still writing.
+    // Keeps a card from opening while sibling mutations are still writing.
     executionMode: "sequential",
 
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const onAbort = () => runtime?.resolvePending({ kind: "cancelled" });
+      const onAbort = () => runtime?.resolvePending({ kind: "dismissed" });
       signal?.addEventListener("abort", onAbort, { once: true });
       try {
         const { text, terminate, details } = await runCheckpoint(ctx, {
@@ -311,54 +600,93 @@ export default function pear(pi: ExtensionAPI) {
           files: params.files,
           next: params.next,
         });
-        return {
-          content: [{ type: "text" as const, text }],
-          details,
-          terminate,
-        };
+        return { content: [{ type: "text" as const, text }], details, terminate };
       } finally {
         signal?.removeEventListener("abort", onAbort);
       }
     },
 
-    renderCall(args, theme) {
-      const files = Array.isArray(args.files) ? args.files : [];
-      const head = theme.fg("toolTitle", theme.bold("checkpoint "));
-      const body = theme.fg("muted", String(args.summary ?? ""));
-      const tail = files.length ? theme.fg("dim", `\n  ${files.length} file(s)`) : "";
-      return new Text(head + body + tail, 0, 0);
-    },
+    renderCall: (args, theme) =>
+      renderCardCall(
+        theme,
+        "checkpoint",
+        String(args.summary ?? ""),
+        Array.isArray(args.files) ? args.files.length : undefined,
+      ),
+    renderResult: (result, _options, theme) => renderAnswer(result.details, theme),
+  });
 
-    renderResult(result, _options, theme) {
-      const d = result.details as CheckpointDetails | undefined;
-      if (d === undefined) return new Text("", 0, 0);
-      const label =
-        d.answer === "continue"
-          ? theme.fg("success", "✓ continue")
-          : d.answer === "steer"
-            ? theme.fg("accent", "✎ steering")
-            : d.answer === "stop"
-              ? theme.fg("warning", "■ stop")
-              : theme.fg("dim", d.answer);
-      return new Text(label, 0, 0);
+  function renderAnswer(details: unknown, theme: Theme): Text {
+    const d = details as CardDetails | undefined;
+    if (d === undefined) return new Text("", 0, 0);
+    const marks: Record<string, [ThemeColor, string]> = {
+      continue: ["success", "✓ keep going"],
+      approve: ["success", "✓ approved"],
+      answer: ["success", "✓ answered"],
+      explain: ["accent", "◦ walk me through it"],
+      steer: ["accent", "✎ change direction"],
+      revise: ["accent", "✎ revise the plan"],
+      explore: ["accent", "◦ keep exploring"],
+      stop: ["warning", "■ stop"],
+      dismissed: ["dim", "— dismissed"],
+    };
+    const mark = marks[d.answer];
+    return new Text(mark === undefined ? theme.fg("dim", d.answer) : theme.fg(mark[0], mark[1]), 0, 0);
+  }
+
+  // ---------------------------------------------------------------- commands
+
+  const needRuntime = (ctx: ExtensionContext): PearRuntime | null => {
+    if (runtime === null) ctx.ui.notify("pear: not initialised", "warning");
+    return runtime;
+  };
+
+  pi.registerCommand("pear", {
+    description: "Start over: go back to agreeing an approach",
+    handler: async (_args, ctx) => {
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      if (rt.mode !== "agent-driver") {
+        ctx.ui.notify("pear: not in agent-driver mode — use /pear-mode first.", "warning");
+        return;
+      }
+      rt.replan();
+      syncPhaseTools();
+      refreshStatus(ctx);
+      ctx.ui.notify(
+        "pear: back to scoping — editing is closed until a new plan is approved.",
+        "info",
+      );
     },
   });
 
-  // ------------------------------------------------------------- commands
+  pi.registerCommand("pear-plan", {
+    description: "Show the plan you agreed to",
+    handler: async (_args, ctx) => {
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      const plan = rt.plan;
+      ctx.ui.notify(
+        plan === null ? "pear: no plan approved yet." : `pear plan\n\n${formatPlan(plan)}`,
+        "info",
+      );
+    },
+  });
 
   pi.registerCommand("pear-status", {
-    description: "Show pear's mode and checkpoint budget",
+    description: "Show pear's mode, phase, and review load",
     handler: async (_args, ctx) => {
-      if (runtime === null) {
-        ctx.ui.notify("pear: not initialised", "warning");
-        return;
-      }
-      const snap = runtime.checkpoint.snapshot();
-      const { files, verified } = runtime.filesSinceBaseline();
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      const snap = rt.checkpoint.snapshot();
+      const { files, verified } = rt.filesSinceBaseline();
       ctx.ui.notify(
-        `${runtime.statusText()}\n` +
-          `confirmed ${snap.confirmed}, in-flight ${snap.pending}, unknown ${snap.stale}\n` +
-          (verified ? `${files.length} file(s) changed since last checkpoint` : "file list unavailable (not a git repo)"),
+        `${rt.statusText()}\n` +
+          `${snap.files} file(s), ${snap.lines} line(s) → ${snap.points}/${rt.reviewBudget} points (${rt.tier()})\n` +
+          `calls: confirmed ${snap.confirmed}, in-flight ${snap.pending}, unknown ${snap.stale}\n` +
+          (verified
+            ? `${files.length} file(s) changed since last checkpoint`
+            : "file list unavailable (not a git repo)"),
         "info",
       );
     },
@@ -367,11 +695,9 @@ export default function pear(pi: ExtensionAPI) {
   pi.registerCommand("pear-checkpoint", {
     description: "Open a checkpoint yourself, without waiting for the agent",
     handler: async (_args, ctx) => {
-      if (runtime === null) {
-        ctx.ui.notify("pear: not initialised", "warning");
-        return;
-      }
-      const { files } = runtime.filesSinceBaseline();
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      const { files } = rt.filesSinceBaseline();
       const { text } = await runCheckpoint(ctx, {
         summary: "Checkpoint requested by you (navigator).",
         files,
@@ -381,13 +707,36 @@ export default function pear(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("pear-exclusive", {
+    description: "Turn off tools from other extensions for this session",
+    handler: async (_args, ctx) => {
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      const dropped = applyExclusive(ctx);
+      let persisted = true;
+      let detail = "";
+      try {
+        saveConfig(ctx.cwd, { exclusive: true });
+      } catch (e) {
+        persisted = false;
+        detail = e instanceof ConfigWriteError ? e.message : String(e);
+      }
+      const what =
+        dropped.length === 0 ? "nothing to disable" : `disabled ${dropped.join(", ")}`;
+      ctx.ui.notify(
+        persisted
+          ? `pear: exclusive mode — ${what}.`
+          : `pear: ${what} for this session only — NOT persisted: ${detail}`,
+        persisted ? "info" : "warning",
+      );
+    },
+  });
+
   pi.registerCommand("pear-mode", {
     description: `Switch pear's mode: ${MODES.join(" | ")}`,
     handler: async (args, ctx) => {
-      if (runtime === null) {
-        ctx.ui.notify("pear: not initialised", "warning");
-        return;
-      }
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
       const trimmed = args.trim();
       let target: Mode | undefined;
 
@@ -420,7 +769,8 @@ export default function pear(pi: ExtensionAPI) {
       // up. What we must not do is claim it is active when no human could
       // answer a checkpoint here.
       const runnable = target !== "agent-driver" || canShowDialogs(ctx);
-      runtime.setMode(runnable ? target : "off");
+      rt.setMode(runnable ? target : "off");
+      syncPhaseTools();
       refreshStatus(ctx);
 
       if (!persisted) {
@@ -441,34 +791,32 @@ export default function pear(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("pear-config", {
-    description: "Set how many changes may pass between checkpoints",
+    description: "Set the review load allowed between checkpoints",
     handler: async (args, ctx) => {
-      if (runtime === null) {
-        ctx.ui.notify("pear: not initialised", "warning");
-        return;
-      }
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
       const current = loadConfig(ctx.cwd).config;
       let raw = args.trim();
 
       if (raw === "") {
         if (!ctx.hasUI) {
           ctx.ui.notify(
-            `pear-config needs a number here (${MIN_CHANGES}-${MAX_CHANGES}); currently ${current.maxChangesPerCheckpoint}`,
+            `pear-config needs a number here (${MIN_BUDGET}-${MAX_BUDGET}); currently ${current.reviewBudget}`,
             "warning",
           );
           return;
         }
         const typed = await ctx.ui.input(
-          `Changes allowed between checkpoints (${MIN_CHANGES}-${MAX_CHANGES}), currently ${current.maxChangesPerCheckpoint}:`,
+          `Review points allowed between checkpoints (${MIN_BUDGET}-${MAX_BUDGET}), currently ${current.reviewBudget}:`,
         );
         if (typed === undefined) return;
         raw = typed.trim();
       }
 
       const value = Number(raw);
-      if (!isValidMaxChanges(value)) {
+      if (!isValidBudget(value)) {
         ctx.ui.notify(
-          `pear: need a whole number between ${MIN_CHANGES} and ${MAX_CHANGES}`,
+          `pear: need a whole number between ${MIN_BUDGET} and ${MAX_BUDGET}`,
           "error",
         );
         return;
@@ -477,17 +825,17 @@ export default function pear(pi: ExtensionAPI) {
       let persisted = true;
       let detail = "";
       try {
-        saveConfig(ctx.cwd, { maxChangesPerCheckpoint: value });
+        saveConfig(ctx.cwd, { reviewBudget: value });
       } catch (e) {
         persisted = false;
         detail = e instanceof ConfigWriteError ? e.message : String(e);
       }
 
-      runtime.setMaxChanges(value);
+      rt.setBudget(value);
       refreshStatus(ctx);
       ctx.ui.notify(
         persisted
-          ? `pear: up to ${value} change(s) between checkpoints`
+          ? `pear: up to ${value} review point(s) between checkpoints`
           : `pear: set to ${value} for this session only — NOT persisted: ${detail}`,
         persisted ? "info" : "warning",
       );

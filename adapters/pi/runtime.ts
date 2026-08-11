@@ -6,62 +6,131 @@
  * synchronous and injectable so the whole state machine is testable without a
  * host.
  *
- * Two rules drive the design:
+ * Three rules drive the design:
  *
  * 1. **A hook must never wait for a human.** Blocking decisions are computed
- *    synchronously and returned. Waiting happens inside the checkpoint tool,
- *    which is allowed to take as long as the human needs.
- * 2. **Nothing is ever aborted.** The previous implementation called pi's
+ *    synchronously and returned. Waiting happens inside a pear tool, which is
+ *    allowed to take as long as the human needs.
+ * 2. **Nothing is ever aborted.** The v1 implementation called pi's
  *    `ctx.abort()` when blocking, which killed the agent run so the model never
  *    saw the explanation. Blocks are ordinary tool results here.
+ * 3. **No card answer parks the agent.** Every answer produces a resolution
+ *    immediately. "Walk me through a file" is a resolution too — it hands the
+ *    agent an instruction and relies on it calling back, rather than holding the
+ *    tool open while the human reads.
  */
 
-import { isReadOnlyBashCommand } from "../../core/bash.ts";
 import { createCheckpoint, type Checkpoint, type FileState } from "../../core/checkpoint.ts";
-import { gateClosed, type Mode } from "../../core/config.ts";
+import { loadTier, type LoadTier, type Mode } from "../../core/config.ts";
+import { estimateChange } from "../../core/load.ts";
 import {
+  BLOCK_PAUSED,
+  BLOCK_SCOPING,
   BLOCK_STOPPED,
   RESULT_ALREADY_PENDING,
-  RESULT_CANCELLED,
+  RESULT_ASK_DISMISSED,
+  RESULT_CHECKPOINT_NO_PLAN,
   RESULT_CONTINUE,
+  RESULT_DISMISSED,
   RESULT_MODE_OFF,
   RESULT_OFF,
+  RESULT_PLAN_ALREADY_APPROVED,
+  RESULT_PLAN_APPROVED,
+  RESULT_PLAN_DISMISSED,
+  RESULT_PLAN_KEEP_EXPLORING,
   RESULT_STOP,
-  blockOverdue,
+  blockExplaining,
+  blockOverBudget,
+  formatPlan,
+  nagDue,
+  nagSoft,
+  resultAnswer,
+  resultExplain,
+  resultPlanRevise,
   resultSteering,
   statusLine,
+  type PlanSpec,
 } from "../../core/prompts.ts";
 
-/** Tools that can change the working tree. `bash` is classified per-command. */
-export const MUTATING_TOOLS = new Set(["write", "edit", "bash"]);
+/**
+ * Scoping is read-only and building is not. The phase is also what decides
+ * which persona is injected and which tools are in phase.
+ */
+export type Phase = "scoping" | "building";
 
 export type BlockDecision = { block: true; reason: string } | undefined;
 
 /** What the human chose at a checkpoint, or why there was no choice. */
-export type CheckpointOutcome =
+export type CheckpointAnswer =
   | { kind: "continue" }
+  | { kind: "explain"; file: string }
   | { kind: "steer"; text: string }
   | { kind: "stop" }
-  | { kind: "cancelled" }
+  | { kind: "dismissed" }
   | { kind: "mode-off" };
 
-export type CheckpointResolution = {
+export type PlanAnswer =
+  | { kind: "approve" }
+  | { kind: "revise"; text: string }
+  | { kind: "explore" }
+  | { kind: "dismissed" }
+  | { kind: "mode-off" };
+
+export type AskAnswer =
+  | { kind: "answer"; text: string }
+  | { kind: "dismissed" }
+  | { kind: "mode-off" };
+
+/**
+ * Every teardown path resolves a card the same way, whichever kind is open.
+ * Both members are present in all three answer unions, so teardown never has to
+ * know what it is cancelling.
+ */
+export type TeardownAnswer = { kind: "dismissed" } | { kind: "mode-off" };
+
+export type Resolution = {
   /** Text handed back to the model as the tool result. */
   text: string;
   /** Ask the host to end the agent loop after this tool batch. */
   terminate: boolean;
 };
 
-/** A checkpoint awaiting the human. */
-export type PendingCheckpoint = {
-  resolve: (outcome: CheckpointOutcome) => void;
-  promise: Promise<CheckpointOutcome>;
+/**
+ * A card awaiting the human. One at a time, whatever its kind.
+ *
+ * The owning tool races `promise` against its own UI, then calls `settle` with
+ * whichever answer won. Both are idempotent, so the tool never has to work out
+ * whether it or a teardown path got there first.
+ */
+export type Pending<A> = {
+  promise: Promise<A>;
+  /** Release the slot and resolve with a real answer from the card. */
+  settle: (answer: A) => void;
+};
+
+export type CardKind = "ask" | "plan" | "checkpoint";
+
+type PendingSlot = {
+  kind: CardKind;
+  /** Resolve the open card with a teardown answer, whatever its kind. */
+  teardown: (answer: TeardownAnswer) => void;
+};
+
+/** `{ pending }` when a card should be shown, `{ immediate }` when it should not. */
+export type CardStart<A> = { pending: Pending<A> } | { immediate: Resolution };
+
+export type SettledReport = {
+  /** Review load left unacknowledged at the run boundary. */
+  points: number;
+  /** The file the human asked to be walked through, if that never happened. */
+  awaitingExplanation: string | null;
 };
 
 export type RuntimeDeps = {
-  cwd: string;
   mode: Mode;
-  maxChangesPerCheckpoint: number;
+  reviewBudget: number;
+  /** Whether a fresh agent-driver session starts in scoping. */
+  planPhase: boolean;
   /** Capture current file state; returns null when git is unavailable. */
   captureFiles: () => FileState | null;
   now?: () => number;
@@ -69,29 +138,49 @@ export type RuntimeDeps = {
 
 export type PearRuntime = {
   readonly mode: Mode;
+  readonly phase: Phase;
+  readonly plan: PlanSpec | null;
   readonly stopped: boolean;
+  readonly paused: boolean;
+  readonly explaining: string | null;
+  readonly reviewBudget: number;
   readonly checkpoint: Checkpoint;
-  isCheckpointPending: () => boolean;
+  isCardPending: () => boolean;
+  tier: () => LoadTier;
 
   setMode: (mode: Mode) => void;
-  setMaxChanges: (max: number) => void;
+  setBudget: (points: number) => void;
+  /** Adopt a plan recovered from session history, without re-approving it. */
+  restorePlan: (plan: PlanSpec) => void;
+  /** Return to scoping. The last approved plan is kept for reference. */
+  replan: () => void;
+  /** The approved plan as the model and `/pear-plan` see it. */
+  planText: () => string | null;
 
-  onMutatingToolCall: (toolName: string, callId: string, input: Record<string, unknown>) => BlockDecision;
-  onToolResult: (callId: string, isError: boolean) => void;
-  /** Terminal run boundary: sweep orphans. Returns the uncheckpointed count. */
-  onAgentSettled: () => number;
-  /** Genuine user input (not extension-injected) releases a stop. */
+  onMutatingToolCall: (
+    toolName: string,
+    callId: string,
+    input: Record<string, unknown>,
+  ) => BlockDecision;
+  /**
+   * Settle a tool call. Returns a note to append to the model-visible result,
+   * or undefined when there is nothing to say.
+   */
+  onToolResult: (callId: string, isError: boolean) => string | undefined;
+  /** Terminal run boundary: sweep orphans and clear run-scoped state. */
+  onAgentSettled: () => SettledReport;
+  /** Genuine user input (not extension-injected) clears every hold. */
   onUserInput: () => void;
 
-  /**
-   * Open a checkpoint. Returns either a promise for the human's answer, or an
-   * immediate resolution when no checkpoint should happen.
-   */
-  beginCheckpoint: () => { pending: PendingCheckpoint } | { immediate: CheckpointResolution };
-  /** Resolve the open checkpoint, if any. Idempotent; later calls no-op. */
-  resolvePending: (outcome: CheckpointOutcome) => void;
-  /** Apply an outcome: update state and produce the model-visible result. */
-  applyOutcome: (outcome: CheckpointOutcome) => CheckpointResolution;
+  beginAsk: () => CardStart<AskAnswer>;
+  beginPlan: () => CardStart<PlanAnswer>;
+  beginCheckpoint: () => CardStart<CheckpointAnswer>;
+  /** Resolve whatever card is open. Idempotent; later calls no-op. */
+  resolvePending: (answer: TeardownAnswer) => void;
+
+  applyAskAnswer: (answer: AskAnswer) => Resolution;
+  applyPlanAnswer: (answer: PlanAnswer, plan: PlanSpec) => Resolution;
+  applyCheckpointAnswer: (answer: CheckpointAnswer) => Resolution;
 
   statusText: () => string;
   filesSinceBaseline: () => { files: string[]; verified: boolean };
@@ -100,9 +189,18 @@ export type PearRuntime = {
 export function createRuntime(deps: RuntimeDeps): PearRuntime {
   const now = deps.now ?? (() => Date.now());
   let mode: Mode = deps.mode;
-  let maxChanges = deps.maxChangesPerCheckpoint;
+  let budget = deps.reviewBudget;
+  let phase: Phase = deps.planPhase ? "scoping" : "building";
+  let plan: PlanSpec | null = null;
+
+  /** Latched by "stop"; cleared only by real user input. */
   let stopped = false;
-  let pending: PendingCheckpoint | null = null;
+  /** Set when the human walked away from a card; cleared at the run boundary. */
+  let paused = false;
+  /** Set while the human is being walked through a file. */
+  let explaining: string | null = null;
+
+  let pending: PendingSlot | null = null;
 
   const checkpoint = createCheckpoint(deps.captureFiles() ?? new Map());
 
@@ -111,134 +209,290 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     checkpoint.reset(deps.captureFiles() ?? new Map());
   };
 
-  const isMutating = (toolName: string, input: Record<string, unknown>): boolean => {
-    if (!MUTATING_TOOLS.has(toolName)) return false;
-    if (toolName !== "bash") return true;
-    const command = typeof input.command === "string" ? input.command : "";
-    // Unclassifiable commands count as mutating.
-    return !isReadOnlyBashCommand(command);
+  const points = (): number => checkpoint.snapshot().points;
+  const tier = (): LoadTier => loadTier(points(), budget);
+
+  const resolvePending = (answer: TeardownAnswer): void => {
+    pending?.teardown(answer);
   };
 
-  const applyOutcome = (outcome: CheckpointOutcome): CheckpointResolution => {
-    switch (outcome.kind) {
-      case "continue":
-        rebaseline();
-        return { text: RESULT_CONTINUE, terminate: false };
-
-      case "steer":
-        // The human saw the (git-verified) change set before typing this, so
-        // it counts as acknowledged. Their requested corrections become the
-        // next checkpoint's delta.
-        rebaseline();
-        return { text: resultSteering(outcome.text), terminate: false };
-
-      case "stop":
-        rebaseline();
-        stopped = true;
-        // `terminate` ends the agent loop at the host level; the stop latch
-        // below is the guarantee if the host declines (e.g. mixed batch).
-        return { text: RESULT_STOP, terminate: true };
-
-      case "cancelled":
-        // Deliberately no rebaseline: nothing was acknowledged, so the same
-        // files must still appear at the next checkpoint.
-        stopped = true;
-        return { text: RESULT_CANCELLED, terminate: true };
-
-      case "mode-off":
-        return { text: RESULT_MODE_OFF, terminate: false };
+  /** Shared body of the three `begin*` calls. */
+  function open<A>(kind: CardKind, blocked: Resolution | undefined): CardStart<A> {
+    if (mode !== "agent-driver") {
+      return { immediate: { text: RESULT_OFF, terminate: false } };
     }
-  };
+    if (blocked !== undefined) return { immediate: blocked };
+    if (pending !== null) {
+      // Reject rather than queue: a second card would race the first for the
+      // same answer, and the model should wait for the answer it asked for.
+      return { immediate: { text: RESULT_ALREADY_PENDING, terminate: false } };
+    }
 
-  const resolvePending = (outcome: CheckpointOutcome): void => {
-    const p = pending;
-    if (p === null) return;
-    pending = null;
-    p.resolve(outcome);
-  };
+    let resolve!: (answer: A) => void;
+    const promise = new Promise<A>((res) => {
+      resolve = res;
+    });
+
+    const settle = (answer: A): void => {
+      // Compare identity rather than null-ness: a slot opened by a *later* card
+      // must not be closed by a straggler from an earlier one.
+      if (pending !== slot) return;
+      pending = null;
+      resolve(answer);
+    };
+
+    const slot: PendingSlot = {
+      kind,
+      // Both teardown answers are members of every answer union, so this is
+      // sound for all three card kinds. The generic cannot express "A always
+      // includes TeardownAnswer", which is why the cast is here and not at the
+      // call sites.
+      teardown: (answer) => settle(answer as unknown as A),
+    };
+    pending = slot;
+
+    return { pending: { promise, settle } };
+  }
 
   return {
     get mode() {
       return mode;
     },
+    get phase() {
+      return phase;
+    },
+    get plan() {
+      return plan;
+    },
     get stopped() {
       return stopped;
+    },
+    get paused() {
+      return paused;
+    },
+    get explaining() {
+      return explaining;
+    },
+    get reviewBudget() {
+      return budget;
     },
     get checkpoint() {
       return checkpoint;
     },
-    isCheckpointPending: () => pending !== null,
+    isCardPending: () => pending !== null,
+    tier,
 
     setMode(next) {
       if (next === mode) return;
       mode = next;
       stopped = false;
+      paused = false;
+      explaining = null;
+      phase = deps.planPhase ? "scoping" : "building";
+      plan = null;
       // An open card belongs to the mode that opened it.
       resolvePending({ kind: "mode-off" });
       checkpoint.reset(next === "agent-driver" ? (deps.captureFiles() ?? new Map()) : new Map());
     },
 
-    setMaxChanges(max) {
-      maxChanges = max;
+    setBudget(next) {
+      budget = next;
+    },
+
+    restorePlan(next) {
+      plan = next;
+      phase = "building";
+      rebaseline();
+    },
+
+    replan() {
+      phase = "scoping";
+      stopped = false;
+      paused = false;
+      explaining = null;
+      rebaseline();
+    },
+
+    planText() {
+      return plan === null ? null : formatPlan(plan);
     },
 
     onMutatingToolCall(toolName, callId, input) {
       if (mode !== "agent-driver") return undefined;
-      if (!isMutating(toolName, input)) return undefined;
 
-      // Stop outranks the budget: the human said stop, so the count is moot.
+      // `estimateChange` is the single source of truth for "does this mutate":
+      // read-only bash and every non-mutating tool price as undefined.
+      const cost = estimateChange(toolName, input);
+      if (cost === undefined) return undefined;
+
+      // Nothing may be changed before a plan is approved. edit/write are also
+      // removed from the tool set in scoping; this is the backstop, and the only
+      // thing standing between a mutating bash command and the working tree.
+      if (phase === "scoping") return { block: true, reason: BLOCK_SCOPING };
+
+      // The human's explicit decisions outrank the budget: they are about this
+      // moment, whereas the budget is an accounting threshold.
       if (stopped) return { block: true, reason: BLOCK_STOPPED };
+      if (paused) return { block: true, reason: BLOCK_PAUSED };
+      if (explaining !== null) return { block: true, reason: blockExplaining(explaining) };
 
-      const total = checkpoint.snapshot().total;
-      if (gateClosed(total, maxChanges)) {
-        return { block: true, reason: blockOverdue(total, maxChanges) };
+      // Admit-first: the tier is computed from the load accrued *before* this
+      // call, so a single oversized change always executes and the block lands
+      // on the next one. Blocking on this call's own estimate would force a
+      // checkpoint with nothing yet to review.
+      const before = points();
+      if (loadTier(before, budget) === "blocked") {
+        return { block: true, reason: blockOverBudget(before, budget) };
       }
 
-      checkpoint.admit(callId, toolName, now());
+      checkpoint.admit(callId, toolName, cost, now());
       return undefined;
     },
 
     onToolResult(callId, isError) {
-      checkpoint.settle(callId, !isError);
+      const outcome = checkpoint.settle(callId, !isError);
+      // Only admitted mutating calls are nagged. A failed call changed nothing,
+      // so its load was released and there is nothing new to report.
+      if (outcome !== "confirmed") return undefined;
+      // A card already open, or an active hold, says everything the nag would.
+      if (pending !== null || stopped || paused || explaining !== null) return undefined;
+
+      const total = points();
+      switch (loadTier(total, budget)) {
+        case "quiet":
+          return undefined;
+        case "soft":
+          return nagSoft(total, budget);
+        default:
+          // "due" and "blocked" get the same firm note; the difference between
+          // them is that the next call is refused outright.
+          return nagDue(total, budget);
+      }
     },
 
     onAgentSettled() {
       checkpoint.sweepStale();
-      return checkpoint.snapshot().total;
+      // `paused` is a backstop for the run that was torn down, so it expires
+      // with that run. `stopped` and `explaining` are the human's standing
+      // instructions and survive until they say otherwise.
+      paused = false;
+      return { points: points(), awaitingExplanation: explaining };
     },
 
     onUserInput() {
       stopped = false;
+      paused = false;
+      explaining = null;
+    },
+
+    beginAsk() {
+      // Asking is always in phase: it is how the agent gets unstuck, so gating
+      // it would be a way to wedge the loop.
+      return open<AskAnswer>("ask", undefined);
+    },
+
+    beginPlan() {
+      return open<PlanAnswer>(
+        "plan",
+        phase === "building"
+          ? { text: RESULT_PLAN_ALREADY_APPROVED, terminate: false }
+          : undefined,
+      );
     },
 
     beginCheckpoint() {
-      if (mode !== "agent-driver") {
-        return { immediate: { text: RESULT_OFF, terminate: false } };
-      }
-      if (pending !== null) {
-        // Reject rather than queue: a second card would race the first for the
-        // same answer, and the model should wait for the answer it asked for.
-        return { immediate: { text: RESULT_ALREADY_PENDING, terminate: false } };
-      }
-
-      let resolve!: (outcome: CheckpointOutcome) => void;
-      const promise = new Promise<CheckpointOutcome>((res) => {
-        resolve = res;
-      });
-      pending = { resolve, promise };
-      return { pending };
+      const start = open<CheckpointAnswer>(
+        "checkpoint",
+        phase === "scoping"
+          ? { text: RESULT_CHECKPOINT_NO_PLAN, terminate: false }
+          : undefined,
+      );
+      // Re-showing the card is what ends the walkthrough, so edits are no
+      // longer held once the human is looking at their options again.
+      if ("pending" in start) explaining = null;
+      return start;
     },
 
     resolvePending,
-    applyOutcome,
+
+    applyAskAnswer(answer) {
+      switch (answer.kind) {
+        case "answer":
+          return { text: resultAnswer(answer.text), terminate: false };
+        case "dismissed":
+          paused = true;
+          return { text: RESULT_ASK_DISMISSED, terminate: true };
+        case "mode-off":
+          return { text: RESULT_MODE_OFF, terminate: false };
+      }
+    },
+
+    applyPlanAnswer(answer, proposed) {
+      switch (answer.kind) {
+        case "approve":
+          plan = proposed;
+          phase = "building";
+          // Anything changed while scoping (there should be nothing) is not the
+          // agent's to answer for, so the build window starts clean.
+          rebaseline();
+          return { text: RESULT_PLAN_APPROVED, terminate: false };
+        case "revise":
+          return { text: resultPlanRevise(answer.text), terminate: false };
+        case "explore":
+          return { text: RESULT_PLAN_KEEP_EXPLORING, terminate: false };
+        case "dismissed":
+          paused = true;
+          return { text: RESULT_PLAN_DISMISSED, terminate: true };
+        case "mode-off":
+          return { text: RESULT_MODE_OFF, terminate: false };
+      }
+    },
+
+    applyCheckpointAnswer(answer) {
+      switch (answer.kind) {
+        case "continue":
+          rebaseline();
+          return { text: RESULT_CONTINUE, terminate: false };
+
+        case "explain":
+          // Deliberately no rebaseline: the human has not accepted anything
+          // yet, so the same change set must still be there when they come
+          // back to answer.
+          explaining = answer.file;
+          return { text: resultExplain(answer.file), terminate: false };
+
+        case "steer":
+          // They saw the change set before typing this, so it counts as
+          // acknowledged. Their corrections become the next window's delta.
+          rebaseline();
+          return { text: resultSteering(answer.text), terminate: false };
+
+        case "stop":
+          rebaseline();
+          stopped = true;
+          // `terminate` ends the agent loop at the host level; the latch is the
+          // guarantee if the host declines (e.g. a mixed tool batch).
+          return { text: RESULT_STOP, terminate: true };
+
+        case "dismissed":
+          // No rebaseline and no latch. The turn ends, but the human has not
+          // said stop — anything they type next just carries on.
+          paused = true;
+          return { text: RESULT_DISMISSED, terminate: true };
+
+        case "mode-off":
+          return { text: RESULT_MODE_OFF, terminate: false };
+      }
+    },
 
     statusText() {
-      if (mode !== "agent-driver") return statusLine(mode, 0, maxChanges);
-      const total = checkpoint.snapshot().total;
+      if (mode !== "agent-driver") return statusLine(mode, phase, 0, budget);
       const flags: string[] = [];
       if (stopped) flags.push("stopped");
+      if (explaining !== null) flags.push(`reviewing ${explaining}`);
+      else if (paused) flags.push("paused");
       if (pending !== null) flags.push("awaiting you");
-      return statusLine(mode, total, maxChanges, flags.length ? flags.join(", ") : undefined);
+      return statusLine(mode, phase, points(), budget, flags.length ? flags.join(", ") : undefined);
     },
 
     filesSinceBaseline() {

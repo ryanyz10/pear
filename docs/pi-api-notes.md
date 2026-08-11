@@ -233,3 +233,106 @@ Status: the probe **compiles against the pinned 0.83.0 types** and is included i
 - That `hasUI` implies `ui.custom` works.
 
 Each is handled by a conservative fallback rather than an assumption.
+
+## Verified for v3 (still 0.83.0)
+
+### `tool_result` can rewrite what the model sees
+
+`types.d.ts:790`:
+
+```ts
+export interface ToolResultEventResult {
+    content?: (TextContent | ImageContent)[];
+    details?: unknown;
+    isError?: boolean;
+    usage?: Usage;
+}
+```
+
+This is how the in-band budget nag is delivered: no extra turn, and it is
+attached to the thing the model just did.
+
+**`content` REPLACES, it does not append.** The handler must return
+`[...event.content, note]`. Returning only the note silently discards the tool's
+real output. `test/pi-lifecycle.test.ts` asserts the original blocks survive
+byte-identically.
+
+### Built-in mutating tool input shapes
+
+Used by `core/load.ts` to price a call from its input at `tool_call` time,
+without git and without an `await`.
+
+```ts
+// dist/core/tools/edit.d.ts:10
+declare const editSchema: Type.TObject<{
+    path: Type.TString;
+    edits: Type.TArray<Type.TObject<{ oldText: Type.TString; newText: Type.TString }>>;
+}>;
+
+// dist/core/tools/write.d.ts:4
+declare const writeSchema: Type.TObject<{ path: Type.TString; content: Type.TString }>;
+```
+
+`EditToolDetails` carries `{ diff, patch, firstChangedLine? }` and `write` has
+`details: undefined`, so *results* are not a usable pricing source for both
+tools. Inputs are, and they are available before the call runs — which is when
+the gate needs them.
+
+### `SourceInfo` does not identify built-ins
+
+`dist/core/source-info.d.ts`:
+
+```ts
+export type SourceScope = "user" | "project" | "temporary";
+export type SourceOrigin = "package" | "top-level";
+export interface SourceInfo { path: string; source: string; scope: SourceScope; origin: SourceOrigin; baseDir?: string }
+```
+
+`ToolInfo` carries `sourceInfo`, but nothing in it separates a pi built-in from a
+third-party extension's tool. `exclusive` therefore filters by the known built-in
+**names** and uses `SourceInfo` only for display.
+
+### Session state round-trip
+
+`pi.appendEntry(customType, data)` persists without entering the LLM context;
+`ctx.sessionManager.getEntries()` replays it. `CustomEntry` is
+`{ type: "custom"; customType: string; data?: T }`
+(`dist/core/session-manager.d.ts:69`). `data` is whatever was written, so it must
+be validated on the way back in — pear ignores a plan entry that does not
+type-check rather than trusting it.
+
+### `ui.notify` is not rendered in `print` mode
+
+Notifications are best-effort UI. A `pi -p "/pear-status"` invocation writes
+nothing to stdout, so smoke tests must assert on observable state (the config
+file) rather than notification text.
+
+## Assumptions deliberately NOT relied upon (v3 additions)
+
+- That `setActiveTools` is pear's alone to call. Scoping records the names it
+  removed and adds exactly those back, rather than restoring a snapshot.
+- That `SourceInfo` can classify a tool's provenance.
+- That a persisted session entry still matches the current schema.
+
+### A mid-run `setActiveTools` must be additive
+
+`extensions.md` § "Dynamic Tool Loading" (~:2306):
+
+> A tool can then add more tools with `pi.setActiveTools()` during execution. Pi
+> detects purely additive changes, records the newly available tool names on that
+> tool result, and applies the updated active set before the next model request.
+> […] The change must be additive: do not remove currently active tools in the
+> same call.
+
+This is load-bearing for the plan phase. `pear_plan` approval restores `edit`
+and `write` from inside `execute`, mid-run — supported *only* because the call
+starts from the live active list and appends. Removing anything in that same
+call would forfeit the detection, and the model could be told "editing is open"
+while the tools it needs are absent for the rest of the run.
+
+Returning `addedToolNames` by hand is unnecessary: pi derives it from the
+active-set change. `test/pi-lifecycle.test.ts` asserts the restore call drops
+nothing.
+
+Removals (entering scoping, `exclusive`) happen at `session_start` or in command
+handlers, not during tool execution, so the additive rule does not bind them.

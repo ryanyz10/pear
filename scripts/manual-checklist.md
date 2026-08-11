@@ -1,79 +1,96 @@
 # Manual checklist
 
-`npm test` and `npm run smoke:pi` cover everything that can be checked without
-a live model and a real terminal. These cannot be: they need a model that
-actually calls tools, and a TTY that can render the card and accept keystrokes.
+Everything here needs a live model and a real terminal, which is exactly what
+`npm test` and `npm run smoke:pi` cannot give you. Run this before shipping a
+behavioural change.
 
-Run this before shipping a change to the checkpoint loop, the gate, or the card.
-
-## Setup
+Setup:
 
 ```sh
-cd "$(mktemp -d)" && git init -q && git config user.email t@t && git config user.name t
-printf 'export function add(a, b) { return a + b; }\n' > math.js
-git add -A && git commit -qm init
-
+cd /some/scratch/git/repo
 pi -e /path/to/pear/adapters/pi/extensions/pear.ts
 /pear-mode agent-driver
 ```
 
-## The three answers
+**Standing rule: the session must never end because of a card.** If pi exits, or
+you cannot type, that is a bug regardless of anything else on this list.
 
-| # | Do this | Expect |
-| --- | --- | --- |
-| 1 | "Add a subtract function to math.js" | The card appears after the edit, with a summary, `math.js` in the git-derived list, and a next step |
-| 2 | Choose **Continue** | Agent proceeds; card closes; no error in the transcript |
-| 3 | "Add multiply and divide" → at the card choose **Make changes…**, type `only add multiply, skip divide` | Agent follows the typed instruction and does **not** add divide |
-| 4 | At the next card press Enter on an empty editor | Editor stays open; nothing is submitted |
-| 5 | "Add a modulo function" → choose **Stop** | Agent stops immediately, makes no further edits, and the turn ends |
-| 6 | After Stop, type "what did you change?" | Agent answers normally — **the session is alive** |
-| 7 | After Stop but before typing, ask it to edit again in the same turn | Blocked with "the navigator asked you to stop" |
+## A. Scoping
 
-## Dismissal
+1. Give it a vague task ("make the sync more reliable"). It should ask something
+   useful via a question card before proposing anything — not guess.
+2. The question card offers pre-filled options you would actually pick, plus
+   "Something else…".
+3. Ask it to edit a file during scoping. It should refuse and explain, without
+   erroring.
+4. Tell it to run something destructive in bash during scoping (`rm -rf build`).
+   Blocked. `git status` and `rg` still work.
+5. The plan card is readable: summary first, numbered steps, risks only if real.
+6. **Change something…** → it revises and re-proposes. Editing is still closed.
+7. **Keep exploring** → it looks harder and re-proposes. Editing is still closed.
+8. **Esc** → turn ends, nothing approved, you can type normally.
+9. **Looks good** → editing opens and it starts on step 1.
 
-| # | Do this | Expect |
-| --- | --- | --- |
-| 8 | At a card, press **Esc** | Card closes; changes are paused |
-| 9 | Immediately ask for another edit | Blocked, same as Stop |
-| 10 | Type any message | Latch clears; edits work again |
-| 11 | At the *next* card, check the file list | Files from the dismissed checkpoint are **still listed** (dismissal acknowledges nothing) |
+## B. Cadence — the main event
 
-## The budget
+10. Let it work through a real task. Count the checkpoints.
+    - Do they land at seams, or mid-thought?
+    - Is there ever a wall of changes you cannot hold in your head?
+    - More than ~8 in an hour of work → raise `/pear-config`.
+    - Fewer than ~2 → lower it.
+11. Several small edits to one file should **not** trigger a checkpoint.
+12. One large file rewrite should trigger one immediately afterwards.
+13. Watch for the in-band nag appearing on tool results before any block.
+14. Push past the budget deliberately. The block explains itself, nothing was
+    executed, and the agent recovers by checking in and re-issuing.
 
-| # | Do this | Expect |
-| --- | --- | --- |
-| 12 | `/pear-config 2`, then "make five separate small edits to math.js without checkpointing" | Third mutation is blocked with "checkpoint overdue"; the agent checkpoints, then continues |
-| 13 | Read the blocked tool result in the transcript | It says NOT EXECUTED — and the agent re-issues it rather than assuming it ran |
-| 14 | While over budget, run `git status` via bash | Allowed — read-only commands are never gated |
-| 15 | While over budget, run `/pear-checkpoint` yourself | Card opens; answering it clears the budget |
+## C. Checkpoint answers
 
-## Truthfulness of the file list
+15. **Keep going** → it proceeds with what it said was next.
+16. **Walk me through a file…** → sub-select appears, it explains that file,
+    makes no edits, and **the card comes back**. This is the one to watch.
+17. During a walkthrough, ask it a follow-up question. It should answer — it is
+    not parked.
+18. Try to make it edit during a walkthrough. Blocked, with a clear reason.
+19. **Change direction…** → your text genuinely supersedes its stated `next`.
+20. In the steering editor, press Enter on an empty line. It must stay in the
+    editor, not submit nothing.
+21. **Stop here** → turn ends, you hold the prompt, session alive. Read-only
+    commands still work. It does not sneak in one more fix.
+22. After a stop, type anything. Work resumes normally.
+23. **Esc** → turn ends, no stop latch, you can just talk. The next checkpoint
+    still shows the changes you did not acknowledge.
 
-| # | Do this | Expect |
-| --- | --- | --- |
-| 16 | Ask it to edit two files but mention only one in the summary | The git-derived list shows both; the agent's claim is shown separately |
-| 17 | `git add` one file, leave another unstaged, then trigger a checkpoint | Both appear |
-| 18 | Delete a file, then checkpoint | The deletion appears |
+## D. Summaries
 
-## Lifecycle
+24. Summaries are 1–3 plain sentences, not status reports. No headers, no
+    bulleted file lists, no "I have successfully…".
+25. Each one is legible against the agreed plan — you can tell which step it is.
+26. It says *why*, not only what.
 
-| # | Do this | Expect |
-| --- | --- | --- |
-| 19 | Open a card, then quit pi (Ctrl-C / `/exit`) | pi exits promptly — no hang waiting on the card |
-| 20 | Open a card, then `/reload` | Reload completes; no orphaned card |
-| 21 | Open a card, then press Esc to abort the tool | Tool result appears; session usable |
-| 22 | Mid-turn, run `/pear-mode off` while a card is open | Card resolves; agent told the mode changed; no further gating |
-| 23 | Start a turn, let it edit, then Ctrl-C mid-tool | Next turn: `/pear-status` shows the interrupted call counted as unknown, not as success |
+## E. File list truthfulness
 
-## Non-git
+27. Stage a change (`git add`) and checkpoint — it still shows.
+28. Delete a file and checkpoint — it shows.
+29. Have the agent under-report `files`. The git list is what you see first, and
+    an uncorroborated claim appears under "also reported by the agent".
+30. Run in a non-git directory. The list is marked unverified; the loop still
+    works.
 
-| # | Do this | Expect |
-| --- | --- | --- |
-| 24 | Repeat setup in a non-git directory | Checkpoints still work; the list is labelled "unverified" and shows only the agent's claim |
+## F. Lifecycle
 
-## What to watch for throughout
+31. Approve a plan, then `/reload`. The plan is picked back up and you stay in
+    the building phase.
+32. Quit pi while a card is open. It exits cleanly.
+33. Ctrl-C during a tool call, then checkpoint. Nothing is lost or double-counted.
+34. `/pear-mode off` while a card is open → the card closes, the agent continues
+    ungated.
+35. `/pear` after a plan is approved → editing closes, scoping resumes.
+36. `/pear-checkpoint` while the budget is blown → you get the card and can clear
+    it yourself.
 
-- The session must **never** end because of a checkpoint. If pi exits or the
-  turn dies after a block, that is the original bug regressing.
-- A blocked call must never look to the model like it succeeded.
-- The card must never appear when nobody can answer it.
+## G. Other extensions
+
+37. With another extension's tools active, startup mentions it once.
+38. `/pear-exclusive` disables them and persists. pi's own tools and pear's
+    remain.

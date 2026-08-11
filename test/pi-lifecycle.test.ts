@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import pear from "../adapters/pi/extensions/pear.ts";
-import { saveConfig } from "../core/config.ts";
+import { saveConfig, type PearConfig } from "../core/config.ts";
 
 /* ------------------------------------------------------------------ fakes */
 
@@ -14,17 +14,31 @@ type ToolDef = {
   name: string;
   description: string;
   executionMode?: string;
-  execute: (id: string, params: any, signal: AbortSignal | undefined, onUpdate: unknown, ctx: any) => Promise<any>;
+  execute: (
+    id: string,
+    params: any,
+    signal: AbortSignal | undefined,
+    onUpdate: unknown,
+    ctx: any,
+  ) => Promise<any>;
   renderCall?: (args: any, theme: any) => unknown;
   renderResult?: (result: any, options: any, theme: any) => unknown;
 };
 
 type Notification = { message: string; type?: string };
+type Entry = { type: "custom"; customType: string; data?: unknown };
 
-function fakePi() {
+const BUILTINS = ["bash", "read", "edit", "write", "grep", "find", "ls"];
+
+function fakePi(entries: Entry[], extraTools: string[]) {
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, ToolDef>();
-  const commands = new Map<string, { description?: string; handler: (args: string, ctx: any) => Promise<void> }>();
+  const commands = new Map<
+    string,
+    { description?: string; handler: (args: string, ctx: any) => Promise<void> }
+  >();
+  let active = [...BUILTINS, ...extraTools];
+  const toolSetCalls: string[][] = [];
 
   const api = {
     on: (event: string, handler: Handler) => {
@@ -32,12 +46,22 @@ function fakePi() {
       list.push(handler);
       handlers.set(event, list);
     },
-    registerTool: (tool: ToolDef) => tools.set(tool.name, tool),
+    registerTool: (tool: ToolDef) => {
+      tools.set(tool.name, tool);
+      if (!active.includes(tool.name)) active.push(tool.name);
+    },
     registerCommand: (name: string, opts: any) => commands.set(name, opts),
     registerEntryRenderer: () => {},
     registerMessageRenderer: () => {},
-    appendEntry: () => {},
+    appendEntry: (customType: string, data?: unknown) =>
+      entries.push({ type: "custom", customType, data }),
     sendUserMessage: () => {},
+    getActiveTools: () => [...active],
+    setActiveTools: (names: string[]) => {
+      active = [...names];
+      toolSetCalls.push([...names]);
+    },
+    getAllTools: () => active.map((name) => ({ name })),
   };
 
   const emit = async (event: string, payload: unknown, ctx: unknown) => {
@@ -46,13 +70,8 @@ function fakePi() {
     return results;
   };
 
-  return { api, emit, tools, commands, handlers };
+  return { api, emit, tools, commands, handlers, activeTools: () => [...active], toolSetCalls };
 }
-
-const theme = {
-  fg: (_c: string, s: string) => s,
-  bold: (s: string) => s,
-};
 
 type CtxOptions = {
   cwd: string;
@@ -60,15 +79,18 @@ type CtxOptions = {
   hasUI?: boolean;
   /** Answer for ui.custom (TUI card). */
   cardAnswer?: unknown;
-  /** Answers for ui.select / ui.input (RPC path). */
-  selectAnswer?: string | undefined;
+  /** Answers for ui.select, consumed in order (RPC path). */
+  selectAnswers?: (string | undefined)[];
   inputAnswer?: string | undefined;
   customThrows?: Error;
+  entries?: Entry[];
 };
 
 function fakeCtx(opts: CtxOptions) {
   const notifications: Notification[] = [];
   const statuses: Array<[string, string | undefined]> = [];
+  const selects: Array<{ title: string; options: string[] }> = [];
+  const queue = [...(opts.selectAnswers ?? [])];
   let abortCalls = 0;
 
   const mode = opts.mode ?? "tui";
@@ -77,6 +99,7 @@ function fakeCtx(opts: CtxOptions) {
     mode,
     hasUI: opts.hasUI ?? (mode !== "print" && mode !== "json"),
     signal: undefined as AbortSignal | undefined,
+    sessionManager: { getEntries: () => opts.entries ?? [] },
     abort: () => {
       abortCalls++;
     },
@@ -87,17 +110,15 @@ function fakeCtx(opts: CtxOptions) {
         if (opts.customThrows) throw opts.customThrows;
         return opts.cardAnswer ?? null;
       },
-      select: async (_title: string, _options: string[]) => opts.selectAnswer,
+      select: async (title: string, options: string[]) => {
+        selects.push({ title, options });
+        return queue.shift();
+      },
       input: async (_title: string) => opts.inputAnswer,
     },
   };
 
-  return {
-    ctx,
-    notifications,
-    statuses,
-    abortCalls: () => abortCalls,
-  };
+  return { ctx, notifications, statuses, selects, abortCalls: () => abortCalls };
 }
 
 function tempRepo(): string {
@@ -111,55 +132,105 @@ function tempRepo(): string {
   return dir;
 }
 
-/** Boot the extension and return everything needed to drive it. */
-async function boot(opts: Omit<CtxOptions, "cwd"> & { cwd?: string; mode_?: "off" | "agent-driver" }) {
-  const cwd = opts.cwd ?? tempRepo();
-  if (opts.mode_ !== undefined) saveConfig(cwd, { mode: opts.mode_ });
+type BootOptions = Omit<CtxOptions, "cwd"> & {
+  cwd?: string;
+  config?: PearConfig;
+  extraTools?: string[];
+};
 
-  const pi = fakePi();
+/**
+ * Boot the extension and return everything needed to drive it.
+ *
+ * `planPhase` defaults to false so tests can exercise the build loop directly;
+ * the scoping tests turn it on explicitly.
+ */
+async function boot(opts: BootOptions = {}) {
+  const cwd = opts.cwd ?? tempRepo();
+  const config: PearConfig = { planPhase: false, ...opts.config };
+  saveConfig(cwd, config);
+
+  const entries = opts.entries ?? [];
+  const pi = fakePi(entries, opts.extraTools ?? []);
   pear(pi.api as never);
-  const c = fakeCtx({ ...opts, cwd });
-  await pi.emit("session_start", {}, c.ctx);
-  return { ...pi, ...c, cwd };
+  const c = fakeCtx({ ...opts, cwd, entries });
+  await pi.emit("session_start", { reason: "startup" }, c.ctx);
+  return { ...pi, ...c, cwd, entries };
 }
+
+const driver = (extra: PearConfig = {}): BootOptions => ({
+  config: { mode: "agent-driver", ...extra },
+});
+
+/** A write costing 40 + `lines` points. */
+const writeCall = (id: string, path: string, lines = 0) => ({
+  toolCallId: id,
+  toolName: "write",
+  input: { path, content: Array.from({ length: lines }, (_, i) => `l${i}`).join("\n") },
+});
+
+const PLAN_ARGS = { summary: "Do the thing.", steps: ["First", "Second"] };
 
 /* ------------------------------------------------------------------ tests */
 
 describe("registration", () => {
-  it("registers the checkpoint tool and commands", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    assert.ok(b.tools.has("pear_checkpoint"));
-    assert.equal(b.tools.get("pear_checkpoint")?.executionMode, "sequential");
-    for (const cmd of ["pear-status", "pear-checkpoint", "pear-mode", "pear-config"]) {
+  it("registers all three tools and every command", async () => {
+    const b = await boot(driver());
+    for (const tool of ["pear_ask", "pear_plan", "pear_checkpoint"]) {
+      assert.ok(b.tools.has(tool), `missing ${tool}`);
+      assert.equal(b.tools.get(tool)?.executionMode, "sequential", tool);
+    }
+    for (const cmd of [
+      "pear",
+      "pear-plan",
+      "pear-status",
+      "pear-checkpoint",
+      "pear-exclusive",
+      "pear-mode",
+      "pear-config",
+    ]) {
       assert.ok(b.commands.has(cmd), `missing /${cmd}`);
     }
   });
 
-  it("registers the tool even in off mode (pi cannot unregister)", async () => {
-    const b = await boot({ mode_: "off" });
+  it("registers the tools even in off mode (pi cannot unregister)", async () => {
+    const b = await boot({ config: { mode: "off" } });
     assert.ok(b.tools.has("pear_checkpoint"));
   });
 });
 
 describe("persona injection", () => {
-  it("adds the driver persona only in agent-driver mode", async () => {
-    const on = await boot({ mode_: "agent-driver" });
-    const [result] = await on.emit("before_agent_start", { systemPrompt: "BASE" }, on.ctx);
+  it("adds the scoping persona before a plan is approved", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    const [result] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
     assert.match(result.systemPrompt, /^BASE/);
+    assert.match(result.systemPrompt, /agree the approach first/i);
+    assert.match(result.systemPrompt, /pear_plan/);
+  });
+
+  it("adds the driver persona once building, carrying the plan verbatim", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    await approvePlan(b);
+    const [result] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
     assert.match(result.systemPrompt, /you are the driver/i);
-    assert.match(result.systemPrompt, /pear_checkpoint/);
+    assert.match(result.systemPrompt, /Do the thing\./);
+    assert.match(result.systemPrompt, /1\. First/);
   });
 
   it("leaves the prompt alone in off mode", async () => {
-    const off = await boot({ mode_: "off" });
+    const off = await boot({ config: { mode: "off" } });
     const [result] = await off.emit("before_agent_start", { systemPrompt: "BASE" }, off.ctx);
     assert.equal(result, undefined);
   });
 });
 
+async function approvePlan(b: Awaited<ReturnType<typeof boot>>) {
+  (b.ctx.ui as any).custom = async () => ({ kind: "approve" });
+  return await b.tools.get("pear_plan")?.execute("p", PLAN_ARGS, undefined, undefined, b.ctx);
+}
+
 describe("headless policy", () => {
   it("fails closed to off when there is no dialog-capable UI", async () => {
-    const b = await boot({ mode_: "agent-driver", mode: "print", hasUI: false });
+    const b = await boot({ ...driver(), mode: "print", hasUI: false });
     const [result] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
     assert.equal(result, undefined, "no persona: pear is off for this session");
     assert.ok(
@@ -170,64 +241,71 @@ describe("headless policy", () => {
 
   it("does not rewrite the config when failing closed", async () => {
     const cwd = tempRepo();
-    saveConfig(cwd, { mode: "agent-driver" });
-    await boot({ cwd, mode: "print", hasUI: false });
+    await boot({ cwd, ...driver(), mode: "print", hasUI: false });
     const onDisk = JSON.parse(readFileSync(join(cwd, ".pear", "config.json"), "utf8"));
     assert.equal(onDisk.mode, "agent-driver", "user's config must be preserved");
   });
 
   it("/pear-mode agent-driver saves but does not claim to be running", async () => {
-    const b = await boot({ mode_: "off", mode: "print", hasUI: false });
+    const b = await boot({ config: { mode: "off" }, mode: "print", hasUI: false });
     await b.commands.get("pear-mode")?.handler("agent-driver", b.ctx);
 
-    // Saved, so a later interactive session picks it up...
     const onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
     assert.equal(onDisk.mode, "agent-driver");
 
-    // ...but this session says plainly that it is not active.
     assert.ok(
       b.notifications.some(
         (n) => n.type === "warning" && /needs an interactive session/.test(n.message),
       ),
     );
 
-    // And it really is inert here: no persona, no gating.
     const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
     assert.equal(prompt, undefined, "must not run agent-driver without a human");
-    const [decision] = await b.emit(
-      "tool_call",
-      { toolCallId: "x", toolName: "edit", input: {} },
-      b.ctx,
-    );
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
     assert.equal(decision, undefined);
   });
 });
 
-describe("legacy config migration", () => {
+describe("legacy config", () => {
   it("warns about human-driver and leaves the file byte-identical", async () => {
     const cwd = tempRepo();
     const raw = JSON.stringify({ mode: "human-driver", reviewModel: "a/b" }, null, 2) + "\n";
-    execFileSync("mkdir", ["-p", join(cwd, ".pear")]);
+    mkdirSync(join(cwd, ".pear"), { recursive: true });
     writeFileSync(join(cwd, ".pear", "config.json"), raw);
 
-    const b = await boot({ cwd });
-    assert.ok(b.notifications.some((n) => /human-driver/.test(n.message) && /isn't available/.test(n.message)));
+    const pi = fakePi([], []);
+    pear(pi.api as never);
+    const c = fakeCtx({ cwd });
+    await pi.emit("session_start", { reason: "startup" }, c.ctx);
+
+    assert.ok(
+      c.notifications.some((n) => /human-driver/.test(n.message) && /isn't available/.test(n.message)),
+    );
     assert.equal(readFileSync(join(cwd, ".pear", "config.json"), "utf8"), raw, "file untouched");
+  });
+
+  it("explains the new budget units when migrating the old key", async () => {
+    const cwd = tempRepo();
+    mkdirSync(join(cwd, ".pear"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".pear", "config.json"),
+      JSON.stringify({ mode: "agent-driver", maxChangesPerCheckpoint: 5 }),
+    );
+
+    const pi = fakePi([], []);
+    pear(pi.api as never);
+    const c = fakeCtx({ cwd });
+    await pi.emit("session_start", { reason: "startup" }, c.ctx);
+
+    assert.ok(c.notifications.some((n) => /reviewBudget=200/.test(n.message)));
   });
 });
 
 describe("the gate hook", () => {
-  it("blocks an overdue call without aborting the run", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    // default budget is 5
-    for (let i = 0; i < 5; i++) {
-      await b.emit("tool_call", { toolCallId: `c${i}`, toolName: "edit", input: { path: "f" } }, b.ctx);
-    }
-    const [decision] = await b.emit(
-      "tool_call",
-      { toolCallId: "c5", toolName: "edit", input: { path: "f" } },
-      b.ctx,
-    );
+  it("blocks an over-budget call without aborting the run", async () => {
+    const b = await boot(driver({ reviewBudget: 200 }));
+    await b.emit("tool_call", writeCall("big", "big.ts", 400), b.ctx);
+    const [decision] = await b.emit("tool_call", writeCall("next", "f.ts", 1), b.ctx);
 
     assert.equal(decision.block, true);
     assert.match(decision.reason, /checkpoint overdue/);
@@ -235,148 +313,429 @@ describe("the gate hook", () => {
   });
 
   it("passes non-mutating tools straight through", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    const [decision] = await b.emit("tool_call", { toolCallId: "r", toolName: "read", input: {} }, b.ctx);
+    const b = await boot(driver());
+    const [decision] = await b.emit(
+      "tool_call",
+      { toolCallId: "r", toolName: "read", input: { path: "f" } },
+      b.ctx,
+    );
     assert.equal(decision, undefined);
+  });
+
+  it("lets a small run of edits to one file through", async () => {
+    const b = await boot(driver({ reviewBudget: 200 }));
+    for (let i = 0; i < 5; i++) {
+      const [decision] = await b.emit("tool_call", writeCall(`c${i}`, "same.ts", 2), b.ctx);
+      assert.equal(decision, undefined, `edit ${i + 1}`);
+    }
+  });
+});
+
+describe("the tool_result nag", () => {
+  const settle = (b: Awaited<ReturnType<typeof boot>>, id: string, content: unknown[]) =>
+    b.emit("tool_result", { toolCallId: id, toolName: "write", isError: false, content }, b.ctx);
+
+  it("says nothing while the load is low", async () => {
+    const b = await boot(driver({ reviewBudget: 200 }));
+    await b.emit("tool_call", writeCall("a", "a.ts", 5), b.ctx);
+    const [result] = await settle(b, "a", [{ type: "text", text: "wrote a.ts" }]);
+    assert.equal(result, undefined);
+  });
+
+  it("appends a note past the soft fraction", async () => {
+    const b = await boot(driver({ reviewBudget: 200 }));
+    await b.emit("tool_call", writeCall("a", "a.ts", 100), b.ctx);
+    const [result] = await settle(b, "a", [{ type: "text", text: "wrote a.ts" }]);
+    assert.match(result.content.at(-1).text, /look for a good place to check in/);
+  });
+
+  it("PRESERVES the original content blocks byte-identically", async () => {
+    // `content` REPLACES what the model sees. Dropping the original would
+    // silently blind the model to its own tool output.
+    const b = await boot(driver({ reviewBudget: 200 }));
+    const original = [
+      { type: "text", text: "line one\nline two" },
+      { type: "text", text: "second block" },
+    ];
+    await b.emit("tool_call", writeCall("a", "a.ts", 400), b.ctx);
+    const [result] = await settle(b, "a", original);
+
+    assert.equal(result.content.length, original.length + 1);
+    assert.deepEqual(result.content.slice(0, original.length), original);
+    assert.match(result.content.at(-1).text, /before the next edit/);
+  });
+
+  it("says nothing about a call it never admitted", async () => {
+    const b = await boot(driver());
+    const [result] = await settle(b, "never-admitted", [{ type: "text", text: "x" }]);
+    assert.equal(result, undefined);
   });
 });
 
 describe("stop latch and input provenance", () => {
   async function stopIt(b: Awaited<ReturnType<typeof boot>>) {
-    const tool = b.tools.get("pear_checkpoint");
-    await tool?.execute("t1", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+    await b.tools
+      .get("pear_checkpoint")
+      ?.execute("t1", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
   }
 
   it("extension-injected messages do NOT clear a stop", async () => {
-    const b = await boot({ mode_: "agent-driver", cardAnswer: { kind: "stop" } });
+    const b = await boot({ ...driver(), cardAnswer: { kind: "stop" } });
     await stopIt(b);
 
     await b.emit("input", { text: "go on", source: "extension" }, b.ctx);
-    const [decision] = await b.emit("tool_call", { toolCallId: "x", toolName: "edit", input: {} }, b.ctx);
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
     assert.equal(decision?.block, true, "an extension must not be able to override the human");
   });
 
   it("real user input clears a stop", async () => {
-    const b = await boot({ mode_: "agent-driver", cardAnswer: { kind: "stop" } });
+    const b = await boot({ ...driver(), cardAnswer: { kind: "stop" } });
     await stopIt(b);
 
     await b.emit("input", { text: "carry on", source: "interactive" }, b.ctx);
-    const [decision] = await b.emit("tool_call", { toolCallId: "x", toolName: "edit", input: {} }, b.ctx);
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
     assert.equal(decision, undefined);
   });
 });
 
 describe("checkpoint tool — TUI", () => {
-  it("continue returns the continue result and does not terminate", async () => {
-    const b = await boot({ mode_: "agent-driver", cardAnswer: { kind: "continue" } });
-    const res = await b.tools
+  const run = (b: Awaited<ReturnType<typeof boot>>, files: string[] = []) =>
+    b.tools
       .get("pear_checkpoint")
-      ?.execute("t", { summary: "did a thing", files: ["a.ts"], next: "next thing" }, undefined, undefined, b.ctx);
+      ?.execute("t", { summary: "did a thing", files, next: "next thing" }, undefined, undefined, b.ctx);
 
-    assert.match(res.content[0].text, /NAVIGATOR: continue/);
+  it("keep going returns the continue result and does not terminate", async () => {
+    const b = await boot({ ...driver(), cardAnswer: { kind: "continue" } });
+    const res = await run(b, ["a.ts"]);
+    assert.match(res.content[0].text, /NAVIGATOR: keep going/);
     assert.notEqual(res.terminate, true);
     assert.equal(res.details.answer, "continue");
   });
 
-  it("steering passes the human's words through verbatim", async () => {
+  it("change direction passes the human's words through verbatim", async () => {
     const b = await boot({
-      mode_: "agent-driver",
+      ...driver(),
       cardAnswer: { kind: "steer", text: "use a Map, not an object" },
     });
-    const res = await b.tools
-      .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
-
+    const res = await run(b);
     assert.match(res.content[0].text, /NAVIGATOR STEERING: use a Map, not an object/);
     assert.notEqual(res.terminate, true);
   });
 
   it("stop terminates the agent loop", async () => {
-    const b = await boot({ mode_: "agent-driver", cardAnswer: { kind: "stop" } });
-    const res = await b.tools
-      .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
-
+    const b = await boot({ ...driver(), cardAnswer: { kind: "stop" } });
+    const res = await run(b);
     assert.match(res.content[0].text, /NAVIGATOR: stop/);
     assert.equal(res.terminate, true);
   });
 
-  it("dismissing the card pauses changes without acknowledging them", async () => {
-    const b = await boot({ mode_: "agent-driver", cardAnswer: null });
-    const res = await b.tools
-      .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+  it("walk me through a file returns an instruction without terminating", async () => {
+    const b = await boot({ ...driver(), cardAnswer: { kind: "explain", file: "a.ts" } });
+    const res = await run(b, ["a.ts"]);
+    assert.match(res.content[0].text, /walk me through/);
+    assert.match(res.content[0].text, /a\.ts/);
+    assert.notEqual(res.terminate, true, "the agent must stay free to explain");
+    assert.equal(res.details.answer, "explain");
 
-    assert.match(res.content[0].text, /no answer/);
-    const [decision] = await b.emit("tool_call", { toolCallId: "x", toolName: "edit", input: {} }, b.ctx);
-    assert.equal(decision?.block, true);
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.match(decision?.reason ?? "", /is reviewing/);
   });
 
-  it("reports the git-derived file list alongside the agent's claim", async () => {
+  it("the card comes back after a walkthrough, and clears the hold", async () => {
+    const b = await boot({ ...driver(), cardAnswer: { kind: "explain", file: "a.ts" } });
+    await run(b, ["a.ts"]);
+
+    (b.ctx.ui as any).custom = async () => ({ kind: "continue" });
+    const second = await run(b, ["a.ts"]);
+    assert.match(second.content[0].text, /keep going/);
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.equal(decision, undefined, "editing resumes");
+  });
+
+  it("dismissing pauses changes without acknowledging them", async () => {
+    const b = await boot({ ...driver(), cardAnswer: null });
+    const res = await run(b);
+    assert.match(res.content[0].text, /no answer/);
+    assert.equal(res.terminate, true);
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.match(decision?.reason ?? "", /stepped away/);
+  });
+
+  it("shows the git-derived file list, not just what the agent claimed", async () => {
     const cwd = tempRepo();
-    const b = await boot({ cwd, mode_: "agent-driver", cardAnswer: { kind: "continue" } });
+    const b = await boot({ cwd, ...driver(), mode: "rpc", selectAnswers: ["Keep going"] });
     writeFileSync(join(cwd, "changed.txt"), "new content\n");
 
-    const res = await b.tools
+    await b.tools
       .get("pear_checkpoint")
       ?.execute("t", { summary: "s", files: ["lied-about.txt"], next: "n" }, undefined, undefined, b.ctx);
 
-    assert.equal(res.details.verified, true);
-    assert.deepEqual(res.details.gitFiles, ["changed.txt"]);
-    assert.deepEqual(res.details.claimedFiles, ["lied-about.txt"]);
+    // The dialog path renders the same spec the TUI card would.
+    const shown = b.notifications.map((n) => n.message).join("\n");
+    assert.match(shown, /changed \(1\)/);
+    assert.match(shown, /changed\.txt/, "git's list is what the human sees first");
+    assert.match(shown, /also reported by the agent/);
+    assert.match(shown, /lied-about\.txt/, "an uncorroborated claim is called out");
   });
 });
 
 describe("checkpoint tool — RPC", () => {
-  it("uses dialogs and can continue", async () => {
-    const b = await boot({
-      mode_: "agent-driver",
-      mode: "rpc",
-      selectAnswer: "continue — looks good, keep going",
-    });
-    const res = await b.tools
+  const rpc = (answers: (string | undefined)[], inputAnswer?: string) => ({
+    ...driver(),
+    mode: "rpc" as const,
+    selectAnswers: answers,
+    inputAnswer,
+  });
+
+  const run = (b: Awaited<ReturnType<typeof boot>>, files: string[] = []) =>
+    b.tools
       .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
-    assert.match(res.content[0].text, /NAVIGATOR: continue/);
+      ?.execute("t", { summary: "s", files, next: "n" }, undefined, undefined, b.ctx);
+
+  it("uses dialogs and can keep going", async () => {
+    const b = await boot(rpc(["Keep going"]));
+    const res = await run(b);
+    assert.match(res.content[0].text, /NAVIGATOR: keep going/);
   });
 
   it("collects steering text via the input dialog", async () => {
-    const b = await boot({
-      mode_: "agent-driver",
-      mode: "rpc",
-      selectAnswer: "make changes — I'll type what to do",
-      inputAnswer: "try the other approach",
-    });
-    const res = await b.tools
-      .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+    const b = await boot(rpc(["Change direction…"], "try the other approach"));
+    const res = await run(b);
     assert.match(res.content[0].text, /NAVIGATOR STEERING: try the other approach/);
   });
 
-  it("treats an abandoned steering prompt as a pause, not as steering", async () => {
-    const b = await boot({
-      mode_: "agent-driver",
-      mode: "rpc",
-      selectAnswer: "make changes — I'll type what to do",
-      inputAnswer: undefined,
-    });
-    const res = await b.tools
-      .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+  it("walks through a file with a second select", async () => {
+    const b = await boot(rpc(["Walk me through a file…", "claimed.ts"]));
+    const res = await run(b, ["claimed.ts"]);
+    assert.match(res.content[0].text, /walk me through/);
+    assert.match(res.content[0].text, /claimed\.ts/);
+    // Two selects: the options, then the files.
+    assert.equal(b.selects.length, 2);
+    assert.deepEqual(b.selects[1]?.options, ["claimed.ts"]);
+  });
+
+  it("treats an abandoned option select as a dismissal", async () => {
+    const b = await boot(rpc([undefined]));
+    const res = await run(b);
+    assert.match(res.content[0].text, /no answer/);
+  });
+
+  it("treats an abandoned steering prompt as a dismissal, not as steering", async () => {
+    const b = await boot(rpc(["Change direction…"], undefined));
+    const res = await run(b);
+    assert.match(res.content[0].text, /no answer/);
+  });
+
+  it("treats an empty steering prompt as a dismissal", async () => {
+    const b = await boot(rpc(["Change direction…"], "   "));
+    const res = await run(b);
+    assert.match(res.content[0].text, /no answer/);
+  });
+
+  it("treats an abandoned file select as a dismissal", async () => {
+    const b = await boot(rpc(["Walk me through a file…", undefined]));
+    const res = await run(b, ["a.ts"]);
     assert.match(res.content[0].text, /no answer/);
   });
 });
 
-describe("checkpoint tool — failure and teardown", () => {
-  it("returns actionable guidance instead of throwing when the UI fails", async () => {
+describe("the plan tool", () => {
+  it("approving opens editing, records the plan, and restores the tools", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    assert.ok(!b.activeTools().includes("edit"), "scoping removes edit");
+    assert.ok(!b.activeTools().includes("write"), "scoping removes write");
+
+    const res = await approvePlan(b);
+    assert.match(res.content[0].text, /plan approved/);
+    assert.equal(res.details.answer, "approve");
+
+    assert.ok(b.activeTools().includes("edit"), "edit restored");
+    assert.ok(b.activeTools().includes("write"), "write restored");
+    assert.deepEqual(
+      b.entries.filter((e) => e.customType === "pear-plan").map((e) => e.data),
+      [PLAN_ARGS],
+    );
+
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.equal(decision, undefined);
+  });
+
+  it("revising keeps scoping closed and records nothing", async () => {
     const b = await boot({
-      mode_: "agent-driver",
-      customThrows: new Error("terminal exploded"),
+      ...driver({ planPhase: true }),
+      cardAnswer: { kind: "revise", text: "test first" },
     });
+    const res = await b.tools.get("pear_plan")?.execute("p", PLAN_ARGS, undefined, undefined, b.ctx);
+    assert.match(res.content[0].text, /test first/);
+    assert.equal(b.entries.length, 0, "an unapproved plan is not recorded");
+    assert.ok(!b.activeTools().includes("edit"), "still scoping");
+    const [decision] = await b.emit("tool_call", writeCall("y", "f.ts"), b.ctx);
+    assert.match(decision?.reason ?? "", /no plan is approved/);
+  });
+
+  it("is out of phase once a plan exists", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    await approvePlan(b);
+    const res = await b.tools.get("pear_plan")?.execute("p2", PLAN_ARGS, undefined, undefined, b.ctx);
+    assert.match(res.content[0].text, /already approved/);
+    assert.equal(res.details.answer, "not-run");
+  });
+
+  it("a checkpoint before a plan is out of phase", async () => {
+    const b = await boot(driver({ planPhase: true }));
     const res = await b.tools
       .get("pear_checkpoint")
       ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+    assert.match(res.content[0].text, /no plan is approved/);
+    assert.equal(res.details.answer, "not-run");
+  });
+});
 
+describe("plan persistence across a reload", () => {
+  it("picks the plan back up and stays in the building phase", async () => {
+    const cwd = tempRepo();
+    const first = await boot({ cwd, ...driver({ planPhase: true }) });
+    await approvePlan(first);
+
+    // Same session history, fresh extension instance.
+    const pi = fakePi(first.entries, []);
+    pear(pi.api as never);
+    const c = fakeCtx({ cwd, entries: first.entries });
+    await pi.emit("session_start", { reason: "reload" }, c.ctx);
+
+    assert.ok(c.notifications.some((n) => /picked up the plan/.test(n.message)));
+    const [prompt] = await pi.emit("before_agent_start", { systemPrompt: "BASE" }, c.ctx);
+    assert.match(prompt.systemPrompt, /you are the driver/i);
+    assert.match(prompt.systemPrompt, /Do the thing\./);
+
+    const [decision] = await pi.emit("tool_call", writeCall("x", "f.ts"), c.ctx);
+    assert.equal(decision, undefined, "editing is open again");
+  });
+
+  it("ignores a malformed plan entry rather than trusting it", async () => {
+    const cwd = tempRepo();
+    const entries: Entry[] = [{ type: "custom", customType: "pear-plan", data: { nope: 1 } }];
+    const b = await boot({ cwd, ...driver({ planPhase: true }), entries });
+    const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
+    assert.match(prompt.systemPrompt, /agree the approach first/i, "still scoping");
+  });
+});
+
+describe("the ask tool", () => {
+  it("returns the chosen option", async () => {
+    const b = await boot({
+      ...driver({ planPhase: true }),
+      cardAnswer: { kind: "answer", text: "use the existing queue" },
+    });
+    const res = await b.tools
+      .get("pear_ask")
+      ?.execute("a", { question: "Which queue?", options: [{ label: "use the existing queue" }] }, undefined, undefined, b.ctx);
+    assert.match(res.content[0].text, /use the existing queue/);
+    assert.equal(res.terminate, false);
+  });
+
+  it("offers a free-text escape alongside the options in RPC", async () => {
+    const b = await boot({
+      ...driver({ planPhase: true }),
+      mode: "rpc",
+      selectAnswers: ["Something else…"],
+      inputAnswer: "neither, do X",
+    });
+    const res = await b.tools
+      .get("pear_ask")
+      ?.execute("a", { question: "Which?", options: [{ label: "A" }, { label: "B" }] }, undefined, undefined, b.ctx);
+    assert.match(res.content[0].text, /neither, do X/);
+    assert.deepEqual(b.selects[0]?.options, ["A", "B", "Something else…"]);
+  });
+
+  it("ends the turn rather than letting the agent guess when dismissed", async () => {
+    const b = await boot({ ...driver({ planPhase: true }), cardAnswer: null });
+    const res = await b.tools
+      .get("pear_ask")
+      ?.execute("a", { question: "Which?", options: [{ label: "A" }] }, undefined, undefined, b.ctx);
+    assert.match(res.content[0].text, /rather than guessing/);
+    assert.equal(res.terminate, true);
+  });
+});
+
+describe("scoping tool gating", () => {
+  it("restores exactly what it removed, keeping tools added meanwhile", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    // Another extension registers a tool while pear is scoping.
+    b.api.setActiveTools([...b.activeTools(), "other_tool"]);
+    await approvePlan(b);
+
+    const active = b.activeTools();
+    assert.ok(active.includes("edit"));
+    assert.ok(active.includes("write"));
+    assert.ok(active.includes("other_tool"), "must not clobber another extension's tool");
+  });
+
+  it("restores the tools with a PURELY ADDITIVE setActiveTools call", async () => {
+    // The restore happens mid-run, inside pear_plan.execute. pi only honours a
+    // mid-run tool change when it is additive — remove anything in the same
+    // call and the model may never see edit/write, breaking the approve→build
+    // handoff. Nothing else in this suite can catch that.
+    const b = await boot(driver({ planPhase: true }));
+    const before = b.activeTools();
+    await approvePlan(b);
+
+    const restoreCall = b.toolSetCalls.at(-1);
+    assert.ok(restoreCall, "the restore must actually call setActiveTools");
+    for (const name of before) {
+      assert.ok(restoreCall.includes(name), `${name} must not be dropped by the restore`);
+    }
+    assert.ok(restoreCall.length > before.length, "and it must add edit/write");
+  });
+
+  it("closes editing again on /pear", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    await approvePlan(b);
+    await b.commands.get("pear")?.handler("", b.ctx);
+
+    assert.ok(!b.activeTools().includes("edit"));
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.match(decision?.reason ?? "", /no plan is approved/);
+  });
+});
+
+describe("exclusive mode", () => {
+  it("suggests it when foreign tools are present", async () => {
+    const b = await boot({ ...driver(), extraTools: ["other_tool"] });
+    assert.ok(b.notifications.some((n) => /works best alone/.test(n.message)));
+    assert.ok(b.activeTools().includes("other_tool"), "only suggested, not applied");
+  });
+
+  it("says nothing when only pi and pear tools are active", async () => {
+    const b = await boot(driver());
+    assert.equal(b.notifications.filter((n) => /works best alone/.test(n.message)).length, 0);
+  });
+
+  it("disables foreign tools when configured", async () => {
+    const b = await boot({ ...driver({ exclusive: true }), extraTools: ["other_tool"] });
+    assert.ok(!b.activeTools().includes("other_tool"));
+    assert.ok(b.activeTools().includes("bash"), "pi's own tools stay");
+    assert.ok(b.activeTools().includes("pear_checkpoint"), "pear's own tools stay");
+  });
+
+  it("/pear-exclusive applies and persists it", async () => {
+    const b = await boot({ ...driver(), extraTools: ["other_tool"] });
+    await b.commands.get("pear-exclusive")?.handler("", b.ctx);
+    assert.ok(!b.activeTools().includes("other_tool"));
+    const onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
+    assert.equal(onDisk.exclusive, true);
+  });
+});
+
+describe("checkpoint tool — failure and teardown", () => {
+  const run = (b: Awaited<ReturnType<typeof boot>>, id = "t") =>
+    b.tools
+      .get("pear_checkpoint")
+      ?.execute(id, { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+
+  it("returns actionable guidance instead of throwing when the UI fails", async () => {
+    const b = await boot({ ...driver(), customThrows: new Error("terminal exploded") });
+    const res = await run(b);
     assert.match(res.content[0].text, /could not be shown/);
     assert.match(res.content[0].text, /terminal exploded/);
     assert.equal(res.details.answer, "error");
@@ -384,45 +743,30 @@ describe("checkpoint tool — failure and teardown", () => {
 
   it("does not acknowledge files when the checkpoint fails", async () => {
     const cwd = tempRepo();
-    const b = await boot({ cwd, mode_: "agent-driver", customThrows: new Error("nope") });
-    const tool = b.tools.get("pear_checkpoint");
+    const b = await boot({ cwd, ...driver(), customThrows: new Error("nope") });
     writeFileSync(join(cwd, "pending.txt"), "x\n");
 
-    const failed = await tool?.execute(
-      "t",
-      { summary: "s", files: [], next: "n" },
-      undefined,
-      undefined,
-      b.ctx,
-    );
+    const failed = await run(b);
     assert.equal(failed.details.answer, "error");
 
     // Same session, working UI: the unreviewed file must still be reported,
     // i.e. the failed attempt did not move the baseline.
     (b.ctx.ui as any).custom = async () => ({ kind: "continue" });
-    const res2 = await tool?.execute(
-      "t2",
-      { summary: "s", files: [], next: "n" },
-      undefined,
-      undefined,
-      b.ctx,
-    );
+    await b.emit("input", { text: "ok", source: "interactive" }, b.ctx);
+    await b.commands.get("pear-status")?.handler("", b.ctx);
     assert.ok(
-      res2.details.gitFiles.includes("pending.txt"),
+      b.notifications.some((n) => /1 file\(s\) changed since last checkpoint/.test(n.message)),
       "a failed checkpoint must not acknowledge anything",
     );
   });
 
   it("a second checkpoint while one is open is rejected", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    const tool = b.tools.get("pear_checkpoint");
-
-    // Card that never resolves on its own.
+    const b = await boot(driver());
     let release: (v: unknown) => void = () => {};
     (b.ctx.ui as any).custom = () => new Promise((r) => (release = r));
 
-    const first = tool?.execute("t1", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
-    const second = await tool?.execute("t2", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+    const first = run(b, "t1");
+    const second = await run(b, "t2");
 
     assert.match(second.content[0].text, /already open/);
     release({ kind: "continue" });
@@ -430,11 +774,10 @@ describe("checkpoint tool — failure and teardown", () => {
   });
 
   it("session shutdown resolves an open card instead of hanging", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    const tool = b.tools.get("pear_checkpoint");
+    const b = await boot(driver());
     (b.ctx.ui as any).custom = () => new Promise(() => {}); // never resolves
 
-    const inFlight = tool?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
+    const inFlight = run(b);
     await b.emit("session_shutdown", { reason: "quit" }, b.ctx);
 
     const res = await inFlight;
@@ -442,53 +785,51 @@ describe("checkpoint tool — failure and teardown", () => {
   });
 
   it("aborting the tool resolves an open card", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    const tool = b.tools.get("pear_checkpoint");
+    const b = await boot(driver());
     (b.ctx.ui as any).custom = () => new Promise(() => {});
 
     const controller = new AbortController();
-    const inFlight = tool?.execute(
-      "t",
-      { summary: "s", files: [], next: "n" },
-      controller.signal,
-      undefined,
-      b.ctx,
-    );
+    const inFlight = b.tools
+      .get("pear_checkpoint")
+      ?.execute("t", { summary: "s", files: [], next: "n" }, controller.signal, undefined, b.ctx);
     controller.abort();
 
     const res = await inFlight;
     assert.match(res.content[0].text, /no answer/);
   });
 
-  it("is a no-op in off mode", async () => {
-    const b = await boot({ mode_: "off" });
-    const res = await b.tools
-      .get("pear_checkpoint")
-      ?.execute("t", { summary: "s", files: [], next: "n" }, undefined, undefined, b.ctx);
-    assert.match(res.content[0].text, /not in agent-driver/);
+  it("every tool is a no-op in off mode", async () => {
+    const b = await boot({ config: { mode: "off" } });
+    for (const [name, args] of [
+      ["pear_ask", { question: "q", options: [] }],
+      ["pear_plan", PLAN_ARGS],
+      ["pear_checkpoint", { summary: "s", files: [], next: "n" }],
+    ] as const) {
+      const res = await b.tools.get(name)?.execute("t", args, undefined, undefined, b.ctx);
+      assert.match(res.content[0].text, /not in agent-driver/, name);
+      assert.notEqual(res.terminate, true, name);
+    }
   });
 });
 
 describe("/pear-checkpoint", () => {
   it("opens a checkpoint without the model's involvement", async () => {
-    const b = await boot({ mode_: "agent-driver", cardAnswer: { kind: "continue" } });
-    // Use up the budget so the model itself is blocked.
-    for (let i = 0; i < 6; i++) {
-      await b.emit("tool_call", { toolCallId: `c${i}`, toolName: "edit", input: {} }, b.ctx);
-    }
+    const b = await boot({ ...driver({ reviewBudget: 200 }), cardAnswer: { kind: "continue" } });
+    await b.emit("tool_call", writeCall("big", "big.ts", 400), b.ctx);
+    assert.ok((await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx))[0]?.block);
 
     await b.commands.get("pear-checkpoint")?.handler("", b.ctx);
 
-    const [decision] = await b.emit("tool_call", { toolCallId: "after", toolName: "edit", input: {} }, b.ctx);
+    const [decision] = await b.emit("tool_call", writeCall("after", "f.ts"), b.ctx);
     assert.equal(decision, undefined, "the human unwedged the budget themselves");
   });
 });
 
 describe("run boundary", () => {
   it("notifies once on agent_settled when work is uncheckpointed", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    await b.emit("tool_call", { toolCallId: "a", toolName: "edit", input: {} }, b.ctx);
-    await b.emit("tool_result", { toolCallId: "a", toolName: "edit", isError: false }, b.ctx);
+    const b = await boot(driver());
+    await b.emit("tool_call", writeCall("a", "a.ts", 3), b.ctx);
+    await b.emit("tool_result", { toolCallId: "a", toolName: "write", isError: false, content: [] }, b.ctx);
 
     await b.emit("agent_settled", {}, b.ctx);
     const notes = b.notifications.filter((n) => /not yet checkpointed/.test(n.message));
@@ -496,45 +837,88 @@ describe("run boundary", () => {
   });
 
   it("says nothing when everything is checkpointed", async () => {
-    const b = await boot({ mode_: "agent-driver" });
+    const b = await boot(driver());
     await b.emit("agent_settled", {}, b.ctx);
     assert.equal(b.notifications.filter((n) => /not yet checkpointed/.test(n.message)).length, 0);
+  });
+
+  it("warns when a walkthrough was never followed up", async () => {
+    const b = await boot({ ...driver(), cardAnswer: { kind: "explain", file: "a.ts" } });
+    await b.tools
+      .get("pear_checkpoint")
+      ?.execute("t", { summary: "s", files: ["a.ts"], next: "n" }, undefined, undefined, b.ctx);
+
+    await b.emit("agent_settled", {}, b.ctx);
+    assert.ok(
+      b.notifications.some((n) => n.type === "warning" && /without a follow-up/.test(n.message)),
+    );
   });
 });
 
 describe("/pear-config", () => {
-  it("persists a valid budget", async () => {
-    const b = await boot({ mode_: "agent-driver" });
-    await b.commands.get("pear-config")?.handler("2", b.ctx);
+  it("persists a valid budget and applies it immediately", async () => {
+    const b = await boot(driver());
+    await b.commands.get("pear-config")?.handler("80", b.ctx);
 
     const onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
-    assert.equal(onDisk.maxChangesPerCheckpoint, 2);
+    assert.equal(onDisk.reviewBudget, 80);
 
-    await b.emit("tool_call", { toolCallId: "a", toolName: "edit", input: {} }, b.ctx);
-    await b.emit("tool_call", { toolCallId: "b", toolName: "edit", input: {} }, b.ctx);
-    const [decision] = await b.emit("tool_call", { toolCallId: "c", toolName: "edit", input: {} }, b.ctx);
+    await b.emit("tool_call", writeCall("a", "a.ts", 200), b.ctx);
+    const [decision] = await b.emit("tool_call", writeCall("b", "b.ts", 1), b.ctx);
     assert.equal(decision?.block, true, "new budget takes effect immediately");
   });
 
   it("rejects an invalid budget", async () => {
-    const b = await boot({ mode_: "agent-driver" });
+    const b = await boot(driver());
     await b.commands.get("pear-config")?.handler("0", b.ctx);
     assert.ok(b.notifications.some((n) => n.type === "error"));
   });
 });
 
+describe("/pear-plan and /pear-status", () => {
+  it("/pear-plan shows nothing before approval and the plan after", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    await b.commands.get("pear-plan")?.handler("", b.ctx);
+    assert.ok(b.notifications.some((n) => /no plan approved yet/.test(n.message)));
+
+    await approvePlan(b);
+    await b.commands.get("pear-plan")?.handler("", b.ctx);
+    assert.ok(b.notifications.some((n) => /1\. First/.test(n.message)));
+  });
+
+  it("/pear-status reports the load and its tier", async () => {
+    const b = await boot(driver({ reviewBudget: 200 }));
+    await b.emit("tool_call", writeCall("a", "a.ts", 100), b.ctx);
+    await b.commands.get("pear-status")?.handler("", b.ctx);
+    assert.ok(b.notifications.some((n) => /140\/200 points \(soft\)/.test(n.message)));
+  });
+});
+
 describe("source hygiene", () => {
+  const stripComments = (src: string) =>
+    src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+
   it("contains no ctx.abort() call sites", () => {
     // Aborting the run is what stopped the model from ever seeing a block
-    // reason in the previous implementation. Comments may discuss it; code
-    // may not call it.
-    const stripComments = (src: string) =>
-      src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
-
+    // reason in the first implementation. Comments may discuss it; code may not
+    // call it.
     for (const file of ["adapters/pi/extensions/pear.ts", "adapters/pi/runtime.ts"]) {
       const src = stripComments(readFileSync(new URL(`../${file}`, import.meta.url), "utf8"));
       const calls = src.match(/\bctx\s*\.\s*abort\s*\(/g) ?? [];
       assert.deepEqual(calls, [], `${file} must never abort the agent run`);
+    }
+  });
+
+  it("decides tool_call synchronously", async () => {
+    // A hook that awaits can stall the whole agent loop behind a human. The
+    // waiting belongs in the tools, which are allowed to block.
+    const b = await boot(driver());
+    const hooks = b.handlers.get("tool_call") ?? [];
+    assert.ok(hooks.length > 0);
+    for (const hook of hooks) {
+      assert.notEqual(hook.constructor.name, "AsyncFunction", "tool_call must not be async");
+      const returned = hook(writeCall("sync", "f.ts"), b.ctx);
+      assert.notEqual(typeof (returned as any)?.then, "function", "must not return a promise");
     }
   });
 });

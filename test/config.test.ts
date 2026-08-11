@@ -4,14 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+  BLOCK_MULTIPLE,
   ConfigWriteError,
   DEFAULTS,
-  MAX_CHANGES,
-  MIN_CHANGES,
+  LEGACY_BUDGET_KEY,
+  LEGACY_CHANGE_POINTS,
+  MAX_BUDGET,
+  MIN_BUDGET,
+  SOFT_FRACTION,
   configPath,
-  gateClosed,
-  isValidMaxChanges,
+  isValidBudget,
   loadConfig,
+  loadTier,
   nodeFs,
   saveConfig,
   type ConfigFs,
@@ -26,31 +30,67 @@ function writeConfig(dir: string, contents: string): void {
   writeFileSync(configPath(dir), contents);
 }
 
-describe("gateClosed", () => {
-  it("allows exactly max calls and blocks the next", () => {
-    // max=5 => calls 1..5 admitted (counts 0..4 open), 6th blocked (count 5).
-    assert.equal(gateClosed(0, 5), false);
-    assert.equal(gateClosed(4, 5), false);
-    assert.equal(gateClosed(5, 5), true);
-    assert.equal(gateClosed(6, 5), true);
+describe("loadTier", () => {
+  const B = 200;
+
+  it("is quiet below the soft fraction", () => {
+    assert.equal(loadTier(0, B), "quiet");
+    assert.equal(loadTier(99, B), "quiet");
   });
 
-  it("max=1 admits one call and blocks the second", () => {
-    assert.equal(gateClosed(0, 1), false);
-    assert.equal(gateClosed(1, 1), true);
+  it("nags softly from the soft fraction up to the budget", () => {
+    assert.equal(loadTier(100, B), "soft");
+    assert.equal(loadTier(199, B), "soft");
+  });
+
+  it("says a checkpoint is due at the budget", () => {
+    assert.equal(loadTier(200, B), "due");
+    assert.equal(loadTier(399, B), "due");
+  });
+
+  it("blocks at the block multiple", () => {
+    assert.equal(loadTier(400, B), "blocked");
+    assert.equal(loadTier(4000, B), "blocked");
+  });
+
+  it("derives its boundaries from the exported constants", () => {
+    // Guards against the thresholds and the constants drifting apart.
+    assert.equal(loadTier(B * SOFT_FRACTION, B), "soft");
+    assert.equal(loadTier(B * SOFT_FRACTION - 1, B), "quiet");
+    assert.equal(loadTier(B * BLOCK_MULTIPLE, B), "blocked");
+    assert.equal(loadTier(B * BLOCK_MULTIPLE - 1, B), "due");
+  });
+
+  it("never blocks at zero load, whatever the budget", () => {
+    // Admit-first depends on this: the first change in a window always runs.
+    for (const budget of [MIN_BUDGET, 200, MAX_BUDGET]) {
+      assert.notEqual(loadTier(0, budget), "blocked", `budget ${budget}`);
+    }
   });
 });
 
-describe("isValidMaxChanges", () => {
-  const bad = [0, -3, 2.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_CHANGES + 1, "5", null, undefined, {}];
+describe("isValidBudget", () => {
+  const bad = [
+    0,
+    -3,
+    2.5,
+    MIN_BUDGET - 1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    MAX_BUDGET + 1,
+    "200",
+    null,
+    undefined,
+    {},
+  ];
   for (const v of bad) {
     it(`rejects ${JSON.stringify(v) ?? String(v)}`, () => {
-      assert.equal(isValidMaxChanges(v), false);
+      assert.equal(isValidBudget(v), false);
     });
   }
-  for (const v of [MIN_CHANGES, 5, MAX_CHANGES]) {
+  for (const v of [MIN_BUDGET, 200, MAX_BUDGET]) {
     it(`accepts ${v}`, () => {
-      assert.equal(isValidMaxChanges(v), true);
+      assert.equal(isValidBudget(v), true);
     });
   }
 });
@@ -66,19 +106,33 @@ describe("loadConfig", () => {
 
   it("reads a valid config", () => {
     const dir = tempProject();
-    writeConfig(dir, JSON.stringify({ mode: "agent-driver", maxChangesPerCheckpoint: 3 }));
+    writeConfig(
+      dir,
+      JSON.stringify({ mode: "agent-driver", reviewBudget: 320, planPhase: false, exclusive: true }),
+    );
     const loaded = loadConfig(dir);
     assert.equal(loaded.config.mode, "agent-driver");
-    assert.equal(loaded.config.maxChangesPerCheckpoint, 3);
+    assert.equal(loaded.config.reviewBudget, 320);
+    assert.equal(loaded.config.planPhase, false);
+    assert.equal(loaded.config.exclusive, true);
     assert.equal(loaded.legacyMode, undefined);
+    assert.equal(loaded.migratedBudgetFrom, undefined);
   });
 
   it("drops an out-of-range value but keeps the rest of the file", () => {
     const dir = tempProject();
-    writeConfig(dir, JSON.stringify({ mode: "agent-driver", maxChangesPerCheckpoint: 0 }));
+    writeConfig(dir, JSON.stringify({ mode: "agent-driver", reviewBudget: 0 }));
     const loaded = loadConfig(dir);
     assert.equal(loaded.config.mode, "agent-driver");
-    assert.equal(loaded.config.maxChangesPerCheckpoint, DEFAULTS.maxChangesPerCheckpoint);
+    assert.equal(loaded.config.reviewBudget, DEFAULTS.reviewBudget);
+  });
+
+  it("ignores non-boolean flags rather than coercing them", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ planPhase: "yes", exclusive: 1 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.planPhase, DEFAULTS.planPhase);
+    assert.equal(loaded.config.exclusive, DEFAULTS.exclusive);
   });
 
   it("surfaces a legacy human-driver mode instead of silently coercing", () => {
@@ -106,6 +160,49 @@ describe("loadConfig", () => {
   });
 });
 
+describe("loadConfig: legacy budget migration", () => {
+  it("derives reviewBudget from the old call-count key and reports it", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 5 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.reviewBudget, 5 * LEGACY_CHANGE_POINTS);
+    assert.equal(loaded.migratedBudgetFrom, 5);
+  });
+
+  it("leaves the legacy key on disk so a downgrade still works", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 5 }));
+    loadConfig(dir);
+    saveConfig(dir, { mode: "agent-driver" });
+    const onDisk = JSON.parse(readFileSync(configPath(dir), "utf8")) as Record<string, unknown>;
+    assert.equal(onDisk[LEGACY_BUDGET_KEY], 5, "legacy key must survive a write");
+  });
+
+  it("prefers an explicit reviewBudget over the legacy key", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ reviewBudget: 300, [LEGACY_BUDGET_KEY]: 5 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.reviewBudget, 300);
+    assert.equal(loaded.migratedBudgetFrom, undefined, "no migration happened");
+  });
+
+  it("clamps a migrated value into range rather than falling back to the default", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 1000 }));
+    const loaded = loadConfig(dir);
+    assert.equal(isValidBudget(loaded.config.reviewBudget), true);
+    assert.equal(loaded.migratedBudgetFrom, 1000);
+  });
+
+  it("ignores an out-of-range legacy value", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 0 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.reviewBudget, DEFAULTS.reviewBudget);
+    assert.equal(loaded.migratedBudgetFrom, undefined);
+  });
+});
+
 describe("saveConfig", () => {
   it("round-trips and preserves unknown/legacy fields", () => {
     const dir = tempProject();
@@ -114,10 +211,10 @@ describe("saveConfig", () => {
       JSON.stringify({ mode: "human-driver", reviewModel: "a/b", futureSetting: { deep: true } }),
     );
 
-    saveConfig(dir, { maxChangesPerCheckpoint: 7 });
+    saveConfig(dir, { reviewBudget: 280 });
 
     const onDisk = JSON.parse(readFileSync(configPath(dir), "utf8")) as Record<string, unknown>;
-    assert.equal(onDisk.maxChangesPerCheckpoint, 7);
+    assert.equal(onDisk.reviewBudget, 280);
     // untouched:
     assert.equal(onDisk.mode, "human-driver");
     assert.equal(onDisk.reviewModel, "a/b");
@@ -132,7 +229,11 @@ describe("saveConfig", () => {
 
   it("refuses to persist an invalid value", () => {
     const dir = tempProject();
-    assert.throws(() => saveConfig(dir, { maxChangesPerCheckpoint: 0 }), ConfigWriteError);
+    assert.throws(() => saveConfig(dir, { reviewBudget: 0 }), ConfigWriteError);
+    assert.throws(
+      () => saveConfig(dir, { planPhase: "yes" as unknown as boolean }),
+      ConfigWriteError,
+    );
     assert.throws(
       () => saveConfig(dir, { mode: "human-driver" as unknown as "off" }),
       ConfigWriteError,
@@ -209,8 +310,8 @@ describe("saveConfig", () => {
         nodeFs.writeFileSync(p, d);
       },
     };
-    saveConfig(dir, { maxChangesPerCheckpoint: 2 }, spy);
-    saveConfig(dir, { maxChangesPerCheckpoint: 3 }, spy);
+    saveConfig(dir, { reviewBudget: 240 }, spy);
+    saveConfig(dir, { reviewBudget: 280 }, spy);
     assert.equal(seen.size, 2, "temp paths must not collide");
   });
 });
