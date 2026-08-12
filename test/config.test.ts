@@ -24,8 +24,10 @@ import {
   loadConfig,
   loadTier,
   nodeFs,
+  parseConfigEdit,
   parseConfigValue,
   saveConfig,
+  summariseConfigValue,
   type ConfigFs,
 } from "../core/config.ts";
 
@@ -188,6 +190,123 @@ describe("parseConfigValue", () => {
       const shown = formatConfigValue(DEFAULTS[key]);
       assert.deepEqual(parseConfigValue(key, shown), { ok: true, value: DEFAULTS[key] }, key);
     }
+  });
+});
+
+describe("parseConfigEdit", () => {
+  const list = ["ls", "cat", "git log"];
+
+  it("adds without disturbing what is already there", () => {
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "+rg", list), {
+      ok: true,
+      value: ["ls", "cat", "git log", "rg"],
+    });
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "+rg, fd", list), {
+      ok: true,
+      value: ["ls", "cat", "git log", "rg", "fd"],
+    });
+  });
+
+  it("removes only the named entry", () => {
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "-cat", list), {
+      ok: true,
+      value: ["ls", "git log"],
+    });
+    // Entries contain spaces, so removal splits on commas like everything else.
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "-git log", list), {
+      ok: true,
+      value: ["ls", "cat"],
+    });
+  });
+
+  it("says nothing changed rather than writing a no-op", () => {
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "+cat", list), {
+      ok: false,
+      reason: "unchanged",
+      entries: ["cat"],
+    });
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "-rg", list), {
+      ok: false,
+      reason: "absent",
+      entries: ["rg"],
+    });
+  });
+
+  it("applies a partial add or remove and reports nothing when neither lands", () => {
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "+cat, rg", list), {
+      ok: true,
+      value: ["ls", "cat", "git log", "rg"],
+    });
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "-cat, rg", list), {
+      ok: true,
+      value: ["ls", "git log"],
+    });
+  });
+
+  it("puts any key back to its default", () => {
+    for (const word of ["default", "defaults", "RESET"]) {
+      assert.deepEqual(
+        parseConfigEdit("allowedReadOnlyCommands", word, []),
+        { ok: true, value: DEFAULTS.allowedReadOnlyCommands },
+        word,
+      );
+    }
+    assert.deepEqual(parseConfigEdit("reviewBudget", "reset", 900), {
+      ok: true,
+      value: DEFAULTS.reviewBudget,
+    });
+  });
+
+  it("treats a plain value as the whole value, exactly as before", () => {
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "ls, cat", list), {
+      ok: true,
+      value: ["ls", "cat"],
+    });
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "", list), {
+      ok: true,
+      value: [],
+    });
+    assert.deepEqual(parseConfigEdit("reviewBudget", "300", 200), { ok: true, value: 300 });
+    assert.deepEqual(parseConfigEdit("reviewBudget", "nope", 200), {
+      ok: false,
+      reason: "invalid",
+    });
+  });
+
+  it("refuses +/- where they would read as a sign", () => {
+    // "-200" on a number is a value, not a removal; refusing is the only way
+    // the two readings cannot be confused.
+    assert.deepEqual(parseConfigEdit("reviewBudget", "+300", 200), { ok: false, reason: "invalid" });
+    assert.deepEqual(parseConfigEdit("reviewBudget", "-300", 200), { ok: false, reason: "invalid" });
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "+", list), {
+      ok: false,
+      reason: "invalid",
+    });
+  });
+
+  it("starts from empty when the current value is not a list", () => {
+    assert.deepEqual(parseConfigEdit("allowedReadOnlyCommands", "+ls", undefined), {
+      ok: true,
+      value: ["ls"],
+    });
+  });
+});
+
+describe("summariseConfigValue", () => {
+  it("leaves a short value alone", () => {
+    assert.equal(summariseConfigValue(["ls", "cat"]), "ls, cat");
+    assert.equal(summariseConfigValue(true), "true");
+  });
+
+  it("elides a long list and names how many entries it has", () => {
+    const shown = summariseConfigValue(DEFAULTS.allowedReadOnlyCommands, 40);
+    assert.ok(shown.length <= 40, shown);
+    assert.match(shown, /\u2026 \(\d+\)$/);
+  });
+
+  it("elides a long scalar without a count", () => {
+    const shown = summariseConfigValue("x".repeat(80), 20);
+    assert.equal(shown, `${"x".repeat(19)}\u2026`);
   });
 });
 

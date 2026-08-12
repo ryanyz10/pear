@@ -29,17 +29,13 @@ import {
   isConfigKey,
   loadConfig,
   nodeFs,
-  parseConfigValue,
+  parseConfigEdit,
   saveConfig,
   type ConfigKey,
   type Mode,
   type PearConfig,
 } from "../../../core/config.ts";
-import {
-  latestPlanPath,
-  writePlanApproved,
-  writePlanDraft,
-} from "../../../core/plan-file.ts";
+import { planFileName, plansDir, writePlan } from "../../../core/plan-file.ts";
 import {
   ASK_TOOL_DESCRIPTION,
   ASK_TOOL_NAME,
@@ -63,6 +59,7 @@ import { createWatcher, type WatchEffect, type Watcher } from "../../../core/wat
 import { askCard } from "../cards/ask.ts";
 import { renderCard, type CardSpec } from "../cards/card.ts";
 import { checkpointCard, type CheckpointView } from "../cards/checkpoint.ts";
+import { settingCard, settingsCard } from "../cards/config.ts";
 import { runCardViaDialogs } from "../cards/dialogs.ts";
 import { planCard } from "../cards/plan.ts";
 import { createRuntime, type PearRuntime, type Resolution } from "../runtime.ts";
@@ -120,7 +117,7 @@ const PLAN_ENTRY = "pear-plan";
 
 /**
  * Card answers that mean a human read the proposal, and so that it is worth
- * writing to `.pear/plans/latest.md`. Deliberately excludes `not-run` (no card
+ * writing to the plan's file. Deliberately excludes `not-run` (no card
  * was shown), `mode-off` (torn down by a mode switch) and `error` (the card
  * failed to render).
  */
@@ -208,11 +205,21 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
   let suppressedTools: string[] = [];
 
   /**
-   * Where the currently-approved plan was snapshotted, for `/pear-plan` to
-   * quote. Null in a session that recovered its plan from history rather than
+   * Where the currently-approved plan was written, for `/pear-plan` to quote.
+   * Null in a session that recovered its plan from history rather than
    * approving one, since that file belongs to the earlier session.
    */
   let approvedPlanFile: string | null = null;
+
+  /**
+   * The filename this scoping round's plan is being written to, assigned when
+   * it was first proposed. Held here rather than derived per call so that a
+   * revision rewrites the same file even when the summary is reworded.
+   *
+   * Cleared at every round boundary — a new mode, a `/pear` replan, and
+   * approval itself — so a later plan can never overwrite an approved one.
+   */
+  let planFile: string | null = null;
 
   const captureFiles = (cwd: string) => () => {
     const state = captureGitState(cwd);
@@ -928,17 +935,30 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
         let text = result.text;
         // Save only what a human actually looked at. "not-run" means the call
         // was rejected before a card existed; "mode-off" and "error" mean the
-        // card was torn down before anyone read it — overwriting `latest.md`
+        // card was torn down before anyone read it — rewriting the plan's file
         // with a proposal nobody saw would misrepresent what is being planned.
         if (result.details.kind === "plan" && SAVED_PLAN_ANSWERS.has(result.details.answer)) {
           try {
-            if (result.details.answer === "approve") {
-              // Writes `latest.md` as well as the snapshot, so no draft write here.
-              const snapshot = writePlanApproved(ctx.cwd, proposed, nodeFs, now);
-              approvedPlanFile = snapshot;
-              text = `${result.text}\n\nSaved to ${snapshot}.`;
-            } else {
-              writePlanDraft(ctx.cwd, proposed, nodeFs, now);
+            // Name it once. Every revision of this plan rewrites this file, so
+            // the summary that named it is the one it was first proposed under.
+            planFile ??= planFileName(proposed.summary);
+            const approved = result.details.answer === "approve";
+            const path = writePlan(
+              ctx.cwd,
+              proposed,
+              planFile,
+              approved ? "approved" : "draft",
+              nodeFs,
+              now,
+            );
+            // Where it is, either way: a draft you can go back to is the point
+            // of naming these at all.
+            text = `${result.text}\n\nSaved to ${path}.`;
+            if (approved) {
+              approvedPlanFile = path;
+              // The round is over. Anything proposed later is a different plan
+              // and gets a different file, so this one stays as approved.
+              planFile = null;
             }
           } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
@@ -1033,6 +1053,9 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
         ctx.ui.notify("pear: not running — use /pear-mode first.", "warning");
         return;
       }
+      // A new round of scoping is a new plan: it gets its own file rather than
+      // rewriting the one that was already approved.
+      planFile = null;
       rt.replan();
       syncPhaseTools();
       syncWatcher(ctx);
@@ -1052,13 +1075,13 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       const plan = rt.plan;
       if (plan === null) {
         ctx.ui.notify(
-          `pear: no plan approved yet — drafts save to ${latestPlanPath(ctx.cwd)}.`,
+          `pear: no plan approved yet — drafts save under ${plansDir(ctx.cwd)}.`,
           "info",
         );
         return;
       }
-      // The snapshot, never `latest.md`: the next draft overwrites that, so
-      // quoting it would point at a plan this one may already have superseded.
+      // This plan's own file. Superseding it means writing a different file,
+      // so the path stays true for as long as the plan does.
       const where = approvedPlanFile === null ? "" : ` (saved at ${approvedPlanFile})`;
       ctx.ui.notify(`pear plan${where}\n\n${formatPlan(plan)}`, "info");
     },
@@ -1230,6 +1253,9 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       // up. What we must not do is claim it is active when no human could
       // answer a checkpoint here.
       const runnable = target === "off" || canShowDialogs(ctx);
+      // `setMode` drops the plan, so whatever file it was being written to
+      // belongs to a round that no longer exists.
+      planFile = null;
       rt.setMode(runnable ? target : "off");
       syncPhaseTools();
       syncWatcher(ctx);
@@ -1267,7 +1293,9 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
 
     switch (key) {
       case "mode":
-        // Same rule as /pear-mode: a mode is only run where a human can answer.
+        // Same rule as /pear-mode: a mode is only run where a human can answer,
+        // and the dropped plan takes its filename with it.
+        planFile = null;
         rt.setMode(canShowDialogs(ctx) ? (value as Mode) : "off");
         syncPhaseTools();
         syncWatcher(ctx);
@@ -1304,20 +1332,99 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
     refreshStatus(ctx);
   };
 
-  /** Ask for one value, in whatever way suits its type. */
-  const promptForValue = async (
+  /**
+   * Persist one accepted value, put it into force, and say what happened.
+   *
+   * Every path into `/pear-config` ends here, so the card and the argument
+   * form cannot disagree about what a change does.
+   */
+  const commitSetting = (ctx: ExtensionContext, key: ConfigKey, value: unknown): void => {
+    let persisted = true;
+    let detail = "";
+    try {
+      saveConfig(ctx.cwd, { [key]: value } as PearConfig);
+    } catch (e) {
+      persisted = false;
+      detail = e instanceof ConfigWriteError ? e.message : String(e);
+    }
+
+    applySetting(ctx, key, value);
+
+    const shown = `${key} = ${formatConfigValue(value)}`;
+    // Two keys cannot change this session: scoping has already been decided,
+    // and tools already dropped cannot be handed back. Saying so is the
+    // difference between a setting that looks broken and one that is pending.
+    const later = key === "planPhase" || (key === "exclusive" && value === false);
+    const laterNote = later ? " (takes effect next session)" : "";
+    ctx.ui.notify(
+      persisted
+        ? `pear: ${shown}${laterNote}`
+        : `pear: ${shown} for this session only — NOT persisted: ${detail}`,
+      persisted ? "info" : "warning",
+    );
+  };
+
+  /**
+   * Read one typed edit and commit it, or explain why nothing was written.
+   *
+   * "Nothing changed" is reported rather than saved: adding a command that is
+   * already on the list and removing one that never was are both mistakes, and
+   * a silent success would look like the edit had gone the other way.
+   */
+  const applyEdit = (
     ctx: ExtensionContext,
     key: ConfigKey,
+    text: string,
     current: unknown,
-  ): Promise<string | undefined> => {
-    const spec = CONFIG_SPECS[key];
-    if (key === "mode") return await ctx.ui.select("pear mode:", [...MODES]);
-    if (typeof DEFAULTS[key] === "boolean") {
-      return await ctx.ui.select(`${key} — ${spec.summary}`, ["true", "false"]);
+  ): boolean => {
+    const edit = parseConfigEdit(key, text, current);
+    if (edit.ok) {
+      commitSetting(ctx, key, edit.value);
+      return true;
     }
-    return await ctx.ui.input(
-      `${key} (${spec.describe}), currently ${formatConfigValue(current)}:`,
-    );
+    if (edit.reason === "unchanged") {
+      ctx.ui.notify(`pear: ${edit.entries.join(", ")} already on ${key} — nothing changed`, "info");
+    } else if (edit.reason === "absent") {
+      ctx.ui.notify(`pear: ${edit.entries.join(", ")} is not on ${key} — nothing changed`, "info");
+    } else {
+      ctx.ui.notify(
+        `pear: ${key} wants ${CONFIG_SPECS[key].describe} — "${text}" isn't one`,
+        "error",
+      );
+    }
+    return false;
+  };
+
+  /**
+   * The settings UI: pick a setting, change it, stay on it.
+   *
+   * It loops back to the same setting after a change so adding three commands
+   * is three keystrokes rather than three invocations, and re-reads the file
+   * each time so the card always shows what was actually written. Esc steps
+   * back out, and Esc at the picker closes.
+   */
+  const runSettingsUI = async (ctx: ExtensionContext, only?: ConfigKey): Promise<void> => {
+    let key = only;
+    for (;;) {
+      if (key === undefined) {
+        const picked = await show(ctx, settingsCard(loadConfig(ctx.cwd).config));
+        if (picked === null) return;
+        key = picked.key;
+      }
+
+      const current = loadConfig(ctx.cwd).config[key];
+      const answer = await show(ctx, settingCard(key, current));
+      if (answer === null) {
+        // Esc means "back", not "quit" — unless this card is all there is.
+        if (only !== undefined) return;
+        key = undefined;
+        continue;
+      }
+
+      if (answer.kind === "value") commitSetting(ctx, key, answer.value);
+      else if (answer.kind === "edit") applyEdit(ctx, key, answer.text, current);
+      else applyEdit(ctx, key, `+${answer.text.replace(/^\+/, "")}`, current);
+    }
   };
 
   pi.registerCommand("pear-config", {
@@ -1330,11 +1437,8 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       const current = loadConfig(ctx.cwd).config;
       const raw = args.trim();
 
-      let key: ConfigKey | undefined;
-      let valueText: string | undefined;
-
       if (raw === "") {
-        if (!ctx.hasUI) {
+        if (!canShowDialogs(ctx)) {
           ctx.ui.notify(
             `pear-config needs a key and a value here. ` +
               CONFIG_KEYS.map((k) => `${k}=${formatConfigValue(current[k])}`).join(", "),
@@ -1342,79 +1446,42 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
           );
           return;
         }
-        const labels = CONFIG_KEYS.map(
-          (k) => `${k} = ${formatConfigValue(current[k])}  — ${CONFIG_SPECS[k].summary}`,
-        );
-        const picked = await ctx.ui.select("pear settings:", labels);
-        if (picked === undefined) return;
-        key = CONFIG_KEYS[labels.indexOf(picked)];
-        if (key === undefined) return;
-        valueText = await promptForValue(ctx, key, current[key]);
-        if (valueText === undefined) return;
-      } else {
-        const [first = "", ...rest] = raw.split(" ").filter((t) => t !== "");
-        if (isConfigKey(first)) {
-          key = first;
-          valueText = rest.join(" ");
-          if (valueText === "" && key !== "allowedReadOnlyCommands") {
-            if (!ctx.hasUI) {
-              ctx.ui.notify(
-                `pear: ${key} wants ${CONFIG_SPECS[key].describe}; currently ` +
-                  formatConfigValue(current[key]),
-                "warning",
-              );
-              return;
-            }
-            const typed = await promptForValue(ctx, key, current[key]);
-            if (typed === undefined) return;
-            valueText = typed;
-          }
-        } else if (/^[0-9]+$/.test(raw)) {
-          // Back-compat: /pear-config used to take nothing but a budget.
-          key = "reviewBudget";
-          valueText = raw;
-        } else {
-          ctx.ui.notify(
-            `pear: unknown setting "${first}" — try one of ${CONFIG_KEYS.join(", ")}`,
-            "error",
-          );
-          return;
-        }
+        await runSettingsUI(ctx);
+        return;
       }
 
-      const parsed = parseConfigValue(key, valueText);
-      if (!parsed.ok) {
+      const [first = "", ...rest] = raw.split(" ").filter((t) => t !== "");
+      if (!isConfigKey(first)) {
+        // Back-compat: /pear-config used to take nothing but a budget.
+        if (/^[0-9]+$/.test(raw)) {
+          applyEdit(ctx, "reviewBudget", raw, current.reviewBudget);
+          return;
+        }
         ctx.ui.notify(
-          `pear: ${key} wants ${CONFIG_SPECS[key].describe} — "${valueText}" isn't one`,
+          `pear: unknown setting "${first}" — try one of ${CONFIG_KEYS.join(", ")}`,
           "error",
         );
         return;
       }
 
-      let persisted = true;
-      let detail = "";
-      try {
-        saveConfig(ctx.cwd, { [key]: parsed.value } as PearConfig);
-      } catch (e) {
-        persisted = false;
-        detail = e instanceof ConfigWriteError ? e.message : String(e);
+      const key = first;
+      const valueText = rest.join(" ");
+      if (valueText !== "") {
+        applyEdit(ctx, key, valueText, current[key]);
+        return;
       }
 
-      applySetting(ctx, key, parsed.value);
-
-      const shown = `${key} = ${formatConfigValue(parsed.value)}`;
-      // Two keys cannot change this session: scoping has already been decided,
-      // and tools already dropped cannot be handed back. Saying so is the
-      // difference between a setting that looks broken and one that is pending.
-      const later =
-        key === "planPhase" || (key === "exclusive" && parsed.value === false);
-      const laterNote = later ? " (takes effect next session)" : "";
-      ctx.ui.notify(
-        persisted
-          ? `pear: ${shown}${laterNote}`
-          : `pear: ${shown} for this session only — NOT persisted: ${detail}`,
-        persisted ? "info" : "warning",
-      );
+      // A key on its own is a request to see it, never an instruction to empty
+      // it — which is what a bare `/pear-config allowedReadOnlyCommands` used
+      // to do.
+      if (!canShowDialogs(ctx)) {
+        ctx.ui.notify(
+          `pear: ${key} = ${formatConfigValue(current[key])} (wants ${CONFIG_SPECS[key].describe})`,
+          "info",
+        );
+        return;
+      }
+      await runSettingsUI(ctx, key);
     },
   });
 }

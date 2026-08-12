@@ -279,9 +279,14 @@ rename. Write failures are surfaced as "not persisted", never swallowed.
 
 ### Command classification is two layers, and only one is policy
 
-`core/bash.ts` answers read-only only if **both** hold: the command is simple
-enough to tokenize (no expansion, no operators, no redirection, no env prefix,
-no path-qualified binary), **and** its leading tokens match the allowlist.
+`core/bash.ts` answers read-only only if **both** hold: the string is simple
+enough to tokenize (no expansion, no redirection, no glob, no subshell, no env
+prefix, no path-qualified binary), **and** every command in it matches the
+allowlist by leading tokens.
+
+*Every* command: `|`, `&&`, `||` and `;` split the parse into segments, and each
+segment faces the whole gate. `git log | head` reads exactly what its parts
+read, so refusing composition only bought two tool calls instead of one.
 
 The first layer is not configurable and is not a judgement about programs — it
 is what makes the second mean anything. The second layer *is* the user's:
@@ -293,9 +298,10 @@ header and accepted.
 Tokenizing is `shell-quote`'s `parse`. **A successful parse is not a safety
 verdict.** It does not treat backticks as operators, and `$` expansion
 disappears into an empty string — so both are rejected by scanning the raw
-string *before* parsing. Anything structural (pipes, redirects, subshells,
-globs, comments) comes back as a non-string element and is rejected wholesale.
-A flag naming an output file is refused whatever the list says.
+string *before* parsing. Structure comes back as non-string elements: the four
+control operators above separate segments, and every other one (redirects, `&`,
+subshells, globs, comments) rejects the whole string. An empty segment (`ls |`)
+rejects too. A flag naming an output file is refused whatever the list says.
 
 When adding to the defaults: dual-purpose programs stay out (`sort -o`,
 `git branch -d`, `xargs`, `find -delete`). When in doubt, mutating.

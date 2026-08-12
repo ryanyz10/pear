@@ -283,6 +283,100 @@ export function formatConfigValue(value: unknown): string {
 }
 
 /**
+ * The same value, cut to one line.
+ *
+ * Option labels in a card and in `ui.select` are one line each: pi's selector
+ * renders a long one as a wrapped `Text` whose continuation lines lose the
+ * selection marker's indent, and even pear's own renderer would spend half the
+ * card on a list of commands. So a long value is elided and its size named —
+ * the full value belongs in the card body, which knows how to scroll.
+ */
+export function summariseConfigValue(value: unknown, width = 40): string {
+  const full = formatConfigValue(value);
+  if (full.length <= width) return full;
+  const count = Array.isArray(value) ? ` (${value.length})` : "";
+  const room = Math.max(1, width - count.length - 1);
+  return `${full.slice(0, room).trimEnd()}…${count}`;
+}
+
+/** Keys whose value is a list, and so can be added to and removed from. */
+export function isListKey(key: ConfigKey): boolean {
+  return Array.isArray(DEFAULTS[key]);
+}
+
+/** The words that mean "put this key back how it shipped". */
+const RESET_WORDS = ["default", "defaults", "reset"];
+
+/**
+ * What one edit of one setting did.
+ *
+ * `unchanged` and `absent` exist so the caller can say what happened without
+ * writing anything: adding a command that is already on the list and removing
+ * one that never was are both mistakes worth naming, and neither is a failure.
+ */
+export type ConfigEdit =
+  | { ok: true; value: unknown }
+  | { ok: false; reason: "invalid" }
+  | { ok: false; reason: "unchanged"; entries: string[] }
+  | { ok: false; reason: "absent"; entries: string[] };
+
+/**
+ * Read one edit out of what a human typed, against what the setting is now.
+ *
+ * Three forms on top of `parseConfigValue`, which still handles the plain
+ * "here is the whole value" case:
+ *
+ * - `default` / `reset` — any key, back to what pear ships with.
+ * - `+git log, rg` — list keys, append the entries that are not already there.
+ * - `-rg` — list keys, drop those entries.
+ *
+ * The shorthand costs three literal list entries (`default`, `reset`, and
+ * anything starting with `-`); they are still reachable by giving the whole
+ * list, which is what the card's "replace" option does. Losing a list because
+ * you meant to remove one thing from it is the worse trade.
+ */
+export function parseConfigEdit(
+  key: ConfigKey,
+  text: string,
+  current: unknown,
+): ConfigEdit {
+  const trimmed = text.trim();
+
+  if (RESET_WORDS.includes(trimmed.toLowerCase())) {
+    return { ok: true, value: DEFAULTS[key] };
+  }
+
+  const sign = trimmed.startsWith("+") ? "add" : trimmed.startsWith("-") ? "remove" : "set";
+  if (sign === "set") {
+    const parsed = parseConfigValue(key, trimmed);
+    return parsed.ok ? { ok: true, value: parsed.value } : { ok: false, reason: "invalid" };
+  }
+
+  // `+`/`-` only mean anything for a list. On a number they would read as a
+  // sign, which is exactly the ambiguity worth refusing.
+  if (!isListKey(key)) return { ok: false, reason: "invalid" };
+
+  const entries = trimmed
+    .slice(1)
+    .split(",")
+    .map((e) => e.trim())
+    .filter((e) => e !== "");
+  if (entries.length === 0) return { ok: false, reason: "invalid" };
+
+  const list = Array.isArray(current) ? (current as string[]).map(String) : [];
+
+  if (sign === "add") {
+    const fresh = entries.filter((e) => !list.includes(e));
+    if (fresh.length === 0) return { ok: false, reason: "unchanged", entries };
+    return { ok: true, value: [...list, ...fresh] };
+  }
+
+  const present = entries.filter((e) => list.includes(e));
+  if (present.length === 0) return { ok: false, reason: "absent", entries };
+  return { ok: true, value: list.filter((e) => !present.includes(e)) };
+}
+
+/**
  * Read one typed setting out of what a human typed.
  *
  * Every value arrives as a string — from a command argument or a text input —

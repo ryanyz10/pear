@@ -10,7 +10,9 @@ import {
   type CardSpec,
 } from "../adapters/pi/cards/card.ts";
 import { checkpointCard, reviewableFiles } from "../adapters/pi/cards/checkpoint.ts";
+import { settingCard, settingsCard } from "../adapters/pi/cards/config.ts";
 import { planCard } from "../adapters/pi/cards/plan.ts";
+import { CONFIG_KEYS, DEFAULTS } from "../core/config.ts";
 
 /**
  * Card content is pure data, so it is testable without a terminal — which is
@@ -34,6 +36,11 @@ describe("every card resolves, never parks", () => {
     view(),
     planCard({ summary: "S", steps: ["A"] }),
     askCard({ question: "Q", choices: [{ label: "A" }] }),
+    settingsCard(DEFAULTS),
+    settingCard("allowedReadOnlyCommands", ["ls", "cat"]),
+    settingCard("mode", "agent-driver"),
+    settingCard("statusIcon", false),
+    settingCard("reviewBudget", 200),
   ];
 
   it("has no option that fails to produce an answer", () => {
@@ -215,6 +222,97 @@ describe("ask card", () => {
     const option = spec.options[0];
     assert.ok(option !== undefined && "answer" in option);
     assert.deepEqual(option.answer, { kind: "answer", text: "Use a Map" });
+  });
+});
+
+describe("settings cards", () => {
+  it("keeps every picker label to one line", () => {
+    // The whole point of the rewrite: pi's selector loses its indent on a
+    // wrapped label, so a value never goes into one at full length.
+    for (const label of labels(settingsCard(DEFAULTS))) {
+      assert.ok(label.length <= 70, label);
+      assert.ok(!label.includes("\n"), label);
+    }
+  });
+
+  it("offers one option per setting, carrying the key back", () => {
+    const spec = settingsCard(DEFAULTS);
+    assert.equal(spec.options.length, CONFIG_KEYS.length);
+    const first = spec.options[0];
+    assert.ok(first !== undefined && "answer" in first);
+    assert.deepEqual(first.answer, { key: CONFIG_KEYS[0] });
+  });
+
+  it("shows the full list in the body, where it can scroll", () => {
+    const shown = text(settingCard("allowedReadOnlyCommands", DEFAULTS.allowedReadOnlyCommands));
+    for (const entry of DEFAULTS.allowedReadOnlyCommands) assert.match(shown, new RegExp(entry));
+    assert.match(shown, new RegExp(`${DEFAULTS.allowedReadOnlyCommands.length} commands`));
+  });
+
+  it("warns when the list has been emptied", () => {
+    assert.match(text(settingCard("allowedReadOnlyCommands", [])), /empty/);
+  });
+
+  it("lets a list be added to, removed from, replaced, or reset", () => {
+    assert.deepEqual(labels(settingCard("allowedReadOnlyCommands", ["ls"])), [
+      "Add a command",
+      "Remove a command",
+      "Replace the whole list",
+      "Reset to default",
+    ]);
+  });
+
+  it("removes by rebuilding the list, not by echoing the entry back", () => {
+    // An entry containing a comma would not survive a `-entry` round trip.
+    const spec = settingCard("allowedReadOnlyCommands", ["ls", "git log, please", "cat"]);
+    const remove = spec.options[1];
+    assert.ok(remove !== undefined && "pick" in remove);
+    assert.deepEqual(remove.pick.items, ["ls", "git log, please", "cat"]);
+    assert.deepEqual(remove.pick.answer("git log, please"), {
+      kind: "value",
+      value: ["ls", "cat"],
+    });
+  });
+
+  it("marks an added command as an addition, not a replacement", () => {
+    const add = settingCard("allowedReadOnlyCommands", ["ls"]).options[0];
+    assert.ok(add !== undefined && "editor" in add);
+    assert.deepEqual(add.editor.answer("rg"), { kind: "add", text: "rg" });
+  });
+
+  it("offers the modes as choices rather than as free text", () => {
+    assert.deepEqual(labels(settingCard("mode", "off")), [
+      "off",
+      "agent-driver",
+      "human-driver",
+      "Reset to default",
+    ]);
+  });
+
+  it("offers a boolean as two choices", () => {
+    assert.deepEqual(labels(settingCard("statusIcon", false)), [
+      "true",
+      "false",
+      "Reset to default",
+    ]);
+  });
+
+  it("asks for a number as text, with its bounds shown", () => {
+    const spec = settingCard("reviewBudget", 200);
+    const set = spec.options[0];
+    assert.ok(set !== undefined && "editor" in set);
+    assert.deepEqual(set.editor.answer("300"), { kind: "edit", text: "300" });
+    assert.match(text(spec), /currently 200/);
+    assert.match(text(spec), /whole number/);
+  });
+
+  it("resets to the shipped value, whatever the key", () => {
+    for (const key of CONFIG_KEYS) {
+      const options = settingCard(key, undefined).options;
+      const reset = options[options.length - 1];
+      assert.ok(reset !== undefined && "answer" in reset, key);
+      assert.deepEqual(reset.answer, { kind: "value", value: DEFAULTS[key] }, key);
+    }
   });
 });
 

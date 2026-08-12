@@ -12,9 +12,16 @@
  *
  * A command is read-only only if **both** hold:
  *
- *   1. It is syntactically simple: printable ASCII, no expansion, no operators,
- *      no redirection, no env-assignment prefix, and no path-qualified binary.
- *   2. Its leading tokens match an entry in the allowlist.
+ *   1. It is syntactically simple: printable ASCII, no expansion, no
+ *      redirection, no subshell, no glob, no env-assignment prefix, and no
+ *      path-qualified binary.
+ *   2. Every command in it matches an entry in the allowlist.
+ *
+ * "Every command", not "the command": a pipeline or a chain is admitted when
+ * each of its segments would be admitted alone. `git log | head` reads exactly
+ * what `git log` and `head` read, and refusing it only taught the agent to run
+ * the same inspection in two calls. Composition is not what makes a command
+ * dangerous — the verbs are, and the allowlist still decides those.
  *
  * Rule 1 is not a policy about which programs are safe — it is what makes rule
  * 2 mean anything. If we cannot say which tokens the shell would run, an
@@ -26,9 +33,16 @@
  * Tokenizing is `shell-quote`'s `parse`, which is a parser rather than a split
  * on whitespace, so ordinary quoted arguments (`grep "foo bar" file`) are read
  * correctly instead of being refused. Operators come back as objects
- * (`{ op: "|" }`, `{ op: ">" }`, `{ op: "glob" }`, comments), so rejecting any
- * non-string element rejects every pipeline, redirect, subshell and glob in one
- * check.
+ * (`{ op: "|" }`, `{ op: ">" }`, `{ op: "glob" }`, comments), which is what
+ * makes the structure visible at all: the four control operators below split
+ * the stream into segments, and **every other** non-string element — redirect,
+ * background, subshell, glob, comment — still rejects the whole command.
+ *
+ * Redirection is refused because `>` writes and `<` changes what a segment
+ * reads from; globs because the pattern is gone by the time we see it, and
+ * `{ op: "glob" }` carries no promise about what it expands to. Both are
+ * separate arguments from pipelines, and neither is needed to make inspection
+ * composable.
  *
  * **A successful parse is not a safety verdict**, and two cases prove it:
  *
@@ -132,13 +146,26 @@ function namesAnOutputFile(tokens: string[]): boolean {
 }
 
 /**
- * The command as the shell would see it, or `undefined` if it contains
- * anything we decline to reason about.
- *
- * Operators, globs and comments all parse to objects rather than strings, so
- * "every element is a string" is the whole structural check.
+ * The operators that separate one command from the next without changing what
+ * either of them does. Anything else structural is refused; see the header.
  */
-function tokenize(command: string): string[] | undefined {
+const SEGMENT_OPERATORS = new Set(["|", "&&", "||", ";"]);
+
+/** Is this parsed element one of the operators we split on? */
+function isSegmentOperator(el: unknown): boolean {
+  if (typeof el !== "object" || el === null) return false;
+  const op = (el as { op?: unknown }).op;
+  return typeof op === "string" && SEGMENT_OPERATORS.has(op);
+}
+
+/**
+ * The commands the shell would run, in order, or `undefined` if the string
+ * contains anything we decline to reason about.
+ *
+ * A segment that comes back empty (`ls |`, `; ls`, `a && && b`) is a syntax we
+ * cannot price, so it fails with the rest rather than being skipped.
+ */
+function tokenizeSegments(command: string): string[][] | undefined {
   let parsed: unknown[];
   try {
     parsed = parse(command) as unknown[];
@@ -146,8 +173,24 @@ function tokenize(command: string): string[] | undefined {
     // A command this parser cannot read is not one we will vouch for.
     return undefined;
   }
-  if (!parsed.every((t): t is string => typeof t === "string")) return undefined;
-  return parsed.filter((t) => t !== "");
+
+  const segments: string[][] = [];
+  let current: string[] = [];
+  for (const el of parsed) {
+    if (typeof el === "string") {
+      // `parse` yields "" where an expansion used to be; the raw-string scan
+      // has already refused those, so this is only tidying.
+      if (el !== "") current.push(el);
+      continue;
+    }
+    if (!isSegmentOperator(el)) return undefined;
+    segments.push(current);
+    current = [];
+  }
+  segments.push(current);
+
+  if (segments.some((s) => s.length === 0)) return undefined;
+  return segments;
 }
 
 /** Entries are written by hand, so they are split the simple way. */
@@ -168,6 +211,19 @@ function matchesEntry(tokens: string[], entry: string): boolean {
   return wanted.every((t, i) => tokens[i] === t);
 }
 
+/** Would this one command, on its own, be admitted? */
+function isReadOnlySegment(tokens: string[], allowed: readonly string[]): boolean {
+  const verb = tokens[0] ?? "";
+
+  // An env-assignment prefix, or a path-qualified binary we cannot vouch for.
+  if (ENV_ASSIGNMENT.test(verb)) return false;
+  if (verb.includes("/")) return false;
+
+  if (namesAnOutputFile(tokens)) return false;
+
+  return allowed.some((entry) => matchesEntry(tokens, entry));
+}
+
 export function isReadOnlyBashCommand(
   command: string,
   allowed: readonly string[] = DEFAULT_READ_ONLY_COMMANDS,
@@ -184,16 +240,9 @@ export function isReadOnlyBashCommand(
 
   if (EXPANSION_CHARS.test(trimmed)) return false;
 
-  const tokens = tokenize(trimmed);
-  if (tokens === undefined || tokens.length === 0) return false;
+  const segments = tokenizeSegments(trimmed);
+  if (segments === undefined || segments.length === 0) return false;
 
-  const verb = tokens[0] ?? "";
-
-  // An env-assignment prefix, or a path-qualified binary we cannot vouch for.
-  if (ENV_ASSIGNMENT.test(verb)) return false;
-  if (verb.includes("/")) return false;
-
-  if (namesAnOutputFile(tokens)) return false;
-
-  return allowed.some((entry) => matchesEntry(tokens, entry));
+  // Every segment, because the weakest link is the one that writes.
+  return segments.every((tokens) => isReadOnlySegment(tokens, allowed));
 }

@@ -148,7 +148,10 @@ driving for this session only, without touching the file.
 | `/pear-explain`                                | Talk the agent through what you changed                   |
 | `/pear-mode [off\|agent-driver\|human-driver]` | Switch mode                                               |
 | `/pear-config`                                 | Every setting, in a picker showing its current value      |
+| `/pear-config <key>`                           | Open one setting, with everything you can do to it        |
 | `/pear-config <key> <value>`                   | Set one setting                                           |
+| `/pear-config <key> default`                   | Put one setting back to what pear ships with              |
+| `/pear-config <key> +a, b` / `-a, b`           | Add to or remove from a list setting                      |
 | `/pear-config <n>`                             | Shorthand for `reviewBudget`                              |
 | `/pear-exclusive`                              | Turn off tools from other extensions                      |
 
@@ -217,11 +220,24 @@ Entries match on leading words, so `git log` covers `git log --oneline -n 5`,
 and a shorter entry is a broader permission — `git` alone would allow every
 subcommand.
 
+Editing the list does not mean retyping it. `/pear-config
+allowedReadOnlyCommands +rg` adds one entry, `-rg` drops one, and `default`
+restores the shipped list; giving a whole comma-separated list still replaces
+it. The same four are on the setting's card, which shows the current list in
+full, so removing an entry is picking it from a list rather than typing it.
+(The shorthand costs you three literal entries: `default`, `reset`, and
+anything starting with `-`. Give the whole list to set one of those.)
+
 A command has to be simple enough to read before the list is consulted at all:
-no expansion (`$…`, backticks), no operators, no redirection, no env prefix, no
-path-qualified binary. Quoted arguments are fine — `grep "foo bar" file` reads
-as three words, because tokenizing is done by a parser rather than by splitting
-on spaces.
+no expansion (`$…`, backticks), no redirection, no globs, no subshells, no env
+prefix, no path-qualified binary. Quoted arguments are fine — `grep "foo bar"
+file` reads as three words, because tokenizing is done by a parser rather than
+by splitting on spaces.
+
+Pipelines and chains are read command by command: `git log --oneline | head -5`
+is inspection because both halves are, and `ls | tee out` is not because `tee`
+is not on the list. Every segment of a `|`, `&&`, `||` or `;` chain faces the
+whole check, so one unrecognised verb anywhere makes the whole line a change.
 
 The defaults include `git diff` and `git show`. They can invoke a pager, an
 external diff driver or a textconv filter, all of which run programs named in

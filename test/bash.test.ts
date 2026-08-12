@@ -38,6 +38,14 @@ const readOnly = [
   // read as an output flag for git alone.
   "grep -o foo f",
   "ls -o",
+  // Composition of read-only commands reads exactly what its parts read.
+  "ls -R core | head -50",
+  "git log --oneline | head -5",
+  "git diff | wc -l",
+  "cat f | grep foo | head -n 3",
+  "grep foo f && wc -l f",
+  "ls; pwd",
+  "git status || git log",
 ];
 
 const mutating = [
@@ -58,10 +66,24 @@ const mutating = [
   "cat `rm -rf x`",
   "cat a > b",
   "cat a >> b",
+  "cat a < b",
+  // One refused segment refuses the whole chain, wherever it sits.
   "cat a | tee out",
   "ls && rm x",
   "ls; rm x",
   "ls || rm x",
+  "rm x | ls",
+  "ls | head > out",
+  "ls | FOO=1 head",
+  "ls | /bin/head",
+  "ls | git diff -o notes.md",
+  // Structure we still decline to reason about, and empty segments.
+  "ls & head",
+  "ls |& head",
+  "ls |",
+  "| ls",
+  "ls ;; pwd",
+  "(ls)",
   "cat <(rm x)",
   "cat <<EOF",
   "FOO=1 ls",
@@ -121,10 +143,24 @@ describe("isReadOnlyBashCommand", () => {
     assert.equal(isReadOnlyBashCommand("echo ${HOME}", ["echo"]), false);
   });
 
-  it("rejects anything that parses to more than plain words", () => {
-    // Pipes, redirects, subshells, globs and comments all come back as objects.
-    for (const cmd of ["ls | head", "ls > out", "ls *.ts", "ls # note", "ls & "]) {
+  it("rejects structure that is not a plain sequence of commands", () => {
+    // Redirects, globs, comments and backgrounding all come back as objects,
+    // and only the four control operators are read as segment separators.
+    for (const cmd of ["ls > out", "ls *.ts", "ls # note", "ls & ", "ls > out | head"]) {
       assert.equal(isReadOnlyBashCommand(cmd, ["ls", "head"]), false, cmd);
+    }
+  });
+
+  it("admits a chain only when every segment would be admitted alone", () => {
+    // The verbs are what the allowlist decides; composition is not.
+    assert.equal(isReadOnlyBashCommand("ls | head", ["ls", "head"]), true);
+    assert.equal(isReadOnlyBashCommand("ls | head", ["ls"]), false, "head is not allowed");
+    assert.equal(isReadOnlyBashCommand("head f | ls", ["ls"]), false, "nor is it in front");
+    // Each segment gets the whole gate, not just the allowlist.
+    assert.equal(isReadOnlyBashCommand("ls | head --output=x", ["ls", "head"]), false);
+    // An empty segment is a syntax we cannot price, so it fails with the rest.
+    for (const cmd of ["ls |", "| ls", "ls && && ls"]) {
+      assert.equal(isReadOnlyBashCommand(cmd, ["ls"]), false, cmd);
     }
   });
 
@@ -164,7 +200,9 @@ describe("isReadOnlyBashCommand", () => {
     // Rule 1 is not configurable: an allowlisted verb inside untrustworthy
     // shell syntax is still refused.
     assert.equal(isReadOnlyBashCommand("rm -rf /", ["rm"]), true, "the list is the policy");
-    assert.equal(isReadOnlyBashCommand("ls; rm x", ["ls", "rm"]), false);
+    // ...but a chain of allowlisted commands is now the list's decision too.
+    assert.equal(isReadOnlyBashCommand("ls; rm x", ["ls", "rm"]), true, "the list is the policy");
+    assert.equal(isReadOnlyBashCommand("ls; rm x", ["ls"]), false);
     assert.equal(isReadOnlyBashCommand("ls > out", ["ls"]), false);
     assert.equal(isReadOnlyBashCommand("FOO=1 ls", ["ls", "FOO=1"]), false);
     assert.equal(isReadOnlyBashCommand("cat --output=out", ["cat"]), false);

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import pear from "../adapters/pi/extensions/pear.ts";
-import { saveConfig, type PearConfig } from "../core/config.ts";
+import { DEFAULTS, saveConfig, type PearConfig } from "../core/config.ts";
 
 /* ------------------------------------------------------------------ fakes */
 
@@ -109,6 +109,8 @@ function fakeCtx(opts: CtxOptions) {
   const widgets: Array<[string, string[] | undefined]> = [];
   const queue = [...(opts.selectAnswers ?? [])];
   let abortCalls = 0;
+  // Mutable so a test can answer two cards differently — revise, then approve.
+  let cardAnswer = opts.cardAnswer;
 
   const mode = opts.mode ?? "tui";
   const ctx = {
@@ -126,7 +128,7 @@ function fakeCtx(opts: CtxOptions) {
       setStatus: (k: string, t: string | undefined) => statuses.push([k, t]),
       custom: async (_factory: unknown) => {
         if (opts.customThrows) throw opts.customThrows;
-        return opts.cardAnswer ?? null;
+        return cardAnswer ?? null;
       },
       select: async (title: string, options: string[]) => {
         selects.push({ title, options });
@@ -152,6 +154,10 @@ function fakeCtx(opts: CtxOptions) {
     /** The agent's turn ended. */
     setIdle: (next: boolean) => {
       idle = next;
+    },
+    /** Answer the next card differently from the last one. */
+    setCardAnswer: (next: unknown) => {
+      cardAnswer = next;
     },
   };
 }
@@ -682,34 +688,58 @@ describe("the plan tool", () => {
     assert.match(decision?.reason ?? "", /no plan is approved/);
   });
 
-  it("approving saves the plan to .pear/plans and names the SNAPSHOT path", async () => {
+  it("approving saves the plan under its own name and reports that path", async () => {
     const b = await boot(driver({ planPhase: true }));
     const res = await approvePlan(b);
-    assert.match(res.content[0].text, /Saved to/);
-    // The snapshot, not latest.md: the next draft overwrites latest.md, so
-    // quoting it would send the human to a plan this one may have superseded.
-    assert.match(res.content[0].text, /\.pear\/plans\/approved-.*\.md/);
-    assert.doesNotMatch(res.content[0].text, /latest\.md/);
+    // The name is the plan's, so the path stays true: superseding this plan
+    // means writing a different file, not overwriting this one.
+    assert.match(res.content[0].text, /Saved to .*\.pear\/plans\/do-the-thing-[0-9a-z]{6}\.md/);
 
     const plans = readdirSync(join(b.cwd, ".pear", "plans"));
-    const latest = readFileSync(join(b.cwd, ".pear", "plans", "latest.md"), "utf8");
-    assert.match(latest, /Do the thing\./);
-    assert.match(latest, /1\. First/);
-    assert.equal(plans.filter((f) => f.startsWith("approved-")).length, 1, "one snapshot");
+    assert.equal(plans.length, 1, "one plan, one file");
+    const saved = readFileSync(join(b.cwd, ".pear", "plans", plans[0]), "utf8");
+    assert.match(saved, /# pear plan · approved/);
+    assert.match(saved, /Do the thing\./);
+    assert.match(saved, /1\. First/);
   });
 
-  it("a rejected proposal still lands in latest.md, but gets no snapshot", async () => {
+  it("saves a rejected proposal too, marked as a draft", async () => {
+    const b = await boot({
+      ...driver({ planPhase: true }),
+      cardAnswer: { kind: "revise", text: "test first" },
+    });
+    const res = await b.tools.get("pear_plan")?.execute("p", PLAN_ARGS, undefined, undefined, b.ctx);
+    // Told where it went: being able to go back to a draft is the point of
+    // naming these at all.
+    assert.match(res.content[0].text, /Saved to .*do-the-thing-[0-9a-z]{6}\.md/);
+    const plans = readdirSync(join(b.cwd, ".pear", "plans"));
+    assert.equal(plans.length, 1);
+    const saved = readFileSync(join(b.cwd, ".pear", "plans", plans[0]), "utf8");
+    assert.match(saved, /# pear plan · draft/);
+    assert.match(saved, /Do the thing\./);
+  });
+
+  it("rewrites the same file as a plan is revised and then approved", async () => {
+    // The filename is frozen at the first draft, so a reworded revision cannot
+    // start writing somewhere else and leave the plan split across two files.
     const b = await boot({
       ...driver({ planPhase: true }),
       cardAnswer: { kind: "revise", text: "test first" },
     });
     await b.tools.get("pear_plan")?.execute("p", PLAN_ARGS, undefined, undefined, b.ctx);
-    const latest = readFileSync(join(b.cwd, ".pear", "plans", "latest.md"), "utf8");
-    assert.match(latest, /Do the thing\./);
-    const snapshots = readdirSync(join(b.cwd, ".pear", "plans")).filter((f) =>
-      f.startsWith("approved-"),
-    );
-    assert.equal(snapshots.length, 0);
+    const first = readdirSync(join(b.cwd, ".pear", "plans"));
+    assert.equal(first.length, 1);
+
+    b.setCardAnswer({ kind: "approve" });
+    const res = await b.tools
+      .get("pear_plan")
+      ?.execute("p2", { ...PLAN_ARGS, summary: "Reworded entirely" }, undefined, undefined, b.ctx);
+
+    assert.deepEqual(readdirSync(join(b.cwd, ".pear", "plans")), first, "still one file");
+    assert.ok(res.content[0].text.includes(first[0]), "and it is the one reported");
+    const saved = readFileSync(join(b.cwd, ".pear", "plans", first[0]), "utf8");
+    assert.match(saved, /# pear plan · approved/);
+    assert.match(saved, /Reworded entirely/);
   });
 
   it("is out of phase once a plan exists", async () => {
@@ -1053,6 +1083,49 @@ describe("/pear-config", () => {
     const b = await boot(driver());
     await b.commands.get("pear-config")?.handler("0", b.ctx);
     assert.ok(b.notifications.some((n) => n.type === "error"));
+  });
+
+  it("adds and removes one command without disturbing the rest of the list", async () => {
+    const b = await boot(driver({ allowedReadOnlyCommands: ["ls", "cat"] }));
+    const config = () => b.commands.get("pear-config")?.handler;
+
+    await config()?.("allowedReadOnlyCommands +rg", b.ctx);
+    let onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
+    assert.deepEqual(onDisk.allowedReadOnlyCommands, ["ls", "cat", "rg"]);
+
+    await config()?.("allowedReadOnlyCommands -cat", b.ctx);
+    onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
+    assert.deepEqual(onDisk.allowedReadOnlyCommands, ["ls", "rg"]);
+  });
+
+  it("puts a setting back to its default", async () => {
+    const b = await boot(driver({ allowedReadOnlyCommands: ["ls"] }));
+    await b.commands.get("pear-config")?.handler("allowedReadOnlyCommands default", b.ctx);
+
+    const onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
+    assert.deepEqual(onDisk.allowedReadOnlyCommands, [...DEFAULTS.allowedReadOnlyCommands]);
+  });
+
+  it("reports a key given on its own instead of emptying it", async () => {
+    // The old parse read a missing value as "set the list to nothing", so
+    // asking what the list was wiped it.
+    const b = await boot({
+      config: { allowedReadOnlyCommands: ["ls", "cat"] },
+      mode: "print",
+      hasUI: false,
+    });
+    await b.commands.get("pear-config")?.handler("allowedReadOnlyCommands", b.ctx);
+
+    const onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
+    assert.deepEqual(onDisk.allowedReadOnlyCommands, ["ls", "cat"]);
+    assert.ok(b.notifications.some((n) => /allowedReadOnlyCommands = ls, cat/.test(n.message)));
+  });
+
+  it("says nothing changed rather than writing a no-op edit", async () => {
+    const b = await boot(driver({ allowedReadOnlyCommands: ["ls"] }));
+    await b.commands.get("pear-config")?.handler("allowedReadOnlyCommands -rg", b.ctx);
+
+    assert.ok(b.notifications.some((n) => /nothing changed/.test(n.message)));
   });
 });
 

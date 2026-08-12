@@ -29,9 +29,12 @@ you cannot type, that is a bug regardless of anything else on this list.
    numbered step-by-step guide, still open, risks — each section only when
    real. A second proposal in the same scoping round shows *draft N* in the
    title.
-5b. Every proposal lands in `.pear/plans/latest.md`; approving also writes a
-   timestamped `approved-*.md` snapshot, and the approval result names the
-   path. `/pear-plan` shows where the plan is saved.
+5b. Every proposal lands in `.pear/plans/<slug>-<id>.md`, named after the
+   summary it was first proposed under, and the result names that path.
+   Revising rewrites the *same* file — reword the summary and check no second
+   file appears — and approving rewrites it once more with an `approved`
+   header. `/pear` then re-scoping writes a new file, leaving the approved one
+   alone. `/pear-plan` shows where the plan is saved.
 5c. A plan with open questions carries them visibly on the card, and the
    building persona tells the agent to settle them at the first checkpoint
    rather than guessing.
@@ -160,14 +163,24 @@ Unit tests price the windowing but cannot see it. These need eyes.
 
 ## J. Settings
 
-54. `/pear-config` with no arguments lists every key with its current value.
-    Booleans and `mode` offer a pick rather than a text box; Esc at either step
-    leaves everything unchanged.
+54. `/pear-config` with no arguments opens the settings card: one line per key,
+    each value elided to fit, never wrapped. Choosing one opens its own card;
+    Esc there goes back to the picker, Esc at the picker closes. Booleans and
+    `mode` offer a pick rather than a text box.
 55. `/pear-config statusIcon true` — the status line and the human-driver nudge
     switch to 🍐 immediately, and notifications still say "pear" in words.
 56. `/pear-config pollMs 500` then edit a file: the nudge appears sooner. The
     watcher is rebuilt, so it re-adopts the current tree — work already in the
     tree at that moment is not re-raised until you touch something again.
-57. `/pear-config allowedReadOnlyCommands ls, cat` — the list *replaces* the
-    defaults, so `git status` starts costing review points. Set it back with
-    `/pear-config` and no value to see the current list first.
+57. `/pear-config allowedReadOnlyCommands ls, cat` — a whole list still
+    *replaces* the defaults, so `git status` starts costing review points.
+    `default` puts them back.
+58. `/pear-config allowedReadOnlyCommands +rg` then `-rg` — each edits one
+    entry and leaves the rest alone. Repeating either says "nothing changed"
+    and writes nothing.
+59. `/pear-config allowedReadOnlyCommands` on its own opens that setting's
+    card with the full list in the body — it does **not** empty the list, which
+    is what the argument form used to do. Add three commands from the card in a
+    row: it returns to the same card each time, with the new value shown.
+60. Set the list long enough to overflow the terminal: the card body scrolls
+    with PgUp/PgDn and the options below it stay put.
