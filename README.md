@@ -1,15 +1,4 @@
-```
-         |/
-        (_)
-       .' '.
-      /     \
-     |       |
-     |       |
-      \     /
-       `---'
-```
-
-# pear
+# 🍐 pear
 
 A pair-programming loop for [pi](https://github.com/earendil-works/pi). You agree
 an approach together, then the agent drives and you navigate — it works in
@@ -62,7 +51,7 @@ Requires Node >= 22.19 (`.tool-versions` pins the version used here).
 
 ## The loop
 
-**1. Agree the approach.** A session starts in the *scoping* phase. The agent
+**1. Agree the approach.** A session starts in the _scoping_ phase. The agent
 can read, search, and run read-only commands, but it cannot edit anything. It
 asks you about anything genuinely ambiguous, then proposes a plan:
 
@@ -83,13 +72,13 @@ asks you about anything genuinely ambiguous, then proposes a plan:
 **2. Build against it.** Once you approve, editing opens and the plan becomes
 the shared frame: every checkpoint summary is reported against it. Four answers:
 
-| Answer | What happens |
-| --- | --- |
-| **Keep going** | Carry on with what it said was next |
+| Answer                      | What happens                                                   |
+| --------------------------- | -------------------------------------------------------------- |
+| **Keep going**              | Carry on with what it said was next                            |
 | **Walk me through a file…** | It explains that file, makes no edits, and the card comes back |
-| **Change direction…** | Your words replace its plan for what comes next |
-| **Stop here** | Turn ends, no more changes until you speak |
-| *Escape* | Turn ends, nothing acknowledged, nothing latched — just talk |
+| **Change direction…**       | Your words replace its plan for what comes next                |
+| **Stop here**               | Turn ends, no more changes until you speak                     |
+| _Escape_                    | Turn ends, nothing acknowledged, nothing latched — just talk   |
 
 "Walk me through a file" is the one worth knowing about. The agent is never
 parked waiting on you, so it can actually answer — it explains, then re-opens
@@ -121,7 +110,7 @@ Keep going and eventually it speaks up on its own:
 When you answer, pear attaches the actual diff to your message. The agent reads
 both and tells you where they disagree — which is the point. Explaining code out
 loud is when you notice it's wrong, and a reader with the diff in hand catches
-the cases where what you *think* you wrote and what you wrote have drifted apart.
+the cases where what you _think_ you wrote and what you wrote have drifted apart.
 
 `/pear-explain` starts that conversation whenever you want it. **The agent cannot
 edit anything while you're driving** — if it wants to change something, it says
@@ -133,11 +122,11 @@ message.
 
 ## Modes
 
-| Mode | Behaviour |
-| --- | --- |
-| `off` (default) | pear does nothing |
-| `agent-driver` | The agent builds; you review at checkpoints |
-| `human-driver` | You build; the agent watches and asks you to explain |
+| Mode            | Behaviour                                            |
+| --------------- | ---------------------------------------------------- |
+| `off` (default) | pear does nothing                                    |
+| `agent-driver`  | The agent builds; you review at checkpoints          |
+| `human-driver`  | You build; the agent watches and asks you to explain |
 
 Mode is per-project, stored in `.pear/config.json`. `/pear-swap` changes who is
 driving for this session only, without touching the file.
@@ -149,43 +138,43 @@ driving for this session only, without touching the file.
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `/pear` | Throw out the plan and go back to scoping |
-| `/pear-plan` | Show the plan you agreed to |
-| `/pear-status` | Mode, phase, review load, and what's outstanding |
-| `/pear-checkpoint` | Open a checkpoint yourself, without waiting for the agent |
-| `/pear-swap` | Hand the keyboard over, either way |
-| `/pear-explain` | Talk the agent through what you changed |
-| `/pear-mode [off\|agent-driver\|human-driver]` | Switch mode |
-| `/pear-config` | Every setting, in a picker showing its current value |
-| `/pear-config <key> <value>` | Set one setting |
-| `/pear-config <n>` | Shorthand for `reviewBudget` |
-| `/pear-exclusive` | Turn off tools from other extensions |
+| Command                                        | What it does                                              |
+| ---------------------------------------------- | --------------------------------------------------------- |
+| `/pear`                                        | Throw out the plan and go back to scoping                 |
+| `/pear-plan`                                   | Show the plan you agreed to                               |
+| `/pear-status`                                 | Mode, phase, review load, and what's outstanding          |
+| `/pear-checkpoint`                             | Open a checkpoint yourself, without waiting for the agent |
+| `/pear-swap`                                   | Hand the keyboard over, either way                        |
+| `/pear-explain`                                | Talk the agent through what you changed                   |
+| `/pear-mode [off\|agent-driver\|human-driver]` | Switch mode                                               |
+| `/pear-config`                                 | Every setting, in a picker showing its current value      |
+| `/pear-config <key> <value>`                   | Set one setting                                           |
+| `/pear-config <n>`                             | Shorthand for `reviewBudget`                              |
+| `/pear-exclusive`                              | Turn off tools from other extensions                      |
 
 ## How the pacing works
 
-The agent is *asked* to check in at coherent boundaries, and mostly will. The
+The agent is _asked_ to check in at coherent boundaries, and mostly will. The
 prompt is not the enforcement, though.
 
 pear scores how much there is for you to **read** since you last looked, in
 review-load points:
 
-| | Points |
-| --- | --- |
-| Each distinct file touched | 40 |
-| Each line in an `edit` hunk (both sides — a diff shows both) | 1 |
-| Each line of a `write` | 1 |
-| A `bash` command that isn't provably read-only | 60 |
+|                                                              | Points |
+| ------------------------------------------------------------ | ------ |
+| Each distinct file touched                                   | 40     |
+| Each line in an `edit` hunk (both sides — a diff shows both) | 1      |
+| Each line of a `write`                                       | 1      |
+| A `bash` command that isn't provably read-only               | 60     |
 
 Against a default budget of 200:
 
-| Load | Agent driving | You driving |
-| --- | --- | --- |
-| under 100 | nothing | nothing |
-| 100–199 | mentions it on the next tool result | nudge appears |
-| 200+ | says a checkpoint is due | nudge firms up |
-| 400+ | blocks further changes | starts a turn asking you to explain |
+| Load      | Agent driving                       | You driving                         |
+| --------- | ----------------------------------- | ----------------------------------- |
+| under 100 | nothing                             | nothing                             |
+| 100–199   | mentions it on the next tool result | nudge appears                       |
+| 200+      | says a checkpoint is due            | nudge firms up                      |
+| 400+      | blocks further changes              | starts a turn asking you to explain |
 
 When you're driving there is nothing to block, so the budget's top tier starts a
 conversation instead. The score is measured from git rather than from tool
@@ -196,11 +185,11 @@ conversation, so pear subtracts what it has already shown the agent. Two lines
 after explaining a 400-line change score 2, not 402. Commit, and the credit
 resets with the tree.
 
-Counting *review load* rather than tool calls is the point. Five one-line edits
+Counting _review load_ rather than tool calls is the point. Five one-line edits
 to one file score 50 and pass in silence; one 400-line `write` scores 440 and
 blocks everything after it. A call-counting budget got both of those backwards.
 
-The gate is **admit-first**: it looks at the load accrued *before* the call it
+The gate is **admit-first**: it looks at the load accrued _before_ the call it
 is considering. A single oversized change always runs, and the block lands on
 the next one — blocking the first write of a window would force a checkpoint
 with nothing to review yet.
@@ -237,7 +226,7 @@ on spaces.
 The defaults include `git diff` and `git show`. They can invoke a pager, an
 external diff driver or a textconv filter, all of which run programs named in
 git config — that risk is accepted, because reading the diff is most of what
-inspection is *for*, and the config that would exploit it lives in the repo
+inspection is _for_, and the config that would exploit it lives in the repo
 whose test suite the agent already runs. Take them off the list if you disagree.
 The one thing the list cannot permit is a flag that names a file to write
 (`--output` anywhere, `-o` for git), since that is the definition of not
@@ -246,7 +235,7 @@ read-only.
 ## What the file list means
 
 The checkpoint shows a **git-derived** list of what actually changed since the
-last checkpoint, and separately any file the agent *claims* it touched that git
+last checkpoint, and separately any file the agent _claims_ it touched that git
 did not corroborate. If the agent under-reports, you see it.
 
 That list is best-effort on purpose. It comes from `git status --porcelain=v2`,
@@ -262,11 +251,11 @@ inputs. A wrong file list can never wedge or bypass the loop.
 
 A checkpoint needs a human, so pear only runs where one can answer:
 
-| pi mode | Cards | Human-driver nudge |
-| --- | --- | --- |
-| TUI | Full card, inline editor, file sub-select | Yes |
-| RPC | The same card as select/input dialogs | No — the turn arrives with no warning shot |
-| print / json | pear runs `off` for that session, with a warning | — |
+| pi mode      | Cards                                            | Human-driver nudge                         |
+| ------------ | ------------------------------------------------ | ------------------------------------------ |
+| TUI          | Full card, inline editor, file sub-select        | Yes                                        |
+| RPC          | The same card as select/input dialogs            | No — the turn arrives with no warning shot |
+| print / json | pear runs `off` for that session, with a warning | —                                          |
 
 `human-driver` also needs a git repository, since git is how it sees what you
 changed. Outside one it runs `off` for the session and says so, leaving your
@@ -307,20 +296,20 @@ Every one of these is settable from `/pear-config`, which shows the current
 value of each and validates what you type against the same rules a file write
 uses.
 
-| Key | Default | What it does |
-| --- | --- | --- |
-| `mode` | `off` | `off`, `agent-driver`, or `human-driver` |
-| `reviewBudget` | 200 | Review points allowed between checkpoints (40–100000) |
-| `planPhase` | true | Start in scoping, with editing closed until a plan is approved |
-| `exclusive` | false | Turn off tools from other extensions at session start |
-| `statusIcon` | false | Show 🍐 instead of the word, in the status line and the nudge |
-| `nudge` | true | Show the passive line above your prompt while you drive |
-| `pollMs` | 2000 | How often your working tree is checked (250–60000) |
-| `debounceMs` | 8000 | How long the tree must be quiet before it is priced (500–600000) |
-| `maxPollFailures` | 5 | Consecutive git errors before pear stops watching |
-| `softFraction` | 0.5 | Share of the budget at which pear starts mentioning it |
-| `blockMultiple` | 2 | Multiple of the budget at which changes are refused |
-| `allowedReadOnlyCommands` | see above | Commands that count as inspection rather than change |
+| Key                       | Default   | What it does                                                     |
+| ------------------------- | --------- | ---------------------------------------------------------------- |
+| `mode`                    | `off`     | `off`, `agent-driver`, or `human-driver`                         |
+| `reviewBudget`            | 200       | Review points allowed between checkpoints (40–100000)            |
+| `planPhase`               | true      | Start in scoping, with editing closed until a plan is approved   |
+| `exclusive`               | false     | Turn off tools from other extensions at session start            |
+| `statusIcon`              | false     | Show 🍐 instead of the word, in the status line and the nudge    |
+| `nudge`                   | true      | Show the passive line above your prompt while you drive          |
+| `pollMs`                  | 2000      | How often your working tree is checked (250–60000)               |
+| `debounceMs`              | 8000      | How long the tree must be quiet before it is priced (500–600000) |
+| `maxPollFailures`         | 5         | Consecutive git errors before pear stops watching                |
+| `softFraction`            | 0.5       | Share of the budget at which pear starts mentioning it           |
+| `blockMultiple`           | 2         | Multiple of the budget at which changes are refused              |
+| `allowedReadOnlyCommands` | see above | Commands that count as inspection rather than change             |
 
 - `planPhase: false` skips scoping and starts building immediately, and is the
   one key that only takes effect on the next session.
@@ -356,7 +345,7 @@ surface pear relies on is verified against the pinned pi version in
 extension that re-checks those API facts against a real pi session.
 
 Behaviour that needs a live model and a terminal — how the cadence actually
-*feels* — is in [`scripts/manual-checklist.md`](scripts/manual-checklist.md).
+_feels_ — is in [`scripts/manual-checklist.md`](scripts/manual-checklist.md).
 
 ## Layout
 
