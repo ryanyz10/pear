@@ -12,7 +12,13 @@
 import type { ExtensionAPI, ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { captureGitState } from "../../../core/git.ts";
+import { pointsForWorkingTree } from "../../../core/load.ts";
+import {
+  captureGitState,
+  changedLineStats,
+  isGitRepo,
+  workingDiffText,
+} from "../../../core/git.ts";
 import {
   ConfigWriteError,
   MAX_BUDGET,
@@ -30,12 +36,19 @@ import {
   CHECKPOINT_TOOL_NAME,
   PLAN_TOOL_DESCRIPTION,
   PLAN_TOOL_NAME,
+  NOTHING_TO_EXPLAIN,
   SCOPING_PERSONA,
   buildPersona,
   formatPlan,
+  humanDriverPersona,
+  nudgeLines,
+  parkedNotice,
+  quizPrompt,
   resultCheckpointFailed,
+  withDiff,
   type PlanSpec,
 } from "../../../core/prompts.ts";
+import { createWatcher, type WatchEffect, type Watcher } from "../../../core/watch.ts";
 import { askCard } from "../cards/ask.ts";
 import { renderCard, type CardSpec } from "../cards/card.ts";
 import { checkpointCard, type CheckpointView } from "../cards/checkpoint.ts";
@@ -79,6 +92,17 @@ type CardDetails = {
 /** Session entry type used to persist the approved plan across reloads. */
 const PLAN_ENTRY = "pear-plan";
 
+/**
+ * How often the human-driver watcher looks at the working tree.
+ *
+ * Cheap by construction: the poll only hashes files git already reports as
+ * dirty, and the expensive line-counting read happens once the tree settles.
+ */
+const POLL_MS = 2_000;
+
+/** Widget key for the passive nudge. Keyed so re-setting it refreshes in place. */
+const NUDGE_KEY = "pear-nudge";
+
 /** Tools removed while scoping. `bash` stays, gated per-command by the hook. */
 const WRITE_TOOLS = new Set(["edit", "write"]);
 
@@ -104,7 +128,21 @@ function isPlanSpec(value: unknown): value is PlanSpec {
   );
 }
 
-export default function pear(pi: ExtensionAPI) {
+/**
+ * Injectable timer, so the watcher's lifecycle is testable without a real
+ * clock. pi calls the factory with one argument; this is only ever supplied by
+ * tests.
+ */
+export type PearHooks = {
+  setInterval?: (fn: () => void, ms: number) => { unref?: () => void };
+  clearInterval?: (handle: never) => void;
+  now?: () => number;
+};
+
+export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
+  const startTimer = hooks.setInterval ?? ((fn, ms) => setInterval(fn, ms));
+  const stopTimer = hooks.clearInterval ?? ((h) => clearInterval(h));
+  const now = hooks.now ?? (() => Date.now());
   // `runtime.mode` is the single source of truth for the mode this session is
   // actually running, which can differ from what is on disk (see the headless
   // policy below). Deliberately not mirrored in a second variable.
@@ -180,12 +218,197 @@ export default function pear(pi: ExtensionAPI) {
     return foreign;
   };
 
-  /** Keep the tool set consistent with the phase pear is actually in. */
+  /**
+   * Keep the tool set consistent with who may edit right now.
+   *
+   * Two situations remove the write tools, for the same reason: nothing the
+   * agent does should touch the tree. Before a plan exists, and whenever the
+   * human is the one driving.
+   */
   const syncPhaseTools = () => {
     if (runtime === null) return;
-    if (runtime.mode === "agent-driver" && runtime.phase === "scoping") suppressWriteTools();
-    else restoreWriteTools();
+    const agentMayEdit =
+      runtime.mode !== "off" && runtime.phase === "building" && runtime.driver === "agent";
+    if (agentMayEdit) restoreWriteTools();
+    else suppressWriteTools();
   };
+
+  // ----------------------------------------------------------- the watcher
+
+  let watcher: Watcher | null = null;
+  let pollTimer: { unref?: () => void } | null = null;
+
+  /**
+   * Start watching the working tree.
+   *
+   * Started here rather than in the extension factory, which pi documents as a
+   * hard rule (`extensions.md:220`): a factory can run in an invocation that
+   * never opens a session, and a timer started there would leak. Session
+   * switches re-fire `session_start`/`session_shutdown`, so this self-heals.
+   */
+  const startWatching = (ctx: ExtensionContext): void => {
+    stopWatching(ctx);
+    if (runtime === null || runtime.driver !== "human") return;
+
+    watcher = createWatcher({
+      sample: () => {
+        const state = captureGitState(ctx.cwd);
+        if (!state.ok) return { ok: false, detail: state.detail };
+        // The per-file token map already fingerprints content, so joining it is
+        // a content-sensitive "has anything moved" signal for free.
+        const token = [...state.files].map(([path, t]) => `${path}\u0000${t}`).sort().join("\n");
+        return { ok: true, token };
+      },
+      measure: () => {
+        const result = changedLineStats(ctx.cwd);
+        return result.ok
+          ? { ok: true, ...result.stats }
+          : { ok: false, detail: result.detail };
+      },
+      budget: () => runtime?.reviewBudget ?? 0,
+      now,
+      emit: (effect) => {
+        void onWatchEffect(ctx, effect);
+      },
+    });
+
+    pollTimer = startTimer(() => {
+      try {
+        watcher?.tick();
+      } catch {
+        // A throw here would take down the interval and silently stop watching.
+        // The watcher's own failure counter is what handles persistent trouble.
+      }
+    }, POLL_MS);
+    // Never hold the process open just to poll.
+    pollTimer.unref?.();
+  };
+
+  const stopWatching = (ctx: ExtensionContext): void => {
+    if (pollTimer !== null) {
+      stopTimer(pollTimer as never);
+      pollTimer = null;
+    }
+    watcher?.stop();
+    watcher = null;
+    try {
+      ctx.ui.setWidget(NUDGE_KEY, undefined);
+    } catch {
+      /* the widget is cosmetic */
+    }
+  };
+
+  /** Keep the watcher running exactly when the human is driving. */
+  const syncWatcher = (ctx: ExtensionContext): void => {
+    if (runtime !== null && runtime.driver === "human" && runtime.mode !== "off") {
+      startWatching(ctx);
+    } else {
+      stopWatching(ctx);
+    }
+  };
+
+  async function onWatchEffect(ctx: ExtensionContext, effect: WatchEffect): Promise<void> {
+    const rt = runtime;
+    if (rt === null) return;
+
+    switch (effect.kind) {
+      case "nudge":
+        rt.setWorkingTreeLoad(effect.points);
+        try {
+          ctx.ui.setWidget(
+            NUDGE_KEY,
+            nudgeLines(effect.files, effect.insertions + effect.deletions, effect.tier === "due"),
+            { placement: "aboveEditor" },
+          );
+        } catch {
+          /* setWidget is TUI-only; RPC simply gets no warning shot */
+        }
+        refreshStatus(ctx);
+        return;
+
+      case "clear":
+        try {
+          ctx.ui.setWidget(NUDGE_KEY, undefined);
+        } catch {
+          /* cosmetic */
+        }
+        refreshStatus(ctx);
+        return;
+
+      case "trigger": {
+        rt.setWorkingTreeLoad(effect.points);
+        const asked = startQuiz(ctx, effect.files, effect.insertions, effect.deletions);
+        // The watcher parks itself on `triggered` waiting to be answered. If the
+        // question never got out, nothing will ever answer it, and without this
+        // the watcher would go quiet for the rest of the session.
+        if (!asked) watcher?.rearm();
+        return;
+      }
+
+      case "parked":
+        stopWatching(ctx);
+        ctx.ui.notify(parkedNotice(effect.detail), "warning");
+        refreshStatus(ctx);
+        return;
+
+      case "none":
+        return;
+    }
+  }
+
+  /**
+   * Ask the human to explain themselves, by starting a turn.
+   *
+   * `sendUserMessage` rather than `sendMessage({triggerTurn: true})`: only the
+   * former routes through pi's `prompt()`, which is what fires
+   * `before_agent_start` and therefore injects the navigator persona. The
+   * latter calls the agent directly and the model would have no idea it is
+   * reviewing.
+   */
+  /** @returns whether the question was actually delivered. */
+  function startQuiz(
+    ctx: ExtensionContext,
+    files: number,
+    insertions: number,
+    deletions: number,
+    /** `/pear-explain` — asked for deliberately, so don't second-guess timing. */
+    manual = false,
+  ): boolean {
+    const rt = runtime;
+    if (rt === null) return false;
+
+    // A turn started mid-stream throws, so the idle check holds either way.
+    if (!ctx.isIdle()) {
+      if (manual) {
+        ctx.ui.notify("pear: the agent is mid-turn — try /pear-explain again in a moment.", "warning");
+      }
+      return false;
+    }
+    // The editor check only guards *unprompted* turns: auto-triggering
+    // underneath a half-typed message buries what the human was writing. Typing
+    // the command is itself the answer to "is now a good time?".
+    if (!manual) {
+      try {
+        if (ctx.ui.getEditorText().trim() !== "") return false;
+      } catch {
+        /* no editor to check outside the TUI; the idle check stands alone */
+      }
+    }
+
+    const { files: paths } = rt.filesSinceBaseline();
+    rt.beginQuiz();
+    try {
+      ctx.ui.setWidget(NUDGE_KEY, undefined);
+    } catch {
+      /* cosmetic */
+    }
+    // Prefer git's named paths; fall back to the count when the file list is
+    // unavailable, so the agent is still told the scale of what changed.
+    const named = paths.length > 0 ? paths : Array.from({ length: files }, () => "(unnamed)");
+    pi.sendUserMessage(quizPrompt(named, insertions, deletions));
+    refreshStatus(ctx);
+    return true;
+  }
 
   // ----------------------------------------------------------------- session
 
@@ -217,10 +440,21 @@ export default function pear(pi: ExtensionAPI) {
 
     // Headless fail-closed: never approve changes without a human present.
     let startMode: Mode = loaded.config.mode;
-    if (startMode === "agent-driver" && !canShowDialogs(ctx)) {
+    if (startMode !== "off" && !canShowDialogs(ctx)) {
       ctx.ui.notify(
-        "pear: agent-driver needs an interactive session to show checkpoints — running off for this session. " +
+        "pear: needs an interactive session to check in with you — running off for this session. " +
           "Config unchanged.",
+        "warning",
+      );
+      startMode = "off";
+    }
+
+    // human-driver detects the human's edits through git and has no other way
+    // to see them, so outside a repo there is nothing to fall back to.
+    if (startMode === "human-driver" && !isGitRepo(ctx.cwd)) {
+      ctx.ui.notify(
+        "pear: human-driver needs a git repository to see what you change — running off for this " +
+          "session. Config unchanged.",
         "warning",
       );
       startMode = "off";
@@ -235,7 +469,7 @@ export default function pear(pi: ExtensionAPI) {
 
     // A plan approved earlier in this session survives a reload, so the loop
     // does not silently drop back into scoping and re-litigate it.
-    if (startMode === "agent-driver" && loaded.config.planPhase) {
+    if (startMode !== "off" && loaded.config.planPhase) {
       const recovered = recoverPlan(ctx);
       if (recovered !== undefined) {
         runtime.restorePlan(recovered);
@@ -244,8 +478,9 @@ export default function pear(pi: ExtensionAPI) {
     }
 
     syncPhaseTools();
+    syncWatcher(ctx);
 
-    if (startMode === "agent-driver") {
+    if (startMode !== "off") {
       if (loaded.config.exclusive) {
         const dropped = applyExclusive(ctx);
         if (dropped.length > 0) {
@@ -280,19 +515,27 @@ export default function pear(pi: ExtensionAPI) {
     return found;
   }
 
-  // A pending card must not outlive the session (quit, reload, fork, ...).
-  pi.on("session_shutdown", () => {
+  /**
+   * Nothing may outlive the session — neither a pending card nor a timer.
+   * Session switches re-fire `session_start` afterwards, so a fresh watcher is
+   * built for the new session rather than the old one leaking into it.
+   */
+  pi.on("session_shutdown", (_event, ctx) => {
     runtime?.resolvePending({ kind: "dismissed" });
+    stopWatching(ctx);
   });
 
   // ----------------------------------------------------------------- persona
 
   pi.on("before_agent_start", (event) => {
-    if (runtime === null || runtime.mode !== "agent-driver") return undefined;
+    if (runtime === null || runtime.mode === "off") return undefined;
+    const plan = runtime.planText() ?? "(no plan was recorded — ask what they want.)";
     const persona =
       runtime.phase === "scoping"
         ? SCOPING_PERSONA
-        : buildPersona(runtime.planText() ?? "(no plan was recorded — ask what they want.)");
+        : runtime.driver === "human"
+          ? humanDriverPersona(plan)
+          : buildPersona(plan);
     return { systemPrompt: `${event.systemPrompt}\n\n${persona}` };
   });
 
@@ -329,12 +572,26 @@ export default function pear(pi: ExtensionAPI) {
    * override the human.
    */
   pi.on("input", (event, ctx) => {
-    if (runtime === null) return undefined;
-    if (event.source !== "extension") {
-      runtime.onUserInput();
-      refreshStatus(ctx);
-    }
-    return undefined;
+    const rt = runtime;
+    if (rt === null) return undefined;
+    // pear's own injected quiz must not clear the holds it just set, nor get a
+    // diff stapled to itself.
+    if (event.source === "extension") return undefined;
+
+    const wasQuizzing = rt.quizzing;
+    rt.onUserInput();
+    if (wasQuizzing) rt.onQuizReply();
+    refreshStatus(ctx);
+    if (!wasQuizzing) return undefined;
+
+    // This is the human's explanation. Attach what actually changed so the
+    // agent can compare the two in a single turn — the mismatch between them
+    // is the most valuable thing it can find.
+    const diff = workingDiffText(ctx.cwd);
+    // No diff, or an unreadable one, means the explanation goes through as the
+    // human wrote it. Better than breaking their turn over a git hiccup.
+    if (diff === null || diff === "") return undefined;
+    return { action: "transform" as const, text: withDiff(event.text, diff) };
   });
 
   /**
@@ -342,7 +599,24 @@ export default function pear(pi: ExtensionAPI) {
    * auto-retry or run a queued continuation after `agent_end`.
    */
   pi.on("agent_settled", (_event, ctx) => {
-    if (runtime === null || runtime.mode !== "agent-driver") return;
+    if (runtime === null || runtime.mode === "off") return;
+
+    if (runtime.quizzing) {
+      // A quiz spans *two* agent runs: the one pear starts to ask the question,
+      // and the one the human's answer starts. Ending it on the first would
+      // rebaseline before they had said anything — the diff would never be
+      // attached and the next nudge would skip work nobody discussed.
+      if (runtime.quizAnswered) {
+        // Acknowledgement inverts in human-driver: the *agent* is the navigator,
+        // and it has now seen the diff — whatever the human said back, including
+        // "not now". Re-raising work already discussed would be a nag.
+        runtime.endQuiz();
+        watcher?.acknowledge();
+      }
+      refreshStatus(ctx);
+      return;
+    }
+
     const report = runtime.onAgentSettled();
 
     if (report.awaitingExplanation !== null) {
@@ -646,12 +920,13 @@ export default function pear(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const rt = needRuntime(ctx);
       if (rt === null) return;
-      if (rt.mode !== "agent-driver") {
-        ctx.ui.notify("pear: not in agent-driver mode — use /pear-mode first.", "warning");
+      if (rt.mode === "off") {
+        ctx.ui.notify("pear: not running — use /pear-mode first.", "warning");
         return;
       }
       rt.replan();
       syncPhaseTools();
+      syncWatcher(ctx);
       refreshStatus(ctx);
       ctx.ui.notify(
         "pear: back to scoping — editing is closed until a new plan is approved.",
@@ -669,6 +944,76 @@ export default function pear(pi: ExtensionAPI) {
       ctx.ui.notify(
         plan === null ? "pear: no plan approved yet." : `pear plan\n\n${formatPlan(plan)}`,
         "info",
+      );
+    },
+  });
+
+  pi.registerCommand("pear-swap", {
+    description: "Hand the keyboard over: swap who is driving",
+    handler: async (_args, ctx) => {
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      if (rt.mode === "off") {
+        ctx.ui.notify("pear: not running — use /pear-mode first.", "warning");
+        return;
+      }
+      if (rt.driver === "agent" && !isGitRepo(ctx.cwd)) {
+        ctx.ui.notify(
+          "pear: can't watch your changes outside a git repository, so you can't take the keyboard here.",
+          "warning",
+        );
+        return;
+      }
+
+      const driver = rt.swap();
+      syncPhaseTools();
+      syncWatcher(ctx);
+      refreshStatus(ctx);
+      ctx.ui.notify(
+        driver === "human"
+          ? "pear: you're driving. I'll watch, and ask you to talk me through it now and then."
+          : "pear: I'm driving. I'll check in with you as I go.",
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("pear-explain", {
+    description: "Talk the agent through what you changed, without waiting",
+    handler: async (_args, ctx) => {
+      const rt = needRuntime(ctx);
+      if (rt === null) return;
+      if (rt.driver !== "human") {
+        ctx.ui.notify(
+          "pear: the agent is driving — use /pear-checkpoint to review its work instead.",
+          "warning",
+        );
+        return;
+      }
+
+      // Measure on demand: this is also the escape hatch when the watcher has
+      // parked, so it must not depend on the watcher having a fresh number.
+      const measured = changedLineStats(ctx.cwd);
+      if (!measured.ok) {
+        ctx.ui.notify(`pear: couldn't read your changes (${measured.detail}).`, "warning");
+        return;
+      }
+      if (measured.stats.files === 0) {
+        ctx.ui.notify(NOTHING_TO_EXPLAIN, "info");
+        return;
+      }
+
+      const measuredPoints = pointsForWorkingTree(measured.stats);
+      rt.setWorkingTreeLoad(measuredPoints);
+      // The watcher did not take this measurement, so tell it — otherwise it
+      // credits nothing at acknowledgement and re-raises the same tree.
+      watcher?.observe(measuredPoints);
+      startQuiz(
+        ctx,
+        measured.stats.files,
+        measured.stats.insertions,
+        measured.stats.deletions,
+        true,
       );
     },
   });
@@ -768,9 +1113,10 @@ export default function pear(pi: ExtensionAPI) {
       // `pi -p "/pear-mode agent-driver"` is a legitimate way to set a project
       // up. What we must not do is claim it is active when no human could
       // answer a checkpoint here.
-      const runnable = target !== "agent-driver" || canShowDialogs(ctx);
+      const runnable = target === "off" || canShowDialogs(ctx);
       rt.setMode(runnable ? target : "off");
       syncPhaseTools();
+      syncWatcher(ctx);
       refreshStatus(ctx);
 
       if (!persisted) {

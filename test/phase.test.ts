@@ -6,7 +6,11 @@ import { formatPlan, type PlanSpec } from "../core/prompts.ts";
 import { createRuntime, type PearRuntime } from "../adapters/pi/runtime.ts";
 
 function harness(
-  overrides: { mode?: "off" | "agent-driver"; planPhase?: boolean; budget?: number } = {},
+  overrides: {
+    mode?: "off" | "agent-driver" | "human-driver";
+    planPhase?: boolean;
+    budget?: number;
+  } = {},
 ): { rt: PearRuntime; setFiles: (f: Record<string, string> | null) => void } {
   let files: FileState | null = new Map();
   const rt = createRuntime({
@@ -335,5 +339,225 @@ describe("formatPlan", () => {
 
   it("omits the risks section when empty", () => {
     assert.doesNotMatch(formatPlan({ summary: "S", steps: ["A"], risks: [] }), /Watch out/);
+  });
+});
+
+describe("the driver axis", () => {
+  const human = (over: { planPhase?: boolean } = {}) =>
+    harness({ mode: "human-driver", planPhase: over.planPhase ?? false });
+
+  it("is derived from the mode", () => {
+    assert.equal(harness({ planPhase: false }).rt.driver, "agent");
+    assert.equal(human().rt.driver, "human");
+  });
+
+  it("blocks every change while the human drives", () => {
+    const { rt } = human();
+    const blocked = write(rt, "a");
+    assert.ok(blocked?.block);
+    assert.match(blocked.reason, /the human is driving/);
+  });
+
+  it("blocks mutating bash too, which setActiveTools cannot", () => {
+    const { rt } = human();
+    assert.ok(bash(rt, "a", "rm -rf build")?.block);
+  });
+
+  it("still allows the agent to read", () => {
+    const { rt } = human();
+    assert.equal(bash(rt, "a", "git status"), undefined);
+    assert.equal(rt.onMutatingToolCall("read", "b", { path: "f.ts" }), undefined);
+  });
+
+  it("blocks in both phases, not just scoping", () => {
+    const scoping = human({ planPhase: true });
+    assert.match(write(scoping.rt, "a")?.reason ?? "", /no plan is approved/);
+
+    const building = human({ planPhase: false });
+    assert.match(write(building.rt, "a")?.reason ?? "", /the human is driving/);
+  });
+
+  it("prices load from the working tree, not from tool calls", () => {
+    const { rt } = human();
+    rt.setWorkingTreeLoad(145);
+    assert.equal(rt.tier(), "soft");
+    rt.setWorkingTreeLoad(420);
+    assert.equal(rt.tier(), "blocked");
+  });
+
+  it("reports watching, not driving, in the status line", () => {
+    const { rt } = human();
+    rt.setWorkingTreeLoad(140);
+    assert.match(rt.statusText(), /watching 140\/200/);
+  });
+
+  it("says a checkpoint is out of phase while navigating", () => {
+    const { rt } = human();
+    const started = rt.beginCheckpoint();
+    assert.ok("immediate" in started);
+    assert.match(started.immediate.text, /you are navigating, not driving/);
+    assert.equal(started.immediate.terminate, false);
+  });
+
+  it("still lets the agent ask a question", () => {
+    // Asking is how the navigator gets unstuck; gating it would wedge the loop.
+    const { rt } = human();
+    assert.ok("pending" in rt.beginAsk());
+  });
+});
+
+describe("the quiz", () => {
+  const human = () => harness({ mode: "human-driver", planPhase: false });
+
+  it("starts and ends", () => {
+    const { rt } = human();
+    assert.equal(rt.quizzing, false);
+    rt.beginQuiz();
+    assert.equal(rt.quizzing, true);
+    rt.endQuiz();
+    assert.equal(rt.quizzing, false);
+  });
+
+  it("survives the human's reply, so the diff can be attached to it", () => {
+    // onUserInput must NOT clear quizzing: the input hook needs it still set
+    // to staple the diff onto the very message that clears it.
+    const { rt } = human();
+    rt.beginQuiz();
+    rt.onUserInput();
+    assert.equal(rt.quizzing, true);
+  });
+
+  it("acknowledges on end, because the agent saw the diff", () => {
+    const h = harness({ mode: "human-driver", planPhase: false });
+    h.setFiles({ "a.ts": "h:1" });
+    h.rt.setWorkingTreeLoad(420);
+    h.rt.beginQuiz();
+    h.rt.endQuiz();
+
+    assert.equal(h.rt.tier(), "quiet", "load cleared");
+    assert.deepEqual(h.rt.filesSinceBaseline().files, [], "and the tree re-baselined");
+  });
+
+  it("acknowledges even when the human declined to explain", () => {
+    // The reviewing party here is the agent, and it was shown the diff
+    // regardless of what the human said back.
+    const { rt } = human();
+    rt.setWorkingTreeLoad(420);
+    rt.beginQuiz();
+    rt.endQuiz();
+    assert.equal(rt.tier(), "quiet");
+  });
+
+  it("is not answered until the human says something", () => {
+    // A quiz spans two agent runs, and the host uses this flag to tell them
+    // apart: settling the question turn must not count as an answer.
+    const { rt } = human();
+    rt.beginQuiz();
+    assert.equal(rt.quizAnswered, false);
+    rt.onQuizReply();
+    assert.equal(rt.quizAnswered, true);
+    rt.endQuiz();
+    assert.equal(rt.quizAnswered, false, "cleared for the next one");
+  });
+
+  it("ignores a reply when no quiz is open", () => {
+    const { rt } = human();
+    rt.onQuizReply();
+    assert.equal(rt.quizAnswered, false);
+  });
+
+  it("drops an unanswered quiz on swap and on replan", () => {
+    const { rt } = human();
+    rt.beginQuiz();
+    rt.onQuizReply();
+    rt.swap();
+    assert.equal(rt.quizzing, false);
+    assert.equal(rt.quizAnswered, false);
+
+    rt.swap();
+    rt.beginQuiz();
+    rt.onQuizReply();
+    rt.replan();
+    assert.equal(rt.quizzing, false);
+    assert.equal(rt.quizAnswered, false);
+  });
+
+  it("shows in the status line while waiting", () => {
+    const { rt } = human();
+    rt.beginQuiz();
+    assert.match(rt.statusText(), /awaiting your explanation/);
+  });
+});
+
+describe("swapping the driver", () => {
+  it("hands the keyboard over and back", () => {
+    const { rt } = harness({ planPhase: false });
+    assert.equal(rt.driver, "agent");
+    assert.equal(rt.swap(), "human");
+    assert.equal(rt.driver, "human");
+    assert.equal(rt.swap(), "agent");
+  });
+
+  it("closes editing when the human takes over", () => {
+    const { rt } = harness({ planPhase: false });
+    assert.equal(write(rt, "a"), undefined);
+    rt.swap();
+    assert.match(write(rt, "b")?.reason ?? "", /the human is driving/);
+  });
+
+  it("opens editing when the agent takes over", () => {
+    const { rt } = harness({ mode: "human-driver", planPhase: false });
+    assert.ok(write(rt, "a")?.block);
+    rt.swap();
+    assert.equal(write(rt, "b"), undefined);
+  });
+
+  it("keeps the plan and the phase", () => {
+    const { rt } = harness({ planPhase: true });
+    approve(rt);
+    rt.swap();
+    assert.deepEqual(rt.plan, PLAN, "the plan is the point of swapping");
+    assert.equal(rt.phase, "building");
+  });
+
+  it("clears every hold", () => {
+    const { rt } = harness({ planPhase: false });
+    rt.beginCheckpoint();
+    rt.applyCheckpointAnswer({ kind: "stop" });
+    assert.equal(rt.stopped, true);
+
+    rt.swap();
+    assert.equal(rt.stopped, false);
+    assert.equal(rt.paused, false);
+    assert.equal(rt.explaining, null);
+    assert.equal(rt.quizzing, false);
+  });
+
+  it("resolves an open card rather than stranding it", async () => {
+    const { rt } = harness({ planPhase: false });
+    const started = rt.beginCheckpoint();
+    assert.ok("pending" in started);
+
+    rt.swap();
+    assert.deepEqual(await started.pending.promise, { kind: "mode-off" });
+    assert.equal(rt.isCardPending(), false);
+  });
+
+  it("starts the new driver on a clean slate", () => {
+    const h = harness({ planPhase: false });
+    h.setFiles({ "a.ts": "h:1" });
+    write(h.rt, "a", "a.ts");
+    h.rt.swap();
+
+    assert.equal(h.rt.tier(), "quiet");
+    assert.deepEqual(h.rt.filesSinceBaseline().files, [], "not the new driver's to explain");
+  });
+
+  it("does not change what is on disk", () => {
+    // Swapping is a session-level handover; /pear-mode is the persistent one.
+    const { rt } = harness({ planPhase: false });
+    rt.swap();
+    assert.equal(rt.mode, "agent-driver", "mode is untouched");
+    assert.equal(rt.driver, "human");
   });
 });

@@ -6,6 +6,7 @@ import {
   FILE_POINTS,
   OPAQUE_POINTS,
   pointsFor,
+  pointsForWorkingTree,
 } from "../core/load.ts";
 
 /** Convenience: price a single call as if every path in it were new. */
@@ -187,5 +188,43 @@ describe("calibration: the cases that drove the redesign", () => {
     const total = price("write", { path: "big.ts", content });
     assert.equal(total, FILE_POINTS + 400);
     assert.ok((total ?? 0) >= BUDGET * 2, "should reach the hard-block tier");
+  });
+});
+
+describe("pointsForWorkingTree", () => {
+  it("prices a working tree with the same weights as a tool call", () => {
+    // The two drivers must never disagree about what "a lot to read" means,
+    // because they share one reviewBudget.
+    const tenLines = Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n");
+    const viaTree = pointsForWorkingTree({ files: 1, insertions: 10, deletions: 0 });
+    const viaTool = price("write", { path: "a.ts", content: tenLines });
+    assert.equal(viaTree, viaTool);
+  });
+
+  it("counts both sides of the diff", () => {
+    assert.equal(
+      pointsForWorkingTree({ files: 1, insertions: 30, deletions: 20 }),
+      FILE_POINTS + 50,
+    );
+  });
+
+  it("charges each distinct file", () => {
+    assert.equal(pointsForWorkingTree({ files: 3, insertions: 0, deletions: 0 }), 3 * FILE_POINTS);
+  });
+
+  it("is zero for a clean tree", () => {
+    assert.equal(pointsForWorkingTree({ files: 0, insertions: 0, deletions: 0 }), 0);
+  });
+
+  it("reaches the nudge tier at roughly three files of real work", () => {
+    // Calibration sanity against the default budget of 200: soft at 100.
+    const load = pointsForWorkingTree({ files: 3, insertions: 20, deletions: 5 });
+    assert.equal(load, 145);
+    assert.ok(load >= 100 && load < 200, "should nudge, not yet trigger");
+  });
+
+  it("reaches the auto-trigger tier on a substantial session", () => {
+    const load = pointsForWorkingTree({ files: 5, insertions: 180, deletions: 40 });
+    assert.ok(load >= 400, `${load} should auto-trigger against a budget of 200`);
   });
 });

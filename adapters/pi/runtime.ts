@@ -24,12 +24,14 @@ import { createCheckpoint, type Checkpoint, type FileState } from "../../core/ch
 import { loadTier, type LoadTier, type Mode } from "../../core/config.ts";
 import { estimateChange } from "../../core/load.ts";
 import {
+  BLOCK_HUMAN_DRIVER,
   BLOCK_PAUSED,
   BLOCK_SCOPING,
   BLOCK_STOPPED,
   RESULT_ALREADY_PENDING,
   RESULT_ASK_DISMISSED,
   RESULT_CHECKPOINT_NO_PLAN,
+  RESULT_CHECKPOINT_NOT_DRIVING,
   RESULT_CONTINUE,
   RESULT_DISMISSED,
   RESULT_MODE_OFF,
@@ -57,6 +59,15 @@ import {
  * which persona is injected and which tools are in phase.
  */
 export type Phase = "scoping" | "building";
+
+/**
+ * Who is holding the keyboard. Orthogonal to `phase`: both drivers scope the
+ * same way, and only the building phase differs between them.
+ *
+ * `driver` is derived from the mode rather than stored separately, except that
+ * `/pear-swap` can flip it mid-session without touching what is on disk.
+ */
+export type Driver = "agent" | "human";
 
 export type BlockDecision = { block: true; reason: string } | undefined;
 
@@ -129,7 +140,7 @@ export type SettledReport = {
 export type RuntimeDeps = {
   mode: Mode;
   reviewBudget: number;
-  /** Whether a fresh agent-driver session starts in scoping. */
+  /** Whether a fresh session starts in scoping. */
   planPhase: boolean;
   /** Capture current file state; returns null when git is unavailable. */
   captureFiles: () => FileState | null;
@@ -138,7 +149,12 @@ export type RuntimeDeps = {
 
 export type PearRuntime = {
   readonly mode: Mode;
+  readonly driver: Driver;
   readonly phase: Phase;
+  /** True while pear has asked the human to explain and is waiting. */
+  readonly quizzing: boolean;
+  /** True once the human has replied to the outstanding quiz. */
+  readonly quizAnswered: boolean;
   readonly plan: PlanSpec | null;
   readonly stopped: boolean;
   readonly paused: boolean;
@@ -150,6 +166,23 @@ export type PearRuntime = {
 
   setMode: (mode: Mode) => void;
   setBudget: (points: number) => void;
+  /** Hand the keyboard over, keeping the plan and the session. */
+  swap: () => Driver;
+  /**
+   * Human-driver's load comes from git rather than tool inputs, so the host
+   * pushes measurements in. Keeps this module free of subprocesses.
+   */
+  setWorkingTreeLoad: (points: number) => void;
+  /** Enter the quizzing state; the next human message carries the diff. */
+  beginQuiz: () => void;
+  /**
+   * The human replied to the quiz. A quiz spans *two* agent runs — the one pear
+   * starts to ask the question, and the one their answer starts — so the first
+   * run settling must not end it.
+   */
+  onQuizReply: () => void;
+  /** The human answered (or declined). The agent has seen the diff either way. */
+  endQuiz: () => void;
   /** Adopt a plan recovered from session history, without re-approving it. */
   restorePlan: (plan: PlanSpec) => void;
   /** Return to scoping. The last approved plan is kept for reference. */
@@ -192,6 +225,12 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
   let budget = deps.reviewBudget;
   let phase: Phase = deps.planPhase ? "scoping" : "building";
   let plan: PlanSpec | null = null;
+  /** Seeded from the mode; `swap()` moves it without touching the mode. */
+  let driver: Driver = deps.mode === "human-driver" ? "human" : "agent";
+  let quizzing = false;
+  let quizAnswered = false;
+  /** Human-driver's load, pushed in by the host from git. */
+  let treeLoad = 0;
 
   /** Latched by "stop"; cleared only by real user input. */
   let stopped = false;
@@ -209,7 +248,13 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     checkpoint.reset(deps.captureFiles() ?? new Map());
   };
 
-  const points = (): number => checkpoint.snapshot().points;
+  /**
+   * Review load, from whichever source is authoritative for the current driver.
+   * The agent's comes from priced tool inputs; the human's from git, because
+   * their edits arrive through no tool call at all.
+   */
+  const points = (): number =>
+    driver === "human" ? treeLoad : checkpoint.snapshot().points;
   const tier = (): LoadTier => loadTier(points(), budget);
 
   const resolvePending = (answer: TeardownAnswer): void => {
@@ -218,7 +263,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
 
   /** Shared body of the three `begin*` calls. */
   function open<A>(kind: CardKind, blocked: Resolution | undefined): CardStart<A> {
-    if (mode !== "agent-driver") {
+    if (mode === "off") {
       return { immediate: { text: RESULT_OFF, terminate: false } };
     }
     if (blocked !== undefined) return { immediate: blocked };
@@ -258,8 +303,17 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     get mode() {
       return mode;
     },
+    get driver() {
+      return driver;
+    },
     get phase() {
       return phase;
+    },
+    get quizzing() {
+      return quizzing;
+    },
+    get quizAnswered() {
+      return quizAnswered;
     },
     get plan() {
       return plan;
@@ -285,9 +339,13 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     setMode(next) {
       if (next === mode) return;
       mode = next;
+      driver = next === "human-driver" ? "human" : "agent";
       stopped = false;
       paused = false;
       explaining = null;
+      quizzing = false;
+      quizAnswered = false;
+      treeLoad = 0;
       phase = deps.planPhase ? "scoping" : "building";
       plan = null;
       // An open card belongs to the mode that opened it.
@@ -299,9 +357,51 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       budget = next;
     },
 
+    swap() {
+      driver = driver === "agent" ? "human" : "agent";
+      // A swap is a clean handover: whatever the previous driver was part-way
+      // through is not the new one's to answer for. Same teardown as setMode,
+      // minus the plan, which is the whole point of swapping rather than
+      // restarting.
+      stopped = false;
+      paused = false;
+      explaining = null;
+      quizzing = false;
+      quizAnswered = false;
+      treeLoad = 0;
+      resolvePending({ kind: "mode-off" });
+      rebaseline();
+      return driver;
+    },
+
+    setWorkingTreeLoad(next) {
+      treeLoad = next;
+    },
+
+    beginQuiz() {
+      quizzing = true;
+      quizAnswered = false;
+    },
+
+    onQuizReply() {
+      if (quizzing) quizAnswered = true;
+    },
+
+    endQuiz() {
+      // Acknowledgement inverts here: in agent-driver the human acknowledges by
+      // answering a card, but in human-driver the *agent* is the navigator, so
+      // what matters is that it saw the diff. It did, even if the human replied
+      // "not now" — so this clears regardless of what they said.
+      quizzing = false;
+      quizAnswered = false;
+      treeLoad = 0;
+      rebaseline();
+    },
+
     restorePlan(next) {
       plan = next;
       phase = "building";
+      treeLoad = 0;
       rebaseline();
     },
 
@@ -310,6 +410,9 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       stopped = false;
       paused = false;
       explaining = null;
+      quizzing = false;
+      quizAnswered = false;
+      treeLoad = 0;
       rebaseline();
     },
 
@@ -318,7 +421,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     },
 
     onMutatingToolCall(toolName, callId, input) {
-      if (mode !== "agent-driver") return undefined;
+      if (mode === "off") return undefined;
 
       // `estimateChange` is the single source of truth for "does this mutate":
       // read-only bash and every non-mutating tool price as undefined.
@@ -329,6 +432,11 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       // removed from the tool set in scoping; this is the backstop, and the only
       // thing standing between a mutating bash command and the working tree.
       if (phase === "scoping") return { block: true, reason: BLOCK_SCOPING };
+
+      // The agent never edits while the human drives. Same backstop reasoning,
+      // and it is what makes change attribution unnecessary: anything that
+      // appears in the working tree is the human's by construction.
+      if (driver === "human") return { block: true, reason: BLOCK_HUMAN_DRIVER };
 
       // The human's explicit decisions outrank the budget: they are about this
       // moment, whereas the budget is an accounting threshold.
@@ -383,6 +491,9 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       stopped = false;
       paused = false;
       explaining = null;
+      // `quizzing` is deliberately NOT cleared here: the input hook needs it
+      // still set so it can attach the diff to this very message. `endQuiz`
+      // clears it once the turn settles.
     },
 
     beginAsk() {
@@ -401,12 +512,16 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     },
 
     beginCheckpoint() {
-      const start = open<CheckpointAnswer>(
-        "checkpoint",
+      // Checking in is the driver's job. When the human is driving there is
+      // nothing for the agent to report, so this is out of phase rather than
+      // merely unnecessary.
+      const blocked =
         phase === "scoping"
           ? { text: RESULT_CHECKPOINT_NO_PLAN, terminate: false }
-          : undefined,
-      );
+          : driver === "human"
+            ? { text: RESULT_CHECKPOINT_NOT_DRIVING, terminate: false }
+            : undefined;
+      const start = open<CheckpointAnswer>("checkpoint", blocked);
       // Re-showing the card is what ends the walkthrough, so edits are no
       // longer held once the human is looking at their options again.
       if ("pending" in start) explaining = null;
@@ -486,9 +601,10 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     },
 
     statusText() {
-      if (mode !== "agent-driver") return statusLine(mode, phase, 0, budget);
+      if (mode === "off") return statusLine(mode, phase, 0, budget);
       const flags: string[] = [];
       if (stopped) flags.push("stopped");
+      if (quizzing) flags.push("awaiting your explanation");
       if (explaining !== null) flags.push(`reviewing ${explaining}`);
       else if (paused) flags.push("paused");
       if (pending !== null) flags.push("awaiting you");

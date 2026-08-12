@@ -4,7 +4,13 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { captureGitState, isGitRepo, parsePorcelainV2, worktreeToken } from "../core/git.ts";
+import {
+  captureGitState,
+  changedLineStats,
+  isGitRepo,
+  parsePorcelainV2,
+  worktreeToken,
+} from "../core/git.ts";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -246,5 +252,144 @@ describe("parsePorcelainV2", () => {
   it("ignores headers and ignored-file records", () => {
     const parsed = parsePorcelainV2("# branch.oid abc\0! ignored.txt\0");
     assert.deepEqual(parsed, []);
+  });
+});
+
+describe("changedLineStats", () => {
+  const stats = (dir: string) => {
+    const result = changedLineStats(dir);
+    assert.ok(result.ok, "expected a successful read");
+    return result.stats;
+  };
+
+  it("reports a clean tree as nothing to review", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    assert.deepEqual(stats(dir), { files: 0, insertions: 0, deletions: 0 });
+  });
+
+  it("counts insertions and deletions on a tracked file", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\nthree\n");
+    commit(dir);
+    writeFileSync(join(dir, "a.txt"), "one\nCHANGED\nthree\nfour\n");
+    assert.deepEqual(stats(dir), { files: 1, insertions: 2, deletions: 1 });
+  });
+
+  it("counts a staged change, not just an unstaged one", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+    git(dir, "add", "-A");
+    assert.deepEqual(stats(dir), { files: 1, insertions: 1, deletions: 0 });
+  });
+
+  it("counts an untracked file, which git diff cannot see", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "new.txt"), "1\n2\n3\n");
+    assert.deepEqual(stats(dir), { files: 1, insertions: 3, deletions: 0 });
+  });
+
+  it("counts a final line with no trailing newline", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "new.txt"), "1\n2");
+    assert.equal(stats(dir).insertions, 2);
+  });
+
+  it("treats an empty untracked file as a file with no lines", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "empty.txt"), "");
+    assert.deepEqual(stats(dir), { files: 1, insertions: 0, deletions: 0 });
+  });
+
+  it("charges a binary file for the file but not for bytes", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "blob.bin"), Buffer.from([0, 1, 2, 0, 255, 10, 10]));
+    assert.deepEqual(stats(dir), { files: 1, insertions: 0, deletions: 0 });
+  });
+
+  it("charges a tracked binary change for the file but not for bytes", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "blob.bin"), Buffer.from([0, 1, 2]));
+    commit(dir);
+    writeFileSync(join(dir, "blob.bin"), Buffer.from([0, 9, 9, 9, 9]));
+    assert.deepEqual(stats(dir), { files: 1, insertions: 0, deletions: 0 });
+  });
+
+  it("counts a deletion", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+    commit(dir);
+    rmSync(join(dir, "a.txt"));
+    assert.deepEqual(stats(dir), { files: 1, insertions: 0, deletions: 2 });
+  });
+
+  it("counts a rename once, under its destination", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\nthree\n");
+    commit(dir);
+    git(dir, "mv", "a.txt", "b.txt");
+    // A pure rename moves no lines; the point is that it is exactly one file.
+    assert.equal(stats(dir).files, 1);
+  });
+
+  it("ignores files excluded by .gitignore", () => {
+    const dir = repo();
+    writeFileSync(join(dir, ".gitignore"), "ignored/\n");
+    commit(dir);
+    mkdirSync(join(dir, "ignored"));
+    writeFileSync(join(dir, "ignored", "junk.txt"), "1\n2\n3\n");
+    assert.deepEqual(stats(dir), { files: 0, insertions: 0, deletions: 0 });
+  });
+
+  it("works in an unborn repo, before the first commit", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+    // No commit, so HEAD does not resolve — the empty tree is the base.
+    assert.deepEqual(stats(dir), { files: 1, insertions: 2, deletions: 0 });
+  });
+
+  it("counts staged content in an unborn repo", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+    git(dir, "add", "-A");
+    assert.deepEqual(stats(dir), { files: 1, insertions: 2, deletions: 0 });
+  });
+
+  it("sums across several files", () => {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "a.txt"), "one\ntwo\n");
+    writeFileSync(join(dir, "b.txt"), "1\n2\n3\n");
+    assert.deepEqual(stats(dir), { files: 2, insertions: 4, deletions: 0 });
+  });
+
+  it("reports a failure outside a repo rather than guessing at zero", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pear-nogit-"));
+    const result = changedLineStats(dir);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "not-a-repo");
+  });
+
+  it("reports a git-error separately from not-a-repo", () => {
+    const failing = () => {
+      throw Object.assign(new Error("fatal: something else broke"), {
+        stderr: "fatal: something else broke",
+      });
+    };
+    const result = changedLineStats("/tmp", failing);
+    assert.equal(result.ok, false);
+    assert.equal(result.ok === false && result.reason, "git-error");
   });
 });

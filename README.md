@@ -86,19 +86,55 @@ the checkpoint so you still get your options back.
 
 Use `/pear` to throw the plan out and start scoping again.
 
+## When you drive
+
+Set `human-driver` (or run `/pear-swap`) and it goes the other way: you write the
+code, and pear watches.
+
+It polls git in the background. When enough has piled up, a quiet line appears
+above your prompt — no focus stolen, nothing to dismiss:
+
+```
+┌─ pear ───────────────────────────────────┐
+│ pear · 3 files, ~140 lines uncommitted   │
+│ ready when you are                       │
+└──────────────────────────────────────────┘
+> _
+```
+
+Keep going and eventually it speaks up on its own:
+
+> **pear** — I have 3 uncommitted files — src/sync/client.ts, src/sync/retry.ts,
+> test/retry.test.ts (+140/−20). Ask me to walk you through what I did and why.
+
+When you answer, pear attaches the actual diff to your message. The agent reads
+both and tells you where they disagree — which is the point. Explaining code out
+loud is when you notice it's wrong, and a reader with the diff in hand catches
+the cases where what you *think* you wrote and what you wrote have drifted apart.
+
+`/pear-explain` starts that conversation whenever you want it. **The agent cannot
+edit anything while you're driving** — if it wants to change something, it says
+so and you decide.
+
+It never interrupts you mid-keystroke: it waits for the tree to go quiet for a
+few seconds, and it won't start a turn while you're part-way through typing a
+message.
+
 ## Modes
 
 | Mode | Behaviour |
 | --- | --- |
 | `off` (default) | pear does nothing |
-| `agent-driver` | Scope, then build with checkpoints |
+| `agent-driver` | The agent builds; you review at checkpoints |
+| `human-driver` | You build; the agent watches and asks you to explain |
 
-Mode is per-project, stored in `.pear/config.json`.
+Mode is per-project, stored in `.pear/config.json`. `/pear-swap` changes who is
+driving for this session only, without touching the file.
 
-> An earlier version also had a `human-driver` mode, where a background reviewer
-> critiqued *your* uncommitted changes. It is not in this version. If your config
-> still says `human-driver`, pear runs `off`, tells you so, and **leaves your
-> config file untouched** so nothing is lost.
+> An earlier version had a very different `human-driver`: a background LLM
+> reviewer that posted findings at you and never asked anything. That one is
+> gone. If your config still says `human-driver`, it now runs the mode described
+> above.
 
 ## Commands
 
@@ -108,7 +144,9 @@ Mode is per-project, stored in `.pear/config.json`.
 | `/pear-plan` | Show the plan you agreed to |
 | `/pear-status` | Mode, phase, review load, and what's outstanding |
 | `/pear-checkpoint` | Open a checkpoint yourself, without waiting for the agent |
-| `/pear-mode [off\|agent-driver]` | Switch mode |
+| `/pear-swap` | Hand the keyboard over, either way |
+| `/pear-explain` | Talk the agent through what you changed |
+| `/pear-mode [off\|agent-driver\|human-driver]` | Switch mode |
 | `/pear-config [n]` | Review load allowed between checkpoints (default 200) |
 | `/pear-exclusive` | Turn off tools from other extensions |
 
@@ -127,14 +165,23 @@ review-load points:
 | Each line of a `write` | 1 |
 | A `bash` command that isn't provably read-only | 60 |
 
-Against a default budget of 200, that behaves like this:
+Against a default budget of 200:
 
-| Load | What pear does |
-| --- | --- |
-| under 100 | nothing |
-| 100–199 | mentions it on the agent's next tool result |
-| 200+ | says plainly that a checkpoint is due |
-| 400+ | blocks further changes until one happens |
+| Load | Agent driving | You driving |
+| --- | --- | --- |
+| under 100 | nothing | nothing |
+| 100–199 | mentions it on the next tool result | nudge appears |
+| 200+ | says a checkpoint is due | nudge firms up |
+| 400+ | blocks further changes | starts a turn asking you to explain |
+
+When you're driving there is nothing to block, so the budget's top tier starts a
+conversation instead. The score is measured from git rather than from tool
+inputs, but it's the same score — one `reviewBudget` paces both.
+
+Git measures against `HEAD`, and you probably won't commit between every
+conversation, so pear subtracts what it has already shown the agent. Two lines
+after explaining a 400-line change score 2, not 402. Commit, and the credit
+resets with the tree.
 
 Counting *review load* rather than tool calls is the point. Five one-line edits
 to one file score 50 and pass in silence; one 400-line `write` scores 440 and
@@ -174,11 +221,15 @@ inputs. A wrong file list can never wedge or bypass the loop.
 
 A checkpoint needs a human, so pear only runs where one can answer:
 
-| pi mode | Cards |
-| --- | --- |
-| TUI | Full card, inline editor, file sub-select |
-| RPC | The same card as select/input dialogs |
-| print / json | pear runs `off` for that session, with a warning |
+| pi mode | Cards | Human-driver nudge |
+| --- | --- | --- |
+| TUI | Full card, inline editor, file sub-select | Yes |
+| RPC | The same card as select/input dialogs | No — the turn arrives with no warning shot |
+| print / json | pear runs `off` for that session, with a warning | — |
+
+`human-driver` also needs a git repository, since git is how it sees what you
+changed. Outside one it runs `off` for the session and says so, leaving your
+config alone.
 
 pear **never** auto-approves. An abandoned dialog is a dismissal, never a
 silent "keep going". If nobody can answer, it doesn't pretend one happened.
@@ -202,6 +253,8 @@ tool for that project.
   "exclusive": false
 }
 ```
+
+`mode` is `off`, `agent-driver`, or `human-driver`.
 
 - `reviewBudget` is a whole number from 40 to 100000.
 - `planPhase: false` skips scoping and starts building immediately.
@@ -241,9 +294,10 @@ Behaviour that needs a live model and a terminal — how the cadence actually
 ```
 core/                     host-free logic (no pi imports)
   config.ts               .pear/config.json, budget tiers
-  load.ts                 pricing a tool call in review points
+  load.ts                 pricing a tool call or a working tree
   checkpoint.ts           review-load accounting + file provenance
-  git.ts                  porcelain v2 -> file state tokens
+  git.ts                  porcelain v2, line stats, the review diff
+  watch.ts                when to nudge you, and when to speak up
   bash.ts                 is this command provably read-only?
   prompts.ts              every string the model or human reads
 adapters/pi/

@@ -2,13 +2,25 @@
 
 ## Project overview
 
-`pear` is a pair-programming loop for the **pi** harness. In `agent-driver`
-mode you and the agent agree an approach first (the **scoping** phase, gated by
-`pear_plan`), then it builds in digestible increments (the **building** phase,
-punctuated by `pear_checkpoint`). At each checkpoint you can keep going, have a
-file walked through, change direction, or stop. A review-load budget nags in
-band and then blocks, so drift is bounded without the prompt being the only
-thing holding the line.
+`pear` is a pair-programming loop for the **pi** harness. Either party can hold
+the keyboard.
+
+Both start the same way: a **scoping** phase gated by `pear_plan`, where nothing
+can be edited until an approach is agreed. After that the `driver` decides what
+the **building** phase looks like.
+
+- **`agent-driver`** — the agent builds in digestible increments, punctuated by
+  `pear_checkpoint`. At each one you can keep going, have a file walked through,
+  change direction, or stop.
+- **`human-driver`** — you build; the agent watches the working tree through
+  git, nudges when enough has piled up, and eventually starts a turn asking you
+  to talk it through. It reads the diff alongside your explanation and says what
+  it thinks you got wrong. It cannot edit anything.
+
+`/pear-swap` hands the keyboard over either way, mid-session, keeping the plan.
+
+One review-load budget paces both, so the two never disagree about what "a lot
+to read" means.
 
 - Runtime: Node.js **>= 22.19.0** (`.tool-versions` pins the local version).
 - Language: TypeScript in native ESM / `NodeNext`, run directly via Node's
@@ -22,9 +34,10 @@ thing holding the line.
 
 - `core/` — host-free logic. **Nothing here may import a host SDK.**
   - `config.ts` — `.pear/config.json` I/O, validation, `loadTier`
-  - `load.ts` — pricing a tool call in review-load points
+  - `load.ts` — pricing a tool call, or a working tree, in review-load points
+  - `watch.ts` — the human-driver scheduler (debounce, tiers, parking)
   - `checkpoint.ts` — review-load accounting, file-state provenance
-  - `git.ts` — `git status --porcelain=v2 -z` → state tokens
+  - `git.ts` — porcelain-v2 state tokens, line stats, and the review diff
   - `bash.ts` — "is this command provably read-only?"
   - `prompts.ts` — every string the model or human reads
 - `adapters/pi/runtime.ts` — session state machine (phases, holds, accounting).
@@ -179,10 +192,82 @@ Stop and dismiss are different holds. **Stop** latches until real user input.
 **Dismiss** is run-scoped and expires at `agent_settled`, because the human
 never said stop — they just walked away. Neither ends the session.
 
-### The file list is display-only
+### Git may drive the human-driver trigger, never the agent-driver gate
 
-Nothing in `core/git.ts` feeds the gate. That bound is what keeps the module
-simple; do not start gating on it.
+Agent-driver prices changes from tool inputs and never reads git, so a wrong or
+missing file list can only produce a worse-looking card. Human-driver has no
+tool calls to price and git is its only witness, so it does depend on
+`core/git.ts` — bounded the other way: a git failure means **no trigger**, never
+a nag and never a block, and the watcher parks rather than retrying.
+
+### The agent never edits in human-driver
+
+Write tools are suppressed and mutating `bash` is blocked by the hook, in both
+phases. This is not only discipline: it means anything appearing in the working
+tree is the human's by construction, which is what makes change attribution
+unnecessary. Attribution by timestamp or by `isIdle()` is racy at turn
+boundaries; not needing it at all is not.
+
+### The watcher parks after repeated failure
+
+`MAX_POLL_FAILURES` consecutive git errors stop the poll, report **once**, and
+wait for a restart. The predecessor to `core/watch.ts` retried forever with no
+backoff and produced 106 KB of identical log lines from a single
+misconfiguration. Sample and measure failures are counted separately, because a
+healthy sample would otherwise keep wiping a persistently broken measure.
+
+### Background resources start in `session_start`, never in the factory
+
+pi documents this (`extensions.md:220`): a factory can run in an invocation that
+never opens a session. Clear them in `session_shutdown`. Session switches
+re-fire both, so the watcher self-heals rather than stacking.
+
+### Acknowledgement means the *reviewing* party saw the changes
+
+In agent-driver that is the human, so `continue`/`steer` re-baseline and
+`dismissed` does not. In human-driver the agent is the navigator, so the
+baseline moves once it has been shown the diff — **including when the human
+replied "not now"**. Erring toward oversight pulls the wrong way here and would
+re-quiz someone about work already discussed.
+
+### The human-driver measurement is gross; the pacing is net
+
+`changedLineStats` prices the working tree against `HEAD`, and a human driver
+rarely commits between reviews — so the work just explained is still in the
+tree. `core/watch.ts` therefore credits `acknowledgedPoints` at acknowledgement
+and tiers on `gross - credit`; otherwise the two keystrokes after explaining a
+400-line change re-price all 402 and ask again. The credit is dropped whenever
+the gross measurement falls below it, because that means a commit or a revert
+and a stale credit would mute the watcher permanently.
+
+The counts *shown* stay gross, because the diff handed to the agent is also the
+whole uncommitted tree. `/pear-explain` measures outside the watcher, so it must
+call `watcher.observe(points)` or its acknowledgement credits nothing.
+
+### An undeliverable trigger must be re-armed, not dropped
+
+The watcher sits on `triggered` until acknowledged, so it does not nag someone
+who is deliberately ignoring it. But the auto-trigger declines when the agent is
+mid-turn or the human is part-way through a message — and a declined trigger has
+nobody to answer it. `pear.ts` calls `watcher.rearm()` whenever `startQuiz`
+returns false; without it the watcher goes silent for the rest of the session.
+`rearm` deliberately does *not* acknowledge: nothing was reviewed, so the credit
+and the baseline stay put.
+
+A residual, accepted: `acknowledge()` samples its new baseline at settle time,
+so edits made *while the agent was replying* land inside it. Their points are
+uncredited, but they will only be re-measured on the human's next edit. It
+self-heals on any keystroke.
+
+### A quiz spans two agent runs
+
+pear injects a message, the agent asks its question, and *that run settles* —
+all before the human has typed a word. So `agent_settled` alone cannot end a
+quiz. `runtime.quizAnswered`, set from the `input` hook, is what distinguishes
+the question turn from the answer turn; ending on the first would rebaseline
+over work nobody discussed and the diff would never be attached. Any test of
+this path must emit the settle for the question turn, or it is testing an
+ordering that never happens.
 
 ### Config is never destroyed
 
@@ -202,8 +287,14 @@ textconv helpers. When in doubt, mutating.
 
 `node:test` + `node:assert/strict`. Temp git repos via `mkdtempSync` + `git init`.
 
+**`core/watch.ts` is race-prone.** Its clock and both git reads are parameters
+precisely so every transition can be driven deterministically — add a
+fake-timer case for any change to it. `test/pi-lifecycle.test.ts` injects a
+clock and timer through the factory's optional second argument, which exists
+only for that purpose.
+
 Cover in particular: tier boundaries and admit-first; every resolution path of
-the pending-card state machine and their races; phase transitions and
+the pending-card state machine and their races; phase and driver transitions and
 out-of-phase calls; stop-latch provenance; orphaned calls; id reuse;
 staged-vs-worktree and rename/delete/symlink/unmerged git states; unreadable
 files; config failure paths via the injected `fs` seam (not chmod, which

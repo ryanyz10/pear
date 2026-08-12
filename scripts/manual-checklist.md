@@ -89,8 +89,46 @@ you cannot type, that is a bug regardless of anything else on this list.
 36. `/pear-checkpoint` while the budget is blown → you get the card and can clear
     it yourself.
 
-## G. Other extensions
+## G. Human-driver
 
-37. With another extension's tools active, startup mentions it once.
-38. `/pear-exclusive` disables them and persists. pi's own tools and pear's
+Switch with `/pear-swap` or `/pear-mode human-driver`, then write some code
+yourself.
+
+37. The nudge appears at a moment that feels informative, not nagging. It never
+    steals focus and never interrupts a keystroke.
+38. Keep going past the nudge. The agent speaks up on its own, at a pause rather
+    than mid-thought. **If it consistently catches you mid-thought, the debounce
+    is too short before the budget is wrong.**
+39. Start typing a message, then let the threshold pass. It must not bury what
+    you were writing — **and it must ask once you send or clear that message.**
+    Going quiet for the rest of the session is the failure to watch for here.
+40. Answer the question. The agent's reply shows it actually read the diff, not
+    just your words.
+41. **Deliberately describe your change slightly wrong.** Does it notice? This
+    is the whole value proposition — if it doesn't, nothing else on this list
+    matters.
+42. Ask the agent to make a change. It should decline and suggest `/pear-swap`,
+    not quietly edit.
+43. `/pear-explain` with nothing changed says so; with changes, starts the
+    conversation immediately — including when there is other text in the editor,
+    unlike the auto-trigger in 39.
+44. Say "not now". The next nudge covers only work done *after* that, not the
+    same batch again.
+45. Break git mid-session (`mv .git .git-off`, wait, then restore). It parks
+    quietly and says so **once** — not repeatedly. `/pear-explain` still works
+    while parked.
+46. Commit mid-session. The tree collapses to clean; nothing spurious fires.
+    Then write something new — it must still fire. A stale credit here would
+    mute the watcher for the rest of the session.
+47. `/pear-swap` both ways mid-task. The plan survives, the agent regains and
+    loses its write tools, and the watcher starts and stops.
+48. **Trigger count.** Over a real session, how often did it ask? `reviewBudget`
+    is shared with agent-driver, and you produce the same review load far more
+    slowly than the agent does. If one budget cannot serve both, that is the
+    signal to split the key — not before.
+
+## H. Other extensions
+
+49. With another extension's tools active, startup mentions it once.
+50. `/pear-exclusive` disables them and persists. pi's own tools and pear's
     remain.

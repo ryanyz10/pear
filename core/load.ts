@@ -160,3 +160,22 @@ export function estimateChange(toolName: string, input: unknown): ChangeCost | u
 export function pointsFor(cost: ChangeCost, firstTouches: number): number {
   return firstTouches * FILE_POINTS + cost.lines + (cost.opaque ? OPAQUE_POINTS : 0);
 }
+
+/**
+ * Price a whole working tree, for human-driver.
+ *
+ * When the human is driving there are no tool calls to price, so the load comes
+ * from git instead (`changedLineStats` in `core/git.ts`). The weights are
+ * deliberately **the same** as `pointsFor`: one `reviewBudget` then serves both
+ * drivers, and the two can never disagree about what "a lot to read" means.
+ *
+ * Both sides of the diff count, for the same reason an `edit` charges both
+ * `oldText` and `newText` — a diff shows both.
+ */
+export function pointsForWorkingTree(stats: {
+  files: number;
+  insertions: number;
+  deletions: number;
+}): number {
+  return stats.files * FILE_POINTS + stats.insertions + stats.deletions;
+}

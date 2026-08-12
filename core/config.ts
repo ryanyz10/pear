@@ -30,15 +30,18 @@ import { join } from "node:path";
 import { FILE_POINTS } from "./load.ts";
 
 /** Modes this version can actually run. */
-export type Mode = "off" | "agent-driver";
+export type Mode = "off" | "agent-driver" | "human-driver";
 
-export const MODES: readonly Mode[] = ["off", "agent-driver"];
+export const MODES: readonly Mode[] = ["off", "agent-driver", "human-driver"];
 
 /**
  * Modes that older pear versions wrote and that we still recognise on disk.
  * Recognised so we can warn instead of silently coercing the user to `off`.
+ *
+ * Empty as of v4: `human-driver` was here while it was unimplemented and has
+ * moved into `MODES`. A config that previous versions warned about now runs.
  */
-export const LEGACY_MODES: readonly string[] = ["human-driver"];
+export const LEGACY_MODES: readonly string[] = [];
 
 export type PearConfig = {
   mode?: Mode;
@@ -116,7 +119,7 @@ export function loadTier(points: number, budget: number): LoadTier {
 }
 
 export function isMode(v: unknown): v is Mode {
-  return v === "off" || v === "agent-driver";
+  return v === "off" || v === "agent-driver" || v === "human-driver";
 }
 
 export function isLegacyMode(v: unknown): v is string {

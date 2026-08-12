@@ -31,6 +31,7 @@ type Entry = { type: "custom"; customType: string; data?: unknown };
 const BUILTINS = ["bash", "read", "edit", "write", "grep", "find", "ls"];
 
 function fakePi(entries: Entry[], extraTools: string[]) {
+  const sentUserMessages: string[] = [];
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, ToolDef>();
   const commands = new Map<
@@ -55,7 +56,7 @@ function fakePi(entries: Entry[], extraTools: string[]) {
     registerMessageRenderer: () => {},
     appendEntry: (customType: string, data?: unknown) =>
       entries.push({ type: "custom", customType, data }),
-    sendUserMessage: () => {},
+    sendUserMessage: (content: string) => sentUserMessages.push(content),
     getActiveTools: () => [...active],
     setActiveTools: (names: string[]) => {
       active = [...names];
@@ -70,7 +71,16 @@ function fakePi(entries: Entry[], extraTools: string[]) {
     return results;
   };
 
-  return { api, emit, tools, commands, handlers, activeTools: () => [...active], toolSetCalls };
+  return {
+    api,
+    emit,
+    tools,
+    commands,
+    handlers,
+    sentUserMessages,
+    activeTools: () => [...active],
+    toolSetCalls,
+  };
 }
 
 type CtxOptions = {
@@ -84,12 +94,19 @@ type CtxOptions = {
   inputAnswer?: string | undefined;
   customThrows?: Error;
   entries?: Entry[];
+  /** Agent busy? The auto-trigger refuses to start a turn mid-stream. */
+  idle?: boolean;
+  /** Half-typed message in the editor; the auto-trigger refuses to bury it. */
+  editorText?: string;
 };
 
 function fakeCtx(opts: CtxOptions) {
+  let editorText = opts.editorText ?? "";
+  let idle = opts.idle ?? true;
   const notifications: Notification[] = [];
   const statuses: Array<[string, string | undefined]> = [];
   const selects: Array<{ title: string; options: string[] }> = [];
+  const widgets: Array<[string, string[] | undefined]> = [];
   const queue = [...(opts.selectAnswers ?? [])];
   let abortCalls = 0;
 
@@ -100,6 +117,7 @@ function fakeCtx(opts: CtxOptions) {
     hasUI: opts.hasUI ?? (mode !== "print" && mode !== "json"),
     signal: undefined as AbortSignal | undefined,
     sessionManager: { getEntries: () => opts.entries ?? [] },
+    isIdle: () => idle,
     abort: () => {
       abortCalls++;
     },
@@ -115,10 +133,27 @@ function fakeCtx(opts: CtxOptions) {
         return queue.shift();
       },
       input: async (_title: string) => opts.inputAnswer,
+      getEditorText: () => editorText,
+      setWidget: (key: string, content: string[] | undefined) => widgets.push([key, content]),
     },
   };
 
-  return { ctx, notifications, statuses, selects, abortCalls: () => abortCalls };
+  return {
+    ctx,
+    notifications,
+    statuses,
+    selects,
+    widgets,
+    abortCalls: () => abortCalls,
+    /** The human finished (or abandoned) what they were typing. */
+    setEditorText: (text: string) => {
+      editorText = text;
+    },
+    /** The agent's turn ended. */
+    setIdle: (next: boolean) => {
+      idle = next;
+    },
+  };
 }
 
 function tempRepo(): string {
@@ -127,6 +162,10 @@ function tempRepo(): string {
   execFileSync("git", ["config", "user.email", "t@t"], { cwd: dir });
   execFileSync("git", ["config", "user.name", "t"], { cwd: dir });
   writeFileSync(join(dir, "seed.txt"), "seed\n");
+  // pear's own config lives in the tree; ignoring it is what real projects do,
+  // and without it every human-driver measurement counts .pear/config.json as
+  // a change the human made.
+  writeFileSync(join(dir, ".gitignore"), ".pear/\n");
   execFileSync("git", ["add", "-A"], { cwd: dir });
   execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
   return dir;
@@ -137,6 +176,41 @@ type BootOptions = Omit<CtxOptions, "cwd"> & {
   config?: PearConfig;
   extraTools?: string[];
 };
+
+/**
+ * Stands in for setInterval plus the clock, so the poll loop can be driven,
+ * counted, and pushed past the watcher's debounce deterministically.
+ */
+function fakeTimers() {
+  const live = new Set<{ fn: () => void; ms: number }>();
+  let started = 0;
+  let clock = 0;
+  return {
+    started: () => started,
+    liveCount: () => live.size,
+    /** Run every live interval, advancing the clock by its period each time. */
+    poll: (times = 1) => {
+      for (let i = 0; i < times; i++) {
+        for (const t of [...live]) {
+          clock += t.ms;
+          t.fn();
+        }
+      }
+    },
+    hooks: {
+      setInterval: (fn: () => void, ms: number) => {
+        started++;
+        const handle = { fn, ms, unref: () => {} };
+        live.add(handle);
+        return handle;
+      },
+      clearInterval: (handle: never) => {
+        live.delete(handle as unknown as { fn: () => void; ms: number });
+      },
+      now: () => clock,
+    },
+  };
+}
 
 /**
  * Boot the extension and return everything needed to drive it.
@@ -151,10 +225,11 @@ async function boot(opts: BootOptions = {}) {
 
   const entries = opts.entries ?? [];
   const pi = fakePi(entries, opts.extraTools ?? []);
-  pear(pi.api as never);
+  const timers = fakeTimers();
+  pear(pi.api as never, timers.hooks);
   const c = fakeCtx({ ...opts, cwd, entries });
   await pi.emit("session_start", { reason: "startup" }, c.ctx);
-  return { ...pi, ...c, cwd, entries };
+  return { ...pi, ...c, cwd, entries, timers };
 }
 
 const driver = (extra: PearConfig = {}): BootOptions => ({
@@ -267,9 +342,12 @@ describe("headless policy", () => {
 });
 
 describe("legacy config", () => {
-  it("warns about human-driver and leaves the file byte-identical", async () => {
+  it("reads a config with unknown keys without ever writing to it", async () => {
+    // Byte-identity on load is the property worth keeping. human-driver used
+    // to be the deferred mode standing in for it; it runs now, so an unknown
+    // key plays that part instead.
     const cwd = tempRepo();
-    const raw = JSON.stringify({ mode: "human-driver", reviewModel: "a/b" }, null, 2) + "\n";
+    const raw = JSON.stringify({ mode: "agent-driver", reviewModel: "a/b" }, null, 2) + "\n";
     mkdirSync(join(cwd, ".pear"), { recursive: true });
     writeFileSync(join(cwd, ".pear", "config.json"), raw);
 
@@ -278,9 +356,6 @@ describe("legacy config", () => {
     const c = fakeCtx({ cwd });
     await pi.emit("session_start", { reason: "startup" }, c.ctx);
 
-    assert.ok(
-      c.notifications.some((n) => /human-driver/.test(n.message) && /isn't available/.test(n.message)),
-    );
     assert.equal(readFileSync(join(cwd, ".pear", "config.json"), "utf8"), raw, "file untouched");
   });
 
@@ -920,5 +995,380 @@ describe("source hygiene", () => {
       const returned = hook(writeCall("sync", "f.ts"), b.ctx);
       assert.notEqual(typeof (returned as any)?.then, "function", "must not return a promise");
     }
+  });
+});
+
+/* ------------------------------------------------- human-driver lifecycle */
+
+const navigator = (extra: PearConfig = {}): BootOptions => ({
+  config: { mode: "human-driver", ...extra },
+});
+
+/** Make `lines` lines of change the human "wrote". */
+function humanEdits(b: Awaited<ReturnType<typeof boot>>, path: string, lines: number): void {
+  writeFileSync(join(b.cwd, path), Array.from({ length: lines }, (_, i) => `l${i}`).join("\n"));
+}
+
+/**
+ * Let the watcher adopt the current tree as its baseline. Everything the human
+ * does after this is theirs to explain; everything before it is not.
+ */
+function adopt(b: Awaited<ReturnType<typeof boot>>): void {
+  b.timers.poll(1);
+}
+
+describe("human-driver: registration and gating", () => {
+  it("registers the new commands", async () => {
+    const b = await boot(navigator());
+    assert.ok(b.commands.has("pear-swap"));
+    assert.ok(b.commands.has("pear-explain"));
+  });
+
+  it("takes the write tools away from the agent", async () => {
+    const b = await boot(navigator());
+    assert.ok(!b.activeTools().includes("edit"));
+    assert.ok(!b.activeTools().includes("write"));
+    assert.ok(b.activeTools().includes("read"), "reading is the whole job");
+  });
+
+  it("blocks a mutating call without aborting the run", async () => {
+    const b = await boot(navigator());
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts", 3), b.ctx);
+    assert.equal(decision?.block, true);
+    assert.match(decision.reason, /the human is driving/);
+    assert.equal(b.abortCalls(), 0);
+  });
+
+  it("injects the navigator persona, carrying the plan", async () => {
+    const b = await boot(navigator({ planPhase: true }));
+    await approvePlan(b);
+    const [result] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
+    assert.match(result.systemPrompt, /you are the navigator/i);
+    assert.match(result.systemPrompt, /cannot edit anything/);
+    assert.match(result.systemPrompt, /Do the thing\./);
+  });
+
+  it("falls back to off outside a git repository, leaving the config alone", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pear-nogit-"));
+    const b = await boot({ cwd, ...navigator() });
+    assert.ok(b.notifications.some((n) => /needs a git repository/.test(n.message)));
+
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.equal(decision, undefined, "pear is inert");
+    const onDisk = JSON.parse(readFileSync(join(cwd, ".pear", "config.json"), "utf8"));
+    assert.equal(onDisk.mode, "human-driver", "config untouched");
+  });
+});
+
+describe("human-driver: the watcher", () => {
+  it("starts polling when the human drives", async () => {
+    const b = await boot(navigator());
+    assert.equal(b.timers.started(), 1);
+    assert.equal(b.timers.liveCount(), 1);
+  });
+
+  it("does not poll when the agent drives", async () => {
+    const b = await boot(driver());
+    assert.equal(b.timers.started(), 0);
+  });
+
+  it("stops polling on session shutdown", async () => {
+    const b = await boot(navigator());
+    await b.emit("session_shutdown", { reason: "quit" }, b.ctx);
+    assert.equal(b.timers.liveCount(), 0, "a timer must not outlive its session");
+  });
+
+  it("does not stack a second timer on a session switch", async () => {
+    const b = await boot(navigator());
+    await b.emit("session_shutdown", { reason: "new" }, b.ctx);
+    await b.emit("session_start", { reason: "new" }, b.ctx);
+    assert.equal(b.timers.liveCount(), 1, "exactly one watcher at a time");
+  });
+
+  it("nudges once enough has changed, without starting a turn", async () => {
+    const b = await boot(navigator({ reviewBudget: 200 }));
+    adopt(b);
+    humanEdits(b, "work.ts", 80); // 40 + 80 = 120 -> soft
+    b.timers.poll(12); // notice, then settle past the debounce
+
+    const nudge = b.widgets.find(([key, content]) => key === "pear-nudge" && content !== undefined);
+    assert.ok(nudge, "expected a nudge widget");
+    assert.match(nudge[1]?.join(" ") ?? "", /1 file/);
+    assert.deepEqual(b.sentUserMessages, [], "a nudge never starts a turn");
+  });
+
+  it("auto-triggers a turn once the work gets large", async () => {
+    const b = await boot(navigator({ reviewBudget: 200 }));
+    adopt(b);
+    humanEdits(b, "big.ts", 400);
+    b.timers.poll(12);
+
+    assert.equal(b.sentUserMessages.length, 1);
+    assert.match(b.sentUserMessages[0] ?? "", /^\(pear\)/);
+    assert.match(b.sentUserMessages[0] ?? "", /walk you through/);
+  });
+
+  it("refuses to start a turn while the agent is busy", async () => {
+    const b = await boot({ ...navigator({ reviewBudget: 200 }), idle: false });
+    adopt(b);
+    humanEdits(b, "big.ts", 400);
+    b.timers.poll(12);
+    assert.deepEqual(b.sentUserMessages, [], "sendUserMessage would throw mid-stream");
+  });
+
+  it("refuses to start a turn under a half-typed message", async () => {
+    const b = await boot({ ...navigator({ reviewBudget: 200 }), editorText: "I was saying" });
+    adopt(b);
+    humanEdits(b, "big.ts", 400);
+    b.timers.poll(12);
+    assert.deepEqual(b.sentUserMessages, [], "burying their message would be rude");
+  });
+
+  it("asks once the editor clears, rather than going quiet for good", async () => {
+    // A declined trigger leaves the watcher waiting to be answered by a
+    // question that was never asked. Without a re-arm that is a silent wedge:
+    // no nudge, no trigger, for the rest of the session.
+    const b = await boot({ ...navigator({ reviewBudget: 200 }), editorText: "I was saying" });
+    adopt(b);
+    humanEdits(b, "big.ts", 400);
+    b.timers.poll(12);
+    assert.deepEqual(b.sentUserMessages, [], "not while they are typing");
+
+    b.setEditorText("");
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1, "asked as soon as it could");
+  });
+
+  it("asks once the agent goes idle, rather than going quiet for good", async () => {
+    const b = await boot({ ...navigator({ reviewBudget: 200 }), idle: false });
+    adopt(b);
+    humanEdits(b, "big.ts", 400);
+    b.timers.poll(12);
+    assert.deepEqual(b.sentUserMessages, []);
+
+    b.setIdle(true);
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1);
+  });
+
+  it("does not raise work that predates the session", async () => {
+    const cwd = tempRepo();
+    writeFileSync(join(cwd, "already.ts"), Array.from({ length: 400 }, (_, i) => `l${i}`).join("\n"));
+    const b = await boot({ cwd, ...navigator({ reviewBudget: 200 }) });
+    b.timers.poll(12);
+    assert.deepEqual(b.sentUserMessages, [], "not the human's to explain");
+  });
+});
+
+describe("human-driver: the quiz", () => {
+  /**
+   * Drive a real auto-trigger and return the harness, settled on the question.
+   *
+   * A quiz spans two runs — pear injects a message, the agent asks the question,
+   * *that* run settles, and only then does the human reply. Skipping the first
+   * settle here would test an ordering that never happens.
+   */
+  async function quizzed(reviewBudget = 200) {
+    const b = await boot(navigator({ reviewBudget }));
+    adopt(b);
+    humanEdits(b, "work.ts", 400);
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1, "expected the quiz to fire");
+    await b.emit("agent_settled", {}, b.ctx);
+    return b;
+  }
+
+  it("stays open when the question turn settles", async () => {
+    // The human has not answered yet. Ending the quiz here would rebaseline
+    // over work nobody discussed and the diff would never be attached.
+    const b = await quizzed();
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1, "no second quiz for the same work");
+
+    const [result] = await b.emit("input", { text: "so what I did", source: "interactive" }, b.ctx);
+    assert.equal(result.action, "transform", "the quiz is still open, so the diff attaches");
+    assert.match(result.text, /<pear-diff/);
+  });
+
+  it("attaches the diff to the human's explanation", async () => {
+    const b = await quizzed();
+    const [result] = await b.emit(
+      "input",
+      { text: "I added a retry wrapper", source: "interactive" },
+      b.ctx,
+    );
+    assert.equal(result.action, "transform");
+    assert.match(result.text, /^I added a retry wrapper/);
+    assert.match(result.text, /<pear-diff/);
+    assert.match(result.text, /work\.ts/);
+  });
+
+  it("does not attach a diff when nobody asked", async () => {
+    const b = await boot(navigator());
+    const [result] = await b.emit("input", { text: "hello", source: "interactive" }, b.ctx);
+    assert.equal(result, undefined);
+  });
+
+  it("never attaches a diff to its own injected message", async () => {
+    const b = await quizzed();
+    const [result] = await b.emit("input", { text: "(pear) ...", source: "extension" }, b.ctx);
+    assert.equal(result, undefined, "pear must not staple a diff to itself");
+  });
+
+  it("acknowledges once the review turn settles", async () => {
+    const b = await quizzed();
+    await b.emit("input", { text: "here is what I did", source: "interactive" }, b.ctx);
+    await b.emit("agent_settled", {}, b.ctx); // the *answer* turn
+
+    // Same tree, so nothing new to raise.
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1, "work already discussed is not re-raised");
+  });
+
+  it("acknowledges even when the human declined to explain", async () => {
+    // The agent is the navigator here and was shown the diff either way.
+    const b = await quizzed();
+    await b.emit("input", { text: "not now", source: "interactive" }, b.ctx);
+    await b.emit("agent_settled", {}, b.ctx);
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1);
+  });
+
+  it("starts on demand even with a half-typed message", async () => {
+    // Typing /pear-explain *is* the answer to "is now a good time?". The guard
+    // exists to stop pear interrupting; it must not stop the human asking.
+    const b = await boot({ ...navigator(), editorText: "/pear-explain" });
+    adopt(b);
+    humanEdits(b, "work.ts", 20);
+    await b.commands.get("pear-explain")?.handler("", b.ctx);
+    assert.equal(b.sentUserMessages.length, 1);
+  });
+
+  it("declines on demand when the agent is mid-turn, and says why", async () => {
+    const b = await boot({ ...navigator(), idle: false });
+    adopt(b);
+    humanEdits(b, "work.ts", 20);
+    await b.commands.get("pear-explain")?.handler("", b.ctx);
+    assert.deepEqual(b.sentUserMessages, []);
+    assert.ok(b.notifications.some((n) => /mid-turn/.test(n.message)));
+  });
+
+  it("raises the next batch of work after a review", async () => {
+    const b = await quizzed();
+    await b.emit("input", { text: "explained", source: "interactive" }, b.ctx);
+    await b.emit("agent_settled", {}, b.ctx);
+
+    humanEdits(b, "more.ts", 400);
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 2);
+  });
+});
+
+describe("/pear-explain", () => {
+  it("starts a review on demand", async () => {
+    const b = await boot(navigator());
+    humanEdits(b, "work.ts", 5);
+    await b.commands.get("pear-explain")?.handler("", b.ctx);
+    assert.equal(b.sentUserMessages.length, 1, "no threshold to wait for");
+  });
+
+  it("says so when there is nothing to talk about", async () => {
+    const b = await boot(navigator());
+    await b.commands.get("pear-explain")?.handler("", b.ctx);
+    assert.deepEqual(b.sentUserMessages, []);
+    assert.ok(b.notifications.some((n) => /nothing has changed/.test(n.message)));
+  });
+
+  it("works even after the watcher has parked", async () => {
+    // The escape hatch must not depend on the thing that broke.
+    const b = await boot(navigator());
+    humanEdits(b, "work.ts", 5);
+    await b.emit("session_shutdown", { reason: "quit" }, b.ctx);
+    await b.commands.get("pear-explain")?.handler("", b.ctx);
+    assert.equal(b.sentUserMessages.length, 1);
+  });
+
+  it("points at /pear-checkpoint when the agent is driving", async () => {
+    const b = await boot(driver());
+    await b.commands.get("pear-explain")?.handler("", b.ctx);
+    assert.ok(b.notifications.some((n) => /pear-checkpoint/.test(n.message)));
+  });
+});
+
+describe("/pear-swap", () => {
+  it("hands the keyboard to the human and starts watching", async () => {
+    const b = await boot(driver());
+    assert.equal(b.timers.started(), 0);
+
+    await b.commands.get("pear-swap")?.handler("", b.ctx);
+    assert.equal(b.timers.liveCount(), 1, "now watching");
+    assert.ok(!b.activeTools().includes("edit"), "agent may no longer edit");
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.match(decision?.reason ?? "", /the human is driving/);
+  });
+
+  it("hands it back and stops watching", async () => {
+    const b = await boot(navigator());
+    await b.commands.get("pear-swap")?.handler("", b.ctx);
+
+    assert.equal(b.timers.liveCount(), 0, "no longer watching");
+    assert.ok(b.activeTools().includes("edit"), "agent may edit again");
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.equal(decision, undefined);
+  });
+
+  it("restores the write tools additively", async () => {
+    const b = await boot(navigator());
+    b.api.setActiveTools([...b.activeTools(), "other_tool"]);
+    await b.commands.get("pear-swap")?.handler("", b.ctx);
+
+    const restore = b.toolSetCalls.at(-1);
+    assert.ok(restore?.includes("edit"));
+    assert.ok(restore?.includes("other_tool"), "must not clobber another extension's tool");
+  });
+
+  it("keeps the plan across the handover", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    await approvePlan(b);
+    await b.commands.get("pear-swap")?.handler("", b.ctx);
+
+    await b.commands.get("pear-plan")?.handler("", b.ctx);
+    assert.ok(b.notifications.some((n) => /1\. First/.test(n.message)));
+  });
+
+  it("does not persist the handover to disk", async () => {
+    const b = await boot(driver());
+    await b.commands.get("pear-swap")?.handler("", b.ctx);
+    const onDisk = JSON.parse(readFileSync(join(b.cwd, ".pear", "config.json"), "utf8"));
+    assert.equal(onDisk.mode, "agent-driver", "swap is session-level; /pear-mode persists");
+  });
+
+  it("refuses to hand over outside a git repository", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pear-nogit-"));
+    execFileSync("git", ["init", "-q"], { cwd });
+    const b = await boot({ cwd, ...driver() });
+    // Break the repo out from under it.
+    execFileSync("rm", ["-rf", join(cwd, ".git")]);
+
+    await b.commands.get("pear-swap")?.handler("", b.ctx);
+    assert.ok(b.notifications.some((n) => /git repository/.test(n.message)));
+    assert.equal(b.timers.liveCount(), 0, "never started watching");
+  });
+});
+
+describe("human-driver: re-triggering", () => {
+  it("does not re-raise explained work when the human types one more line", async () => {
+    const b = await boot(navigator({ reviewBudget: 200 }));
+    adopt(b);
+    humanEdits(b, "work.ts", 400);
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1);
+    await b.emit("agent_settled", {}, b.ctx);
+    await b.emit("input", { text: "explained", source: "interactive" }, b.ctx);
+    await b.emit("agent_settled", {}, b.ctx);
+
+    humanEdits(b, "work.ts", 402); // two more lines, nothing like a new batch
+    b.timers.poll(12);
+    assert.equal(b.sentUserMessages.length, 1, "already discussed");
   });
 });

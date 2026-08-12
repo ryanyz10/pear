@@ -134,6 +134,35 @@ ${planText}
 ${VOICE}`;
 }
 
+/**
+ * Appended to the system prompt when the human is driving.
+ *
+ * The agent is the navigator here, and the inversion needs saying plainly: it
+ * reviews rather than builds, and it cannot edit at all. Carries the plan for
+ * the same reason the build persona does — it is the frame the human's
+ * explanation gets judged against.
+ */
+export function humanDriverPersona(planText: string): string {
+  return `## Pair programming: you are the navigator
+
+The human is driving. They write the code; you keep them honest about it. You cannot edit anything — if a change needs making, say so and let them make it, or suggest they run \`/pear-swap\`.
+
+This is the plan you both agreed to:
+
+${planText}
+
+When they explain what they changed, you will be given the diff alongside their words. Read both, then:
+
+- Say whether what they built matches what they just described. A mismatch between the two is the single most useful thing you can find.
+- Point out logic problems, missed cases, and anything the plan called for that is not there.
+- If it looks right, say so briefly and let them get back to work. Do not manufacture concerns.
+- Ask about anything in the diff you genuinely do not understand — that is often where the bug is.
+
+Judge the code, not the person. One or two real points beat a list of nitpicks.
+
+${VOICE}`;
+}
+
 /** Truncate free text from the human, marking it so the model knows it was cut. */
 export function clampSteering(text: string): string {
   const trimmed = text.trim();
@@ -286,6 +315,93 @@ export function nagDue(points: number, budget: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Human-driver: the quiz loop
+// ---------------------------------------------------------------------------
+
+/** Cap on a diff handed to the model, to bound a pathological working tree. */
+export const MAX_DIFF_BYTES = 200_000;
+
+const MAX_PATHS_IN_PROMPT = 8;
+
+/**
+ * The message pear injects to start a review turn.
+ *
+ * It renders as an ordinary user message — `sendUserMessage` is the only way to
+ * start a turn that still fires `before_agent_start`, and therefore the only
+ * way the persona above gets injected. So it is labelled as pear speaking
+ * rather than pretending the human typed it.
+ */
+export function quizPrompt(files: string[], insertions: number, deletions: number): string {
+  const shown = files.slice(0, MAX_PATHS_IN_PROMPT);
+  const rest = files.length - shown.length;
+  const list =
+    shown.length === 0
+      ? "some files"
+      : shown.join(", ") + (rest > 0 ? `, and ${rest} more` : "");
+  return (
+    `(pear) I have ${files.length} uncommitted file${files.length === 1 ? "" : "s"} — ` +
+    `${list} (+${insertions}/−${deletions}). Ask me to walk you through what I did and why.`
+  );
+}
+
+/**
+ * Widget content for the passive nudge. Kept to two lines.
+ *
+ * The counts describe the whole uncommitted tree, because that is exactly what
+ * the agent gets handed when the conversation starts. The *pacing* discounts
+ * work already reviewed (see `core/watch.ts`); the numbers on screen do not,
+ * because claiming "since we last talked" while showing a whole-tree count
+ * would be the one thing worse than showing a bigger number.
+ */
+export function nudgeLines(files: number, lines: number, due: boolean): string[] {
+  const scale = `${files} file${files === 1 ? "" : "s"}, ~${lines} line${lines === 1 ? "" : "s"}`;
+  return [
+    `pear · ${scale} uncommitted`,
+    due ? "worth talking through — /pear-explain" : "ready when you are",
+  ];
+}
+
+/**
+ * Wrap the human's explanation with the diff it is about.
+ *
+ * Delivered through the `input` hook's `transform`, so the agent gets the words
+ * and the code in one turn and can compare them. The diff is the whole
+ * uncommitted tree: a partial one would make the agent judge an explanation
+ * against code it cannot see all of, which is worse than showing it twice.
+ */
+export function withDiff(explanation: string, diff: string): string {
+  const trimmed =
+    diff.length <= MAX_DIFF_BYTES
+      ? diff
+      : `${diff.slice(0, MAX_DIFF_BYTES)}\n[…truncated by pear at ${MAX_DIFF_BYTES} bytes]`;
+  return (
+    `${explanation}\n\n` +
+    `<pear-diff description="What actually changed since the last review. Compare it against what I just told you.">\n` +
+    `${trimmed}\n` +
+    `</pear-diff>`
+  );
+}
+
+export function parkedNotice(detail: string): string {
+  return (
+    `pear: stopped watching for changes after repeated git errors (${detail}). ` +
+    `Nothing else is affected — use /pear-explain to review by hand, or /pear-swap to restart watching.`
+  );
+}
+
+export const NOTHING_TO_EXPLAIN =
+  "pear: nothing has changed since your last review, so there is nothing to walk through.";
+
+/** Blocked tool calls specific to human-driver. */
+export const BLOCK_HUMAN_DRIVER =
+  `pear: the human is driving, so you cannot change anything. NOT EXECUTED. ` +
+  `Say what you would change and let them do it, or suggest they run /pear-swap.`;
+
+export const RESULT_CHECKPOINT_NOT_DRIVING =
+  `pear: you are navigating, not driving — there is nothing for you to check in about. ` +
+  `Wait for the human to explain their changes.`;
+
+// ---------------------------------------------------------------------------
 // Human-facing status
 // ---------------------------------------------------------------------------
 
@@ -297,11 +413,15 @@ export function statusLine(
   budget: number,
   extra?: string,
 ): string {
-  const base =
-    mode !== "agent-driver"
-      ? `pear: ${mode}`
-      : phase === "building"
-        ? `pear: driver ${points}/${budget}`
-        : `pear: ${phase}`;
+  let base: string;
+  if (mode === "off") {
+    base = "pear: off";
+  } else if (phase === "scoping") {
+    // Both drivers scope the same way, so the driver is not worth showing yet.
+    base = "pear: scoping";
+  } else {
+    const role = mode === "human-driver" ? "watching" : "driver";
+    base = `pear: ${role} ${points}/${budget}`;
+  }
   return extra === undefined ? base : `${base} · ${extra}`;
 }

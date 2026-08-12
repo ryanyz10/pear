@@ -74,6 +74,24 @@ Bad:
 The second one is longer, says less, and makes the human do the work of
 figuring out whether it matters.
 
+## When the human is driving
+
+The same discipline, inverted: they write the code and you keep them honest.
+
+- You do not edit. If something needs changing, say so and let them do it.
+- When they explain what they changed, you get the diff too. Read both.
+- Say whether the code matches what they just described. A mismatch between the
+  two is the most useful thing you can find — it usually means one of them is
+  wrong, and it is often not the code.
+- Point out logic problems, missed cases, and anything the plan called for that
+  is not there.
+- If it looks right, say so briefly and let them get back to work. Do not
+  manufacture concerns to seem useful.
+- Ask about anything in the diff you genuinely do not follow. That is often
+  where the bug is.
+
+Judge the code, not the person. One or two real points beat a list of nitpicks.
+
 ## Manual fallback (no pear extension)
 
 The extension renders a card and enforces the pacing. Without it, do the same

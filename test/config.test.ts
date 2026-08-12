@@ -9,10 +9,13 @@ import {
   DEFAULTS,
   LEGACY_BUDGET_KEY,
   LEGACY_CHANGE_POINTS,
+  LEGACY_MODES,
+  MODES,
   MAX_BUDGET,
   MIN_BUDGET,
   SOFT_FRACTION,
   configPath,
+  isMode,
   isValidBudget,
   loadConfig,
   loadTier,
@@ -135,14 +138,22 @@ describe("loadConfig", () => {
     assert.equal(loaded.config.exclusive, DEFAULTS.exclusive);
   });
 
-  it("surfaces a legacy human-driver mode instead of silently coercing", () => {
+  it("runs a human-driver config that older versions only warned about", () => {
     const dir = tempProject();
     writeConfig(dir, JSON.stringify({ mode: "human-driver", reviewModel: "x/y" }));
     const loaded = loadConfig(dir);
-    assert.equal(loaded.legacyMode, "human-driver");
-    assert.equal(loaded.config.mode, "off");
+    assert.equal(loaded.config.mode, "human-driver");
+    assert.equal(loaded.legacyMode, undefined, "no longer a legacy mode");
     // and the raw object still carries the unknown field
     assert.equal(loaded.raw.reviewModel, "x/y");
+  });
+
+  it("still reports a mode it cannot run at all", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ mode: "telepathy" }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.mode, DEFAULTS.mode);
+    assert.equal(loaded.legacyMode, undefined, "unknown is not the same as legacy");
   });
 
   it("flags malformed JSON without throwing", () => {
@@ -235,7 +246,7 @@ describe("saveConfig", () => {
       ConfigWriteError,
     );
     assert.throws(
-      () => saveConfig(dir, { mode: "human-driver" as unknown as "off" }),
+      () => saveConfig(dir, { mode: "telepathy" as unknown as "off" }),
       ConfigWriteError,
     );
   });
@@ -313,5 +324,22 @@ describe("saveConfig", () => {
     saveConfig(dir, { reviewBudget: 240 }, spy);
     saveConfig(dir, { reviewBudget: 280 }, spy);
     assert.equal(seen.size, 2, "temp paths must not collide");
+  });
+});
+
+describe("modes", () => {
+  it("accepts every mode this version can run", () => {
+    for (const mode of MODES) assert.equal(isMode(mode), true, mode);
+  });
+
+  it("includes human-driver, and no longer treats it as legacy", () => {
+    assert.ok(MODES.includes("human-driver"));
+    assert.deepEqual([...LEGACY_MODES], [], "nothing is deferred any more");
+  });
+
+  it("rejects anything not in the list", () => {
+    for (const v of ["", "driver", "HUMAN-DRIVER", null, undefined, 1, {}]) {
+      assert.equal(isMode(v), false, JSON.stringify(v) ?? String(v));
+    }
   });
 });

@@ -89,7 +89,7 @@ node -e '
 ' || fail "a config write dropped fields it should have preserved"
 echo "ok: unknown keys preserved"
 
-echo "== leg d: a legacy human-driver config is not rewritten =="
+echo "== leg d: a human-driver config activates and is not rewritten =="
 cat > .pear/config.json <<'JSON'
 {
   "mode": "human-driver",
@@ -97,10 +97,16 @@ cat > .pear/config.json <<'JSON'
 }
 JSON
 BEFORE="$(shasum .pear/config.json | cut -d' ' -f1)"
-"$PI" -e "$EXT" --no-session -p "/pear-status" >/dev/null 2>&1
+"$PI" -e "$EXT" --no-session -p "/pear-status" >"$WORKDIR/human.txt" 2>&1 \
+  || { cat "$WORKDIR/human.txt" >&2; fail "a human-driver session failed to start"; }
 AFTER="$(shasum .pear/config.json | cut -d' ' -f1)"
-[[ "$BEFORE" == "$AFTER" ]] || fail "legacy config was modified (before=$BEFORE after=$AFTER)"
-echo "ok: legacy config left byte-identical"
+[[ "$BEFORE" == "$AFTER" ]] || fail "config was modified (before=$BEFORE after=$AFTER)"
+# human-driver is a real mode now: it must not be reported as unavailable.
+if grep -qi "isn't available" "$WORKDIR/human.txt"; then
+  cat "$WORKDIR/human.txt" >&2
+  fail "human-driver was treated as a legacy mode"
+fi
+echo "ok: human-driver runs, unknown keys and file left byte-identical"
 
 echo "== leg e: session stays alive and usable after pear commands =="
 # Liveness proxy available without a model: pi must exit 0 and keep processing

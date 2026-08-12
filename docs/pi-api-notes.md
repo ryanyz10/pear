@@ -123,8 +123,9 @@ export type InputSource = "interactive" | "rpc" | "extension";
 The stop latch must be cleared only by genuine user input. Because `source`
 distinguishes `"extension"` (i.e. `pi.sendUserMessage`) from `"interactive"` /
 `"rpc"`, pear clears the latch **only** when `source !== "extension"`. No probe
-was needed; the type makes this decidable. pear itself never calls
-`sendUserMessage`, but a third-party extension cannot silently defeat Stop.
+was needed; the type makes this decidable. pear's human-driver auto-trigger is
+itself a `sendUserMessage`, so this is also what stops pear clearing its own
+holds and stapling a diff to its own question.
 
 ### `session_shutdown` covers extension reload
 
@@ -336,3 +337,33 @@ nothing.
 
 Removals (entering scoping, `exclusive`) happen at `session_start` or in command
 handlers, not during tool execution, so the additive rule does not bind them.
+
+## Verified for v4 (still 0.83.0)
+
+### Extension commands never reach the `input` hook
+
+`AgentSession.prompt()` (`dist/core/agent-session.js:792`) dispatches in this
+order:
+
+1. If the text starts with `/`, try `_tryExecuteExtensionCommand`. On a hit it
+   returns immediately — **before** any `input` handler runs (:799-806).
+2. Only then does it emit `input` (:810).
+3. Skill commands (`/skill:name`) and prompt templates are expanded *after*
+   `input` (:822-826).
+
+pear relies on step 1: while a human-driver quiz is open, the `input` hook
+treats the next message as the answer and staples the working diff to it. If
+commands went through the hook, typing `/pear-status` mid-quiz would close the
+quiz and attach 200 KB of diff to a status request.
+
+The gap this leaves is step 3: a *skill* invocation typed while a quiz is open
+does reach the hook and is treated as the answer. That is a genuine turn the
+model sees, so the diff is not misdelivered — it is just attached to a message
+about something else. Accepted.
+
+### `sendUserMessage` is the only injection that fires `before_agent_start`
+
+`sendUserMessage` routes through `prompt()`, which fires `input` and
+`before_agent_start`. `sendMessage({ triggerTurn: true })` calls
+`_runAgentPrompt` directly and skips both. The human-driver auto-trigger must
+use the former or the model runs the review turn without the navigator persona.
