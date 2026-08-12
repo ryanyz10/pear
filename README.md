@@ -388,9 +388,14 @@ git push origin main --follow-tags
 ```
 
 `.github/workflows/release.yml` then runs the same gates as CI, checks the tag
-agrees with `package.json`, and publishes. It authenticates with npm through
-OIDC [trusted publishing](https://docs.npmjs.com/trusted-publishers), so there
-is no token stored in the repo and every published version carries provenance.
+agrees with `package.json`, publishes, and finally opens a GitHub Release with
+notes generated from the commits since the previous tag. It authenticates with
+npm through OIDC [trusted publishing](https://docs.npmjs.com/trusted-publishers),
+so there is no token stored in the repo and every published version carries
+provenance.
+
+The version is always chosen by hand — nothing derives it from commit messages.
+The workflow only reacts to a tag; it never creates one.
 
 That requires a one-time setup on npmjs.com: on the package's Settings page,
 add a trusted publisher pointing at this repository and the workflow file

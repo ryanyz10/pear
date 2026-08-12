@@ -8,7 +8,8 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  # write, not read, only so the last step can create the GitHub Release.
+  contents: write
   # Required for npm trusted publishing (OIDC). GitHub mints a short-lived
   # token for this run, so there is no NPM_TOKEN secret to leak or rotate.
   id-token: write
@@ -63,3 +64,20 @@ jobs:
       # --provenance would be redundant.
       - name: Publish to npm
         run: npm publish
+
+      # Deliberately last: a Release page announcing a version that failed to
+      # publish would be worse than no page at all.
+      #
+      # This uses the preinstalled `gh` rather than a third-party action on
+      # purpose. This workflow holds `id-token: write` — the credential that
+      # publishes to npm as us — and a marketplace action running in the same
+      # job inherits that blast radius. `gh` ships on the runner and
+      # authenticates with the built-in token.
+      #
+      # --generate-notes writes the changelog from commits since the previous
+      # tag; --verify-tag refuses to invent a release for a tag that is not
+      # actually on the remote.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
