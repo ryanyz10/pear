@@ -1,6 +1,6 @@
 {
   "name": "pi-pear",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pair-programming checkpoint loop for pi: the agent pauses after each logical change and asks the human to continue, steer, or stop",
   "type": "module",
   "license": "MIT",
