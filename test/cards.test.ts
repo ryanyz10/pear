@@ -153,6 +153,36 @@ describe("plan card", () => {
   it("says plainly that dismissing approves nothing", () => {
     assert.match(planCard({ summary: "S", steps: [] }).footer ?? "", /nothing is approved/);
   });
+
+  it("shows context, decisions, and open questions as sections", () => {
+    const rendered = text(
+      planCard({
+        summary: "S",
+        context: "The client retries nothing today.",
+        decisions: ["Retry on 5xx only"],
+        steps: ["A"],
+        openQuestions: ["Timeout value?"],
+      }),
+    );
+    assert.match(rendered, /context/);
+    assert.match(rendered, /The client retries nothing today\./);
+    assert.match(rendered, /what you decided/);
+    assert.match(rendered, /Retry on 5xx only/);
+    assert.match(rendered, /still open/);
+    assert.match(rendered, /Timeout value\?/);
+  });
+
+  it("omits sections that are not filled in", () => {
+    const rendered = text(planCard({ summary: "S", steps: ["A"] }));
+    for (const label of ["context", "what you decided", "still open"]) {
+      assert.doesNotMatch(rendered, new RegExp(label));
+    }
+  });
+
+  it("names the draft once a round has been iterated", () => {
+    assert.equal(planCard({ summary: "S", steps: [] }).title, "pear · plan");
+    assert.equal(planCard({ summary: "S", steps: [] }, 2).title, "pear · plan · draft 2");
+  });
 });
 
 describe("ask card", () => {

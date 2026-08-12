@@ -1,6 +1,6 @@
 # pear
 
-A pair-programming loop for [pi](https://github.com/badlogic/pi-mono). You agree
+A pair-programming loop for [pi](https://github.com/earendil-works/pi). You agree
 an approach together, then the agent drives and you navigate — it works in
 digestible increments and checks in between them.
 

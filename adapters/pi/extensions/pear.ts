@@ -26,9 +26,15 @@ import {
   MODES,
   isValidBudget,
   loadConfig,
+  nodeFs,
   saveConfig,
   type Mode,
 } from "../../../core/config.ts";
+import {
+  latestPlanPath,
+  writePlanApproved,
+  writePlanDraft,
+} from "../../../core/plan-file.ts";
 import {
   ASK_TOOL_DESCRIPTION,
   ASK_TOOL_NAME,
@@ -71,7 +77,22 @@ const AskParams = Type.Object({
 
 const PlanParams = Type.Object({
   summary: Type.String({ description: "How you intend to solve it, in a sentence or two." }),
-  steps: Type.Array(Type.String(), { description: "The steps, in the order you will do them." }),
+  context: Type.Optional(
+    Type.String({ description: "What you learned while scoping — the problem, constraints, why this approach." }),
+  ),
+  steps: Type.Array(Type.String(), {
+    description: "The steps, in the order you will do them. Each is one bounded action the navigator can recognise happening.",
+  }),
+  decisions: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "What the navigator decided during scoping (ask answers, steering).",
+    }),
+  ),
+  openQuestions: Type.Optional(
+    Type.Array(Type.String(), {
+      description: "Anything still unresolved — shown on the card so it is not silently guessed.",
+    }),
+  ),
   risks: Type.Optional(
     Type.Array(Type.String(), { description: "Anything that might go wrong or need a decision." }),
   ),
@@ -535,7 +556,7 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
         ? SCOPING_PERSONA
         : runtime.driver === "human"
           ? humanDriverPersona(plan)
-          : buildPersona(plan);
+          : buildPersona(plan, runtime.plan?.openQuestions);
     return { systemPrompt: `${event.systemPrompt}\n\n${persona}` };
   });
 
@@ -814,17 +835,21 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const onAbort = () => runtime?.resolvePending({ kind: "dismissed" });
       signal?.addEventListener("abort", onAbort, { once: true });
-      const proposed: PlanSpec =
-        params.risks === undefined
-          ? { summary: params.summary, steps: params.steps }
-          : { summary: params.summary, steps: params.steps, risks: params.risks };
+      const proposed: PlanSpec = {
+        summary: params.summary,
+        steps: params.steps,
+        ...(params.context !== undefined ? { context: params.context } : {}),
+        ...(params.decisions !== undefined ? { decisions: params.decisions } : {}),
+        ...(params.openQuestions !== undefined ? { openQuestions: params.openQuestions } : {}),
+        ...(params.risks !== undefined ? { risks: params.risks } : {}),
+      };
       try {
-        const { text, terminate, details } = await runCard(
+        const result = await runCard(
           ctx,
           "plan",
           params.summary,
           (rt) => rt.beginPlan(),
-          () => planCard(proposed),
+          () => planCard(proposed, runtime?.planDrafts ?? 0),
           { kind: "dismissed" as const },
           (rt, answer) => {
             const resolution = rt.applyPlanAnswer(answer, proposed);
@@ -840,7 +865,26 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
             return resolution;
           },
         );
-        return { content: [{ type: "text" as const, text }], details, terminate };
+        let text = result.text;
+        // A card was shown, so a proposal exists on disk — except when the call
+        // was rejected outright ("not-run"), in which case nothing was proposed.
+        if (result.details.kind === "plan" && result.details.answer !== "not-run") {
+          try {
+            writePlanDraft(ctx.cwd, proposed, nodeFs, now);
+            if (result.details.answer === "approve") {
+              writePlanApproved(ctx.cwd, proposed, nodeFs, now);
+              text = `${result.text}\n\nSaved to ${latestPlanPath(ctx.cwd)}.`;
+            }
+          } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            ctx.ui.notify(`pear: the plan was not saved to disk (${message}).`, "warning");
+          }
+        }
+        return {
+          content: [{ type: "text" as const, text }],
+          details: result.details,
+          terminate: result.terminate,
+        };
       } finally {
         signal?.removeEventListener("abort", onAbort);
       }
@@ -942,7 +986,9 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       if (rt === null) return;
       const plan = rt.plan;
       ctx.ui.notify(
-        plan === null ? "pear: no plan approved yet." : `pear plan\n\n${formatPlan(plan)}`,
+        plan === null
+          ? "pear: no plan approved yet — drafts save to .pear/plans/latest.md."
+          : `pear plan (saved at ${latestPlanPath(ctx.cwd)})\n\n${formatPlan(plan)}`,
         "info",
       );
     },

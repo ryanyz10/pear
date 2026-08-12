@@ -8,8 +8,10 @@ import {
   captureGitState,
   changedLineStats,
   isGitRepo,
+  isPearBookkeeping,
   parsePorcelainV2,
   worktreeToken,
+  workingDiffText,
 } from "../core/git.ts";
 
 function git(cwd: string, ...args: string[]): string {
@@ -391,5 +393,77 @@ describe("changedLineStats", () => {
     const result = changedLineStats("/tmp", failing);
     assert.equal(result.ok, false);
     assert.equal(result.ok === false && result.reason, "git-error");
+  });
+});
+
+describe("pear's own bookkeeping is not the human's work", () => {
+  /** A repo with a real change and a .pear plan file that is NOT gitignored. */
+  function repoWithPearPlan(): string {
+    const dir = repo();
+    writeFileSync(join(dir, "a.txt"), "one\n");
+    commit(dir);
+    mkdirSync(join(dir, ".pear", "plans"), { recursive: true });
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "# pear plan\n");
+    writeFileSync(join(dir, "new.txt"), "hello\n");
+    return dir;
+  }
+
+  it("isPearBookkeeping covers the directory and its contents", () => {
+    assert.equal(isPearBookkeeping(".pear"), true);
+    assert.equal(isPearBookkeeping(".pear/plans/latest.md"), true);
+    assert.equal(isPearBookkeeping("pear/notes.md"), false, "a sibling dir is fine");
+    assert.equal(isPearBookkeeping("src/a.ts"), false);
+  });
+
+  it("captureGitState skips untracked files under .pear but keeps real changes", () => {
+    const dir = repoWithPearPlan();
+    const state = captureGitState(dir);
+    assert.ok(state.ok);
+    assert.ok(state.ok && !state.files.has(".pear/plans/latest.md"));
+    assert.ok(state.ok && state.files.has("new.txt"), "the human's file still shows");
+  });
+
+  it("captureGitState ignores a tracked .pear modification", () => {
+    const dir = repo();
+    mkdirSync(join(dir, ".pear", "plans"), { recursive: true });
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "v1\n");
+    commit(dir);
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "v2\n");
+    const state = captureGitState(dir);
+    assert.ok(state.ok);
+    assert.ok(state.ok && state.files.size === 0);
+  });
+
+  it("changedLineStats ignores .pear even when it is not gitignored", () => {
+    const dir = repoWithPearPlan();
+    const result = changedLineStats(dir);
+    assert.ok(result.ok);
+    assert.deepEqual(result.stats, { files: 1, insertions: 1, deletions: 0 });
+  });
+
+  it("changedLineStats ignores a tracked .pear file's churn", () => {
+    const dir = repo();
+    mkdirSync(join(dir, ".pear", "plans"), { recursive: true });
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "v1\n");
+    commit(dir);
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "v1\nv2\nv3\n");
+    const result = changedLineStats(dir);
+    assert.ok(result.ok);
+    assert.deepEqual(result.stats, { files: 0, insertions: 0, deletions: 0 });
+  });
+
+  it("workingDiffText leaves pear's plan file out, untracked or tracked", () => {
+    const dir = repoWithPearPlan();
+    const diff = workingDiffText(dir);
+    assert.ok(diff !== null);
+    assert.doesNotMatch(diff, /\.pear/);
+    assert.match(diff, /new\.txt/);
+
+    git(dir, "add", ".pear");
+    git(dir, "commit", "-qm", "track the plan");
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "# pear plan\nv2\n");
+    const trackedDiff = workingDiffText(dir);
+    assert.ok(trackedDiff !== null);
+    assert.doesNotMatch(trackedDiff, /latest\.md/);
   });
 });

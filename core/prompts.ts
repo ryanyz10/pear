@@ -28,9 +28,9 @@ Use this whenever a decision is genuinely theirs to make: an ambiguous requireme
 
 export const PLAN_TOOL_DESCRIPTION = `Propose how you intend to solve the problem, and get the navigator's approval before you start building.
 
-Keep it short and concrete: what you are going to do, in the order you will do it. Steps should be things they can recognise happening, not internal bookkeeping.
+Write the plan as a step-by-step guide you could follow without thinking: a one-line goal (summary), what you learned while exploring (context), the decisions the navigator made (decisions), the numbered steps, anything still open (openQuestions), and risks. A step is one bounded action the navigator can recognise happening.
 
-Nothing can be edited until a plan is approved. Once it is, the plan becomes the shared frame for the rest of the session — every later checkpoint is reported against it.`;
+Nothing can be edited until a plan is approved. A first proposal is a draft — expect the navigator to send it back. Once it is approved, the plan becomes the shared frame for the rest of the session — every later checkpoint is reported against it.`;
 
 export const CHECKPOINT_TOOL_DESCRIPTION = `Show the navigator what you just changed, then get their decision before continuing.
 
@@ -65,37 +65,70 @@ const VOICE = `## How to talk
 /**
  * Appended to the system prompt during the scoping phase.
  *
- * Deliberately short: long personas get diluted.
+ * This is the behavioural core of plan mode: the agent is not asked to file a
+ * proposal, it is asked to run a discovery loop. A first proposal is a draft;
+ * the human's revise/explore answers are the mechanism that converges it.
  */
-export const SCOPING_PERSONA = `## Pair programming: agree the approach first
+export const SCOPING_PERSONA = `## Pair programming: discover before you build
 
-A human is your navigator. You are about to work on their problem together, and right now you are still deciding *what* to do — not doing it.
+A human is your navigator. You cannot edit anything yet. Your job is to turn the request into a plan worth approving — that takes more than one pass.
 
-- You cannot edit anything yet. Read, search, and run read-only commands to understand the problem.
-- If something is genuinely ambiguous and only they can settle it, ask with \`${ASK_TOOL_NAME}\`. Offer real options.
-- When you know what you would do, call \`${PLAN_TOOL_NAME}\` with a short summary and the steps in order.
-- If they send you back to explore more, do that and propose again. Do not argue for your first plan.
+1. **Understand.** Read, search, run read-only commands. Find out what the problem actually is before you propose anything.
+2. **Ask.** Use \`${ASK_TOOL_NAME}\` for anything that changes the approach: what done looks like, scope, constraints, what they already tried. Ask before you draft, not after.
+3. **Draft.** Propose the plan with \`${PLAN_TOOL_NAME}\`: a one-line goal, what you learned while exploring, the decisions they made, the numbered step-by-step guide, anything still open, and risks.
+4. **Iterate.** The first proposal is a draft. They will send it back — "change something" or "keep exploring" — and each round should tighten the plan. Fold what they say into the plan's decisions and open questions.
+
+A step is only a step if it is one bounded action the navigator can recognise happening. If you could not follow your own plan without thinking, it is not ready yet. A plan with open questions is a draft that names what is missing — ask, then re-propose.
 
 ${VOICE}`;
 
-/** What the agent proposed and the human approved. */
+/**
+ * What the agent proposed and the human approved.
+ *
+ * The plan is a document, not a form: it carries the goal, what was learned
+ * while scoping, the decisions the human made, the step-by-step build guide,
+ * and what is still unresolved. A plan with open questions is a draft that
+ * names its own gaps rather than hiding them.
+ */
 export type PlanSpec = {
+  /** One-line goal: what done looks like. */
   summary: string;
+  /** What we learned while scoping — the problem, constraints, context. */
+  context?: string;
+  /** The numbered build guide. One bounded action per step. */
   steps: string[];
+  /** What the human explicitly decided during scoping (ask answers, steering). */
+  decisions?: string[];
+  /** Still unresolved. Shown on the card and to the agent. */
+  openQuestions?: string[];
+  /** Anything that might go wrong or need a decision. */
   risks?: string[];
 };
 
 /**
- * Render a plan for the model and for `/pear-plan`.
+ * Render a plan for the model, for `/pear-plan`, and for the saved markdown.
  *
- * One rendering for both audiences on purpose: what the human approved and what
- * the agent is reminded of must not be able to drift apart.
+ * One rendering for all audiences on purpose: what the human approved, what
+ * the agent is reminded of, and what is written to `.pear/plans/` must not be
+ * able to drift apart. It reads as plain text in the card and as light
+ * markdown in the file, so no second renderer is needed.
  */
 export function formatPlan(plan: PlanSpec): string {
   const lines = [plan.summary.trim()];
+  if (plan.context !== undefined && plan.context.trim() !== "") {
+    lines.push("", "Context:", plan.context.trim());
+  }
+  if (plan.decisions !== undefined && plan.decisions.length > 0) {
+    lines.push("", "What you decided:");
+    for (const decision of plan.decisions) lines.push(`- ${decision.trim()}`);
+  }
   if (plan.steps.length > 0) {
-    lines.push("");
+    lines.push("", "How we'll build it:");
     plan.steps.forEach((step, i) => lines.push(`${i + 1}. ${step.trim()}`));
+  }
+  if (plan.openQuestions !== undefined && plan.openQuestions.length > 0) {
+    lines.push("", "Still open:");
+    for (const question of plan.openQuestions) lines.push(`- ${question.trim()}`);
   }
   if (plan.risks !== undefined && plan.risks.length > 0) {
     lines.push("", "Watch out for:");
@@ -111,7 +144,11 @@ export function formatPlan(plan: PlanSpec): string {
  * summaries land against a frame the human already agreed to, rather than
  * floating free.
  */
-export function buildPersona(planText: string): string {
+export function buildPersona(planText: string, openQuestions?: string[]): string {
+  const unsettled =
+    openQuestions !== undefined && openQuestions.length > 0
+      ? `- The plan above names open questions — raise them at your first checkpoint rather than guessing.\n`
+      : "";
   return `## Pair programming: you are the driver
 
 A human is your navigator. They are not watching every edit, so you keep them oriented by checkpointing.
@@ -120,7 +157,7 @@ This is the plan you both agreed to:
 
 ${planText}
 
-- Say what you are going for in a sentence before starting a chunk of work.
+${unsettled}- Say what you are going for in a sentence before starting a chunk of work.
 - When one recognisable piece of the plan is done, call \`${CHECKPOINT_TOOL_NAME}\`. That may be one edit or several — stop at a coherent boundary, not mid-thought.
 - Always checkpoint before ending a turn in which you changed anything.
 - Then do what the answer says:

@@ -72,6 +72,17 @@ function normalizeOid(oid: string | undefined): string {
 }
 
 /**
+ * pear's own bookkeeping directory. Everything under it is written by pear —
+ * the config, the plan files — never by the human. It must never count as the
+ * human's work: without this exclusion, a plan file written during scoping
+ * would show up as an uncommitted change and trigger a quiz about a file the
+ * human never touched.
+ */
+export function isPearBookkeeping(relPath: string): boolean {
+  return relPath === ".pear" || relPath.startsWith(".pear/");
+}
+
+/**
  * Token for a path's current worktree state. Never throws: anything we cannot
  * read becomes an uncertain token, which the diff treats as always-changed.
  */
@@ -187,6 +198,8 @@ export function captureGitState(cwd: string, run: GitRunner = defaultRunner): Gi
   const files: FileState = new Map();
 
   for (const rec of parsePorcelainV2(out)) {
+    if (isPearBookkeeping(rec.path)) continue;
+    if (rec.origPath !== undefined && isPearBookkeeping(rec.origPath)) continue;
     if (rec.kind === "1" || rec.kind === "2") {
       // fields: <kind> <XY> <sub> <mH> <mI> <mW> <hH> <hI> [<Xscore>]
       const xy = rec.fields[1] ?? "??";
@@ -324,6 +337,7 @@ export function changedLineStats(cwd: string, run: GitRunner = defaultRunner): L
     if (path === "") continue;
 
     // Binary files report "-" for both counts; charge the file, not the bytes.
+    if (isPearBookkeeping(path)) continue;
     if (addRaw !== "-") insertions += Number(addRaw) || 0;
     if (delRaw !== "-") deletions += Number(delRaw) || 0;
     paths.add(path);
@@ -340,10 +354,10 @@ export function changedLineStats(cwd: string, run: GitRunner = defaultRunner): L
   }
   for (const rel of untracked.split("\0")) {
     if (rel === "") continue;
+    if (isPearBookkeeping(rel)) continue;
     paths.add(rel);
     insertions += untrackedLineCount(cwd, rel);
   }
-
   return { ok: true, stats: { files: paths.size, insertions, deletions } };
 }
 
@@ -364,7 +378,9 @@ export function workingDiffText(cwd: string, run: GitRunner = defaultRunner): st
 
   let diff: string;
   try {
-    diff = run(["diff", base], cwd);
+    // The pathspec excludes pear's own bookkeeping, so its churn never gets
+    // handed to the agent as work the human needs to explain.
+    diff = run(["diff", base, "--", ".", ":(exclude).pear/**"], cwd);
   } catch {
     return null;
   }
@@ -379,6 +395,7 @@ export function workingDiffText(cwd: string, run: GitRunner = defaultRunner): st
   const parts = diff === "" ? [] : [diff];
   for (const rel of untracked.split("\0")) {
     if (rel === "") continue;
+    if (isPearBookkeeping(rel)) continue;
     let content: Buffer;
     try {
       content = readFileSync(join(cwd, rel));

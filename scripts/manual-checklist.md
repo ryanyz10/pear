@@ -25,7 +25,18 @@ you cannot type, that is a bug regardless of anything else on this list.
    erroring.
 4. Tell it to run something destructive in bash during scoping (`rm -rf build`).
    Blocked. `git status` and `rg` still work.
-5. The plan card is readable: summary first, numbered steps, risks only if real.
+5. The plan card is readable: goal first, then context, what you decided, the
+   numbered step-by-step guide, still open, risks — each section only when
+   real. A second proposal in the same scoping round shows *draft N* in the
+   title.
+5b. Every proposal lands in `.pear/plans/latest.md`; approving also writes a
+   timestamped `approved-*.md` snapshot, and the approval result names the
+   path. `/pear-plan` shows where the plan is saved.
+5c. A plan with open questions carries them visibly on the card, and the
+   building persona tells the agent to settle them at the first checkpoint
+   rather than guessing.
+5d. The agent should iterate rather than file one proposal: ask before
+   drafting, and fold your revise/explore answers into the plan's decisions.
 6. **Change something…** → it revises and re-proposes. Editing is still closed.
 7. **Keep exploring** → it looks harder and re-proposes. Editing is still closed.
 8. **Esc** → turn ends, nothing approved, you can type normally.

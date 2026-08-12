@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -278,7 +278,7 @@ describe("persona injection", () => {
     const b = await boot(driver({ planPhase: true }));
     const [result] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
     assert.match(result.systemPrompt, /^BASE/);
-    assert.match(result.systemPrompt, /agree the approach first/i);
+    assert.match(result.systemPrompt, /discover before you build/i);
     assert.match(result.systemPrompt, /pear_plan/);
   });
 
@@ -289,6 +289,17 @@ describe("persona injection", () => {
     assert.match(result.systemPrompt, /you are the driver/i);
     assert.match(result.systemPrompt, /Do the thing\./);
     assert.match(result.systemPrompt, /1\. First/);
+  });
+
+  it("the driver persona names open questions so the agent does not guess", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    (b.ctx.ui as any).custom = async () => ({ kind: "approve" });
+    await b.tools
+      .get("pear_plan")
+      ?.execute("p", { ...PLAN_ARGS, openQuestions: ["Timeout value?"] }, undefined, undefined, b.ctx);
+    const [result] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
+    assert.match(result.systemPrompt, /open questions/);
+    assert.match(result.systemPrompt, /Timeout value\?/);
   });
 
   it("leaves the prompt alone in off mode", async () => {
@@ -648,12 +659,41 @@ describe("the plan tool", () => {
     assert.match(decision?.reason ?? "", /no plan is approved/);
   });
 
+  it("approving saves the plan to .pear/plans and names the path", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    const res = await approvePlan(b);
+    assert.match(res.content[0].text, /Saved to/);
+    assert.match(res.content[0].text, /\.pear\/plans\/latest\.md/);
+
+    const plans = readdirSync(join(b.cwd, ".pear", "plans"));
+    const latest = readFileSync(join(b.cwd, ".pear", "plans", "latest.md"), "utf8");
+    assert.match(latest, /Do the thing\./);
+    assert.match(latest, /1\. First/);
+    assert.equal(plans.filter((f) => f.startsWith("approved-")).length, 1, "one snapshot");
+  });
+
+  it("a rejected proposal still lands in latest.md, but gets no snapshot", async () => {
+    const b = await boot({
+      ...driver({ planPhase: true }),
+      cardAnswer: { kind: "revise", text: "test first" },
+    });
+    await b.tools.get("pear_plan")?.execute("p", PLAN_ARGS, undefined, undefined, b.ctx);
+    const latest = readFileSync(join(b.cwd, ".pear", "plans", "latest.md"), "utf8");
+    assert.match(latest, /Do the thing\./);
+    const snapshots = readdirSync(join(b.cwd, ".pear", "plans")).filter((f) =>
+      f.startsWith("approved-"),
+    );
+    assert.equal(snapshots.length, 0);
+  });
+
   it("is out of phase once a plan exists", async () => {
     const b = await boot(driver({ planPhase: true }));
     await approvePlan(b);
+    const before = readdirSync(join(b.cwd, ".pear", "plans"));
     const res = await b.tools.get("pear_plan")?.execute("p2", PLAN_ARGS, undefined, undefined, b.ctx);
     assert.match(res.content[0].text, /already approved/);
     assert.equal(res.details.answer, "not-run");
+    assert.deepEqual(readdirSync(join(b.cwd, ".pear", "plans")), before, "nothing written");
   });
 
   it("a checkpoint before a plan is out of phase", async () => {
@@ -692,7 +732,7 @@ describe("plan persistence across a reload", () => {
     const entries: Entry[] = [{ type: "custom", customType: "pear-plan", data: { nope: 1 } }];
     const b = await boot({ cwd, ...driver({ planPhase: true }), entries });
     const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
-    assert.match(prompt.systemPrompt, /agree the approach first/i, "still scoping");
+    assert.match(prompt.systemPrompt, /discover before you build/i, "still scoping");
   });
 });
 

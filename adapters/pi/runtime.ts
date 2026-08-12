@@ -156,6 +156,8 @@ export type PearRuntime = {
   /** True once the human has replied to the outstanding quiz. */
   readonly quizAnswered: boolean;
   readonly plan: PlanSpec | null;
+  /** How many plan proposals have been shown this scoping round. */
+  readonly planDrafts: number;
   readonly stopped: boolean;
   readonly paused: boolean;
   readonly explaining: string | null;
@@ -229,6 +231,8 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
   let driver: Driver = deps.mode === "human-driver" ? "human" : "agent";
   let quizzing = false;
   let quizAnswered = false;
+  /** How many plan proposals have been shown this scoping round. */
+  let planDrafts = 0;
   /** Human-driver's load, pushed in by the host from git. */
   let treeLoad = 0;
 
@@ -318,6 +322,9 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     get plan() {
       return plan;
     },
+    get planDrafts() {
+      return planDrafts;
+    },
     get stopped() {
       return stopped;
     },
@@ -346,6 +353,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       quizzing = false;
       quizAnswered = false;
       treeLoad = 0;
+      planDrafts = 0;
       phase = deps.planPhase ? "scoping" : "building";
       plan = null;
       // An open card belongs to the mode that opened it.
@@ -400,6 +408,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
 
     restorePlan(next) {
       plan = next;
+      planDrafts = 0;
       phase = "building";
       treeLoad = 0;
       rebaseline();
@@ -413,6 +422,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       quizzing = false;
       quizAnswered = false;
       treeLoad = 0;
+      planDrafts = 0;
       rebaseline();
     },
 
@@ -503,12 +513,15 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     },
 
     beginPlan() {
-      return open<PlanAnswer>(
+      const start = open<PlanAnswer>(
         "plan",
         phase === "building"
           ? { text: RESULT_PLAN_ALREADY_APPROVED, terminate: false }
           : undefined,
       );
+      // A proposal is only a proposal if a card is actually going to be shown.
+      if ("pending" in start) planDrafts += 1;
+      return start;
     },
 
     beginCheckpoint() {
@@ -547,6 +560,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
         case "approve":
           plan = proposed;
           phase = "building";
+          planDrafts = 0;
           // Anything changed while scoping (there should be nothing) is not the
           // agent's to answer for, so the build window starts clean.
           rebaseline();
@@ -608,6 +622,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       if (explaining !== null) flags.push(`reviewing ${explaining}`);
       else if (paused) flags.push("paused");
       if (pending !== null) flags.push("awaiting you");
+      if (phase === "scoping" && planDrafts > 0) flags.push(`draft ${planDrafts}`);
       return statusLine(mode, phase, points(), budget, flags.length ? flags.join(", ") : undefined);
     },
 

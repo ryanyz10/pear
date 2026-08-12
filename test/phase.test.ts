@@ -321,15 +321,45 @@ describe("walking through a file", () => {
 });
 
 describe("formatPlan", () => {
-  it("numbers the steps", () => {
+  it("labels and numbers the steps", () => {
     assert.equal(
       formatPlan({ summary: "Do the thing.", steps: ["First", "Second"] }),
-      "Do the thing.\n\n1. First\n2. Second",
+      "Do the thing.\n\nHow we'll build it:\n1. First\n2. Second",
     );
   });
 
   it("renders a summary with no steps", () => {
     assert.equal(formatPlan({ summary: "Just this.", steps: [] }), "Just this.");
+  });
+
+  it("renders context between the goal and the steps", () => {
+    const text = formatPlan({
+      summary: "S",
+      context: "The client retries nothing today.",
+      steps: ["A"],
+    });
+    assert.match(text, /S\n\nContext:\nThe client retries nothing today\./);
+  });
+
+  it("lists the decisions the human made", () => {
+    const text = formatPlan({
+      summary: "S",
+      decisions: ["Retry on 5xx only", "Max 3 attempts"],
+      steps: [],
+    });
+    assert.match(text, /What you decided:\n- Retry on 5xx only\n- Max 3 attempts/);
+  });
+
+  it("names open questions as still open", () => {
+    const text = formatPlan({ summary: "S", openQuestions: ["Timeout value?"], steps: [] });
+    assert.match(text, /Still open:\n- Timeout value\?/);
+  });
+
+  it("omits every empty section", () => {
+    const text = formatPlan({ summary: "S", steps: [] });
+    for (const label of ["Context:", "What you decided:", "Still open:", "Watch out for:"]) {
+      assert.doesNotMatch(text, new RegExp(label));
+    }
   });
 
   it("includes risks when there are any", () => {
@@ -339,6 +369,69 @@ describe("formatPlan", () => {
 
   it("omits the risks section when empty", () => {
     assert.doesNotMatch(formatPlan({ summary: "S", steps: ["A"], risks: [] }), /Watch out/);
+  });
+});
+
+describe("plan drafts", () => {
+  it("counts proposals within a scoping round", () => {
+    const { rt } = harness();
+    assert.equal(rt.planDrafts, 0);
+    assert.ok("pending" in rt.beginPlan());
+    assert.equal(rt.planDrafts, 1);
+    rt.resolvePending({ kind: "dismissed" });
+    assert.ok("pending" in rt.beginPlan());
+    assert.equal(rt.planDrafts, 2);
+  });
+
+  it("does not count a proposal that never opens a card", () => {
+    const { rt } = harness();
+    approve(rt);
+    const started = rt.beginPlan();
+    assert.ok("immediate" in started, "already approved, so no card");
+    assert.equal(rt.planDrafts, 0);
+  });
+
+  it("resets on approval", () => {
+    const { rt } = harness();
+    assert.ok("pending" in rt.beginPlan());
+    rt.resolvePending({ kind: "dismissed" });
+    assert.ok("pending" in rt.beginPlan());
+    assert.equal(rt.planDrafts, 2);
+    rt.beginPlan();
+    rt.resolvePending({ kind: "dismissed" });
+    rt.beginPlan();
+    rt.applyPlanAnswer({ kind: "approve" }, PLAN);
+    assert.equal(rt.planDrafts, 0, "a fresh round starts clean");
+  });
+
+  it("resets on replan and on mode change", () => {
+    const { rt } = harness();
+    assert.ok("pending" in rt.beginPlan());
+    rt.resolvePending({ kind: "dismissed" });
+    rt.replan();
+    assert.equal(rt.planDrafts, 0);
+
+    assert.ok("pending" in rt.beginPlan());
+    rt.resolvePending({ kind: "dismissed" });
+    rt.setMode("off");
+    rt.setMode("agent-driver");
+    assert.equal(rt.planDrafts, 0);
+  });
+
+  it("resets on restorePlan", () => {
+    const { rt } = harness();
+    assert.ok("pending" in rt.beginPlan());
+    rt.restorePlan(PLAN);
+    assert.equal(rt.planDrafts, 0);
+  });
+
+  it("shows the draft number in the status line while scoping", () => {
+    const { rt } = harness();
+    assert.doesNotMatch(rt.statusText(), /draft/);
+    assert.ok("pending" in rt.beginPlan());
+    rt.resolvePending({ kind: "dismissed" });
+    assert.ok("pending" in rt.beginPlan());
+    assert.match(rt.statusText(), /draft 2/);
   });
 });
 
