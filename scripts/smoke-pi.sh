@@ -156,8 +156,42 @@ if ! node -e '
 fi
 echo "ok: no abort call sites"
 
-echo "== leg g: packaged install loads =="
-"$PI" install "$ROOT" -na
+echo "== leg g: the published tarball loads =="
+# Installing $ROOT would test the working tree, which is not what an npm user
+# gets: `files` in package.json decides that, and a whitelist that omits a
+# needed directory fails only after publishing. So pack the real artifact,
+# unpack it, and install that.
+PACKDIR="$WORKDIR/pack"
+mkdir -p "$PACKDIR"
+TARBALL="$PACKDIR/$(cd "$PACKDIR" && npm pack "$ROOT" --silent)"
+[[ -f "$TARBALL" ]] || fail "npm pack produced no tarball"
+tar -xzf "$TARBALL" -C "$PACKDIR"
+PKG="$PACKDIR/package"
+[[ -d "$PKG" ]] || fail "tarball did not unpack to $PKG"
+
+# The manifest's pi paths must survive the `files` whitelist.
+node -e '
+  const fs = require("node:fs"), path = require("node:path");
+  const root = process.argv[1];
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const declared = [...(pkg.pi?.extensions ?? []), ...(pkg.pi?.skills ?? [])];
+  if (!declared.length) { console.error("no pi resources declared"); process.exit(1); }
+  let bad = false;
+  for (const p of declared) {
+    if (!fs.existsSync(path.join(root, p))) { console.error("missing from tarball: " + p); bad = true; }
+  }
+  for (const p of ["LICENSE", "README.md"]) {
+    if (!fs.existsSync(path.join(root, p))) { console.error("missing from tarball: " + p); bad = true; }
+  }
+  process.exit(bad ? 1 : 0);
+' "$PKG" || fail "the files whitelist dropped something the pi manifest points at"
+
+# pi runs `npm install` for npm and git installs; a local path install does not,
+# so do it by hand or the runtime dependency is simply absent.
+(cd "$PKG" && npm install --silent --omit=dev --no-audit --no-fund) \
+  || fail "npm install failed inside the unpacked tarball"
+
+"$PI" install "$PKG" -na
 if ! "$PI" --help >"$WORKDIR/help2.txt" 2>&1; then
   cat "$WORKDIR/help2.txt" >&2
   fail "packaged install --help failed"
@@ -166,7 +200,7 @@ grep -qE "Failed to load extension" "$WORKDIR/help2.txt" && {
   cat "$WORKDIR/help2.txt" >&2
   fail "packaged extension failed to load"
 }
-echo "ok: packaged install loads cleanly"
+echo "ok: packed tarball installs and loads cleanly"
 
 echo
 echo "smoke-pi: all legs passed"

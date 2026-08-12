@@ -36,9 +36,24 @@ gives you the prompt back. Nothing here can end your session.
 ## Install
 
 ```sh
+pi install npm:pi-pear
+```
+
+That writes to your user settings. Add `-l` to install it for one project
+instead, which also shares it with anyone else working in that repo. Pin the
+version with `npm:pi-pear@0.1.0` if you would rather updates be deliberate.
+
+To try it for a single run, without installing anything:
+
+```sh
+pi -e npm:pi-pear
+```
+
+From source instead — a git ref, or a clone on disk:
+
+```sh
+pi install git:github.com/ryanyz10/pear
 pi install /path/to/pear
-# or, without installing:
-pi -e /path/to/pear/adapters/pi/extensions/pear.ts
 ```
 
 Then turn it on in your project:
@@ -362,6 +377,25 @@ extension that re-checks those API facts against a real pi session.
 
 Behaviour that needs a live model and a terminal — how the cadence actually
 _feels_ — is in [`scripts/manual-checklist.md`](scripts/manual-checklist.md).
+
+## Releasing
+
+A release is a pushed tag. Nothing publishes on merge.
+
+```sh
+npm version patch   # or minor / major — updates package.json and the lockfile
+git push origin main --follow-tags
+```
+
+`.github/workflows/release.yml` then runs the same gates as CI, checks the tag
+agrees with `package.json`, and publishes. It authenticates with npm through
+OIDC [trusted publishing](https://docs.npmjs.com/trusted-publishers), so there
+is no token stored in the repo and every published version carries provenance.
+
+That requires a one-time setup on npmjs.com: on the package's Settings page,
+add a trusted publisher pointing at this repository and the workflow file
+`release.yml`. The workflow filename is part of that configuration — renaming it
+breaks publishing until npmjs.com is updated to match.
 
 ## Layout
 

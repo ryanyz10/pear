@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only: CI never publishes and never writes to the repo.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # .tool-versions is the single source of truth for the Node version;
+      # scripts/smoke-pi.sh reads the same file.
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      # Separate step on purpose: a smoke failure means the extension does not
+      # load into a real pi, which is a different problem from a failing unit
+      # test and should be readable as such in the job log.
+      - name: Smoke test against a real pi
+        run: npm run smoke:pi

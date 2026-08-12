@@ -1,0 +1,65 @@
+name: Release
+
+# Publishing is deliberate: it happens when a version tag is pushed, never on a
+# merge. `git tag v1.2.3 && git push origin v1.2.3` is the whole release ritual.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  # Required for npm trusted publishing (OIDC). GitHub mints a short-lived
+  # token for this run, so there is no NPM_TOKEN secret to leak or rotate.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+
+      # The same gates CI runs. `prepublishOnly` repeats typecheck and tests at
+      # publish time; that redundancy is the point — it is the last thing that
+      # can stop a bad tarball, and it costs a minute.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Smoke test against a real pi
+        run: npm run smoke:pi
+
+      # A tag that disagrees with package.json would otherwise publish the old
+      # version under a new tag, or fail at the registry with a confusing
+      # message. Fail here instead, where the cause is obvious.
+      - name: Tag must match package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json version $pkg" >&2
+            echo "bump package.json (and the lockfile) or retag, then push again" >&2
+            exit 1
+          fi
+          echo "publishing $pkg as v$tag"
+
+      # Trusted publishing needs npm >= 11.5.1 for the OIDC exchange; Node 22
+      # ships npm 10.x.
+      - name: Upgrade npm for OIDC support
+        run: npm install -g npm@latest
+
+      # No NODE_AUTH_TOKEN: the OIDC exchange happens inside `npm publish`.
+      # Provenance is attached automatically under trusted publishing, so
+      # --provenance would be redundant.
+      - name: Publish to npm
+        run: npm publish
