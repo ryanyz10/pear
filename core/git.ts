@@ -336,8 +336,9 @@ export function changedLineStats(cwd: string, run: GitRunner = defaultRunner): L
     }
     if (path === "") continue;
 
-    // Binary files report "-" for both counts; charge the file, not the bytes.
     if (isPearBookkeeping(path)) continue;
+
+    // Binary files report "-" for both counts; charge the file, not the bytes.
     if (addRaw !== "-") insertions += Number(addRaw) || 0;
     if (delRaw !== "-") deletions += Number(delRaw) || 0;
     paths.add(path);
@@ -380,7 +381,14 @@ export function workingDiffText(cwd: string, run: GitRunner = defaultRunner): st
   try {
     // The pathspec excludes pear's own bookkeeping, so its churn never gets
     // handed to the agent as work the human needs to explain.
-    diff = run(["diff", base, "--", ".", ":(exclude).pear/**"], cwd);
+    //
+    // Both halves are anchored to the repo root, because pathspecs are resolved
+    // relative to the *cwd*, not the root. A bare `.` would clip the diff to
+    // `cwd`'s subtree while `changedLineStats` kept pricing the whole repo — the
+    // agent would judge an explanation against a diff missing files. And a bare
+    // `:(exclude).pear/**` would resolve to `<cwd>/.pear`, quietly leaking the
+    // real one. `:/` and `top` make both absolute.
+    diff = run(["diff", base, "--", ":/", ":(exclude,top).pear/**"], cwd);
   } catch {
     return null;
   }

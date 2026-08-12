@@ -114,6 +114,14 @@ type CardDetails = {
 const PLAN_ENTRY = "pear-plan";
 
 /**
+ * Card answers that mean a human read the proposal, and so that it is worth
+ * writing to `.pear/plans/latest.md`. Deliberately excludes `not-run` (no card
+ * was shown), `mode-off` (torn down by a mode switch) and `error` (the card
+ * failed to render).
+ */
+const SAVED_PLAN_ANSWERS = new Set(["approve", "revise", "explore", "dismissed"]);
+
+/**
  * How often the human-driver watcher looks at the working tree.
  *
  * Cheap by construction: the poll only hashes files git already reports as
@@ -137,6 +145,19 @@ const PI_BUILTIN_TOOLS = new Set(["bash", "read", "edit", "write", "grep", "find
 
 const PEAR_TOOLS = new Set([ASK_TOOL_NAME, PLAN_TOOL_NAME, CHECKPOINT_TOOL_NAME]);
 
+/** An absent value, or an array of strings. Three of `PlanSpec`'s fields. */
+function isOptionalStringArray(v: unknown): boolean {
+  return v === undefined || (Array.isArray(v) && v.every((s) => typeof s === "string"));
+}
+
+/**
+ * Guard for a plan recovered from session history.
+ *
+ * Every field is checked, not just the ones the first version of `PlanSpec`
+ * had: `formatPlan` calls `.trim()` on `context`, so a non-string there throws
+ * inside `before_agent_start` rather than degrading. Growing this alongside the
+ * type is what keeps a malformed entry a no-op instead of a crash.
+ */
 function isPlanSpec(value: unknown): value is PlanSpec {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
@@ -144,8 +165,10 @@ function isPlanSpec(value: unknown): value is PlanSpec {
     typeof v.summary === "string" &&
     Array.isArray(v.steps) &&
     v.steps.every((s) => typeof s === "string") &&
-    (v.risks === undefined ||
-      (Array.isArray(v.risks) && v.risks.every((s) => typeof s === "string")))
+    (v.context === undefined || typeof v.context === "string") &&
+    isOptionalStringArray(v.decisions) &&
+    isOptionalStringArray(v.openQuestions) &&
+    isOptionalStringArray(v.risks)
   );
 }
 
@@ -176,6 +199,13 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
    */
   let suppressedTools: string[] = [];
 
+  /**
+   * Where the currently-approved plan was snapshotted, for `/pear-plan` to
+   * quote. Null in a session that recovered its plan from history rather than
+   * approving one, since that file belongs to the earlier session.
+   */
+  let approvedPlanFile: string | null = null;
+
   const captureFiles = (cwd: string) => () => {
     const state = captureGitState(cwd);
     return state.ok ? state.files : null;
@@ -202,8 +232,13 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
 
   const suppressWriteTools = () => {
     const active = pi.getActiveTools();
-    suppressedTools = active.filter((t) => WRITE_TOOLS.has(t));
-    if (suppressedTools.length === 0) return;
+    const toRemove = active.filter((t) => WRITE_TOOLS.has(t));
+    // Nothing to take away means nothing to remember. Assigning here regardless
+    // would wipe the memory of an earlier suppression — and `syncPhaseTools`
+    // runs after every card, so a `pear_ask` during scoping (which the scoping
+    // persona asks for) would leave nothing to restore when the plan lands.
+    if (toRemove.length === 0) return;
+    suppressedTools = toRemove;
     pi.setActiveTools(active.filter((t) => !WRITE_TOOLS.has(t)));
   };
 
@@ -866,14 +901,19 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
           },
         );
         let text = result.text;
-        // A card was shown, so a proposal exists on disk — except when the call
-        // was rejected outright ("not-run"), in which case nothing was proposed.
-        if (result.details.kind === "plan" && result.details.answer !== "not-run") {
+        // Save only what a human actually looked at. "not-run" means the call
+        // was rejected before a card existed; "mode-off" and "error" mean the
+        // card was torn down before anyone read it — overwriting `latest.md`
+        // with a proposal nobody saw would misrepresent what is being planned.
+        if (result.details.kind === "plan" && SAVED_PLAN_ANSWERS.has(result.details.answer)) {
           try {
-            writePlanDraft(ctx.cwd, proposed, nodeFs, now);
             if (result.details.answer === "approve") {
-              writePlanApproved(ctx.cwd, proposed, nodeFs, now);
-              text = `${result.text}\n\nSaved to ${latestPlanPath(ctx.cwd)}.`;
+              // Writes `latest.md` as well as the snapshot, so no draft write here.
+              const snapshot = writePlanApproved(ctx.cwd, proposed, nodeFs, now);
+              approvedPlanFile = snapshot;
+              text = `${result.text}\n\nSaved to ${snapshot}.`;
+            } else {
+              writePlanDraft(ctx.cwd, proposed, nodeFs, now);
             }
           } catch (e) {
             const message = e instanceof Error ? e.message : String(e);
@@ -985,12 +1025,17 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       const rt = needRuntime(ctx);
       if (rt === null) return;
       const plan = rt.plan;
-      ctx.ui.notify(
-        plan === null
-          ? "pear: no plan approved yet — drafts save to .pear/plans/latest.md."
-          : `pear plan (saved at ${latestPlanPath(ctx.cwd)})\n\n${formatPlan(plan)}`,
-        "info",
-      );
+      if (plan === null) {
+        ctx.ui.notify(
+          `pear: no plan approved yet — drafts save to ${latestPlanPath(ctx.cwd)}.`,
+          "info",
+        );
+        return;
+      }
+      // The snapshot, never `latest.md`: the next draft overwrites that, so
+      // quoting it would point at a plan this one may already have superseded.
+      const where = approvedPlanFile === null ? "" : ` (saved at ${approvedPlanFile})`;
+      ctx.ui.notify(`pear plan${where}\n\n${formatPlan(plan)}`, "info");
     },
   });
 

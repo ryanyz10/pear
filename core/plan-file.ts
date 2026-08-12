@@ -28,9 +28,15 @@ export function latestPlanPath(projectDir: string): string {
   return join(plansDir(projectDir), "latest.md");
 }
 
-/** A timestamped snapshot, written only on approval. */
-export function approvedPlanPath(projectDir: string, now: () => number): string {
-  const stamp = new Date(now()).toISOString().replace(/[:.]/g, "-");
+/**
+ * A timestamped snapshot, written only on approval.
+ *
+ * Takes the instant rather than a clock: the filename stamp and the header
+ * stamp inside the file have to be the same instant, and two `now()` calls
+ * cannot promise that.
+ */
+export function approvedPlanPath(projectDir: string, at: number): string {
+  const stamp = new Date(at).toISOString().replace(/[:.]/g, "-");
   return join(plansDir(projectDir), `approved-${stamp}.md`);
 }
 
@@ -39,8 +45,8 @@ export function approvedPlanPath(projectDir: string, now: () => number): string 
  * disk, so the approved document cannot drift from what the model is reminded
  * of. The header carries the write time so `latest.md` says when it was made.
  */
-export function renderPlanMarkdown(plan: PlanSpec, now: () => number): string {
-  const stamp = new Date(now()).toISOString();
+export function renderPlanMarkdown(plan: PlanSpec, at: number): string {
+  const stamp = new Date(at).toISOString();
   return `# pear plan · ${stamp}\n\n${formatPlan(plan)}\n`;
 }
 
@@ -55,15 +61,22 @@ export function writePlanDraft(
   plan: PlanSpec,
   fs: ConfigFs,
   now: () => number,
-): void {
-  const dir = plansDir(projectDir);
-  fs.mkdirSync(dir);
-  fs.writeFileSync(latestPlanPath(projectDir), renderPlanMarkdown(plan, now));
+): string {
+  const path = latestPlanPath(projectDir);
+  fs.mkdirSync(plansDir(projectDir));
+  fs.writeFileSync(path, renderPlanMarkdown(plan, now()));
+  return path;
 }
 
 /**
  * Persist an approval: `latest.md` plus a timestamped snapshot for reference.
  *
+ * Writes `latest.md` itself, so callers must not also call `writePlanDraft` on
+ * the approve path.
+ *
+ * @returns the snapshot path — the durable record of what was approved.
+ *   `latest.md` is overwritten by the next draft, so it is the wrong thing to
+ *   quote back to the human as "your approved plan".
  * @throws when either write fails; the caller decides how to surface it.
  */
 export function writePlanApproved(
@@ -71,9 +84,14 @@ export function writePlanApproved(
   plan: PlanSpec,
   fs: ConfigFs,
   now: () => number,
-): void {
-  const dir = plansDir(projectDir);
-  fs.mkdirSync(dir);
-  fs.writeFileSync(latestPlanPath(projectDir), renderPlanMarkdown(plan, now));
-  fs.writeFileSync(approvedPlanPath(projectDir, now), renderPlanMarkdown(plan, now));
+): string {
+  // One instant for both files: the snapshot's filename and its header must
+  // agree, and so must the copy left in `latest.md`.
+  const at = now();
+  const rendered = renderPlanMarkdown(plan, at);
+  const snapshot = approvedPlanPath(projectDir, at);
+  fs.mkdirSync(plansDir(projectDir));
+  fs.writeFileSync(latestPlanPath(projectDir), rendered);
+  fs.writeFileSync(snapshot, rendered);
+  return snapshot;
 }

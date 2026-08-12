@@ -646,6 +646,27 @@ describe("the plan tool", () => {
     assert.equal(decision, undefined);
   });
 
+  it("restores the tools even when a card was shown during scoping first", async () => {
+    // `syncPhaseTools` runs after EVERY card, and the scoping persona tells the
+    // agent to ask before drafting — so a `pear_ask` lands between the two
+    // suppressions. A suppress that forgot what it had already taken away
+    // would leave nothing to restore, and editing would never open.
+    const b = await boot(driver({ planPhase: true }));
+    await b.tools
+      .get("pear_ask")
+      ?.execute("a", { question: "Which way?", options: [] }, undefined, undefined, b.ctx);
+    assert.ok(!b.activeTools().includes("edit"), "still scoping after the ask");
+    // The harness dismisses the ask, which pauses; the human typing next is
+    // what clears it. Only the tool bookkeeping is under test here.
+    await b.emit("input", { text: "the second one", source: "interactive" }, b.ctx);
+
+    await approvePlan(b);
+    assert.ok(b.activeTools().includes("edit"), "edit restored");
+    assert.ok(b.activeTools().includes("write"), "write restored");
+    const [decision] = await b.emit("tool_call", writeCall("x", "f.ts"), b.ctx);
+    assert.equal(decision, undefined, "and the gate lets the edit through");
+  });
+
   it("revising keeps scoping closed and records nothing", async () => {
     const b = await boot({
       ...driver({ planPhase: true }),
@@ -659,11 +680,14 @@ describe("the plan tool", () => {
     assert.match(decision?.reason ?? "", /no plan is approved/);
   });
 
-  it("approving saves the plan to .pear/plans and names the path", async () => {
+  it("approving saves the plan to .pear/plans and names the SNAPSHOT path", async () => {
     const b = await boot(driver({ planPhase: true }));
     const res = await approvePlan(b);
     assert.match(res.content[0].text, /Saved to/);
-    assert.match(res.content[0].text, /\.pear\/plans\/latest\.md/);
+    // The snapshot, not latest.md: the next draft overwrites latest.md, so
+    // quoting it would send the human to a plan this one may have superseded.
+    assert.match(res.content[0].text, /\.pear\/plans\/approved-.*\.md/);
+    assert.doesNotMatch(res.content[0].text, /latest\.md/);
 
     const plans = readdirSync(join(b.cwd, ".pear", "plans"));
     const latest = readFileSync(join(b.cwd, ".pear", "plans", "latest.md"), "utf8");
@@ -733,6 +757,46 @@ describe("plan persistence across a reload", () => {
     const b = await boot({ cwd, ...driver({ planPhase: true }), entries });
     const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
     assert.match(prompt.systemPrompt, /discover before you build/i, "still scoping");
+  });
+
+  it("rejects an entry whose new fields are the wrong shape", async () => {
+    // `formatPlan` calls `.trim()` on `context`, so a non-string here would
+    // throw inside `before_agent_start` rather than degrade. Every field of
+    // PlanSpec has to be checked, not just the ones it shipped with.
+    for (const bad of [
+      { summary: "s", steps: ["a"], context: 42 },
+      { summary: "s", steps: ["a"], decisions: "not an array" },
+      { summary: "s", steps: ["a"], openQuestions: [1, 2] },
+    ]) {
+      const b = await boot({
+        cwd: tempRepo(),
+        ...driver({ planPhase: true }),
+        entries: [{ type: "custom", customType: "pear-plan", data: bad }],
+      });
+      const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
+      assert.match(prompt.systemPrompt, /discover before you build/i, `rejected: ${JSON.stringify(bad)}`);
+    }
+  });
+
+  it("recovers a plan that uses every field", async () => {
+    const cwd = tempRepo();
+    const full = {
+      summary: "Wrap the client in a retry.",
+      context: "It retries nothing today.",
+      steps: ["Add the helper", "Wire it in"],
+      decisions: ["Retry on 5xx only"],
+      openQuestions: ["Timeout value?"],
+      risks: ["Changes request timing"],
+    };
+    const b = await boot({
+      cwd,
+      ...driver({ planPhase: true }),
+      entries: [{ type: "custom", customType: "pear-plan", data: full }],
+    });
+    const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
+    assert.match(prompt.systemPrompt, /you are the driver/i, "building, not scoping");
+    assert.match(prompt.systemPrompt, /Retry on 5xx only/, "decisions carried through");
+    assert.match(prompt.systemPrompt, /raise them at your first checkpoint/, "open questions flagged");
   });
 });
 

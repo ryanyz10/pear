@@ -466,4 +466,44 @@ describe("pear's own bookkeeping is not the human's work", () => {
     assert.ok(trackedDiff !== null);
     assert.doesNotMatch(trackedDiff, /latest\.md/);
   });
+
+  it("diffs the whole repo, and still excludes .pear, from a SUBDIRECTORY", () => {
+    // Pathspecs resolve against the cwd, not the repo root. A bare `.` would
+    // clip this to `sub/` while changedLineStats kept pricing the whole tree —
+    // the agent would judge an explanation against a diff missing files. A bare
+    // `:(exclude).pear/**` would look for `sub/.pear` and leak the real one.
+    const dir = repo();
+    mkdirSync(join(dir, "sub"), { recursive: true });
+    writeFileSync(join(dir, "root.txt"), "one\n");
+    writeFileSync(join(dir, "sub", "nested.txt"), "one\n");
+    mkdirSync(join(dir, ".pear", "plans"), { recursive: true });
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "v1\n");
+    commit(dir);
+
+    writeFileSync(join(dir, "root.txt"), "one\ntwo\n");
+    writeFileSync(join(dir, "sub", "nested.txt"), "one\ntwo\n");
+    writeFileSync(join(dir, ".pear", "plans", "latest.md"), "v1\nv2\n");
+
+    const diff = workingDiffText(join(dir, "sub"));
+    assert.ok(diff !== null);
+    assert.match(diff, /nested\.txt/, "the cwd's own change is there");
+    assert.match(diff, /root\.txt/, "and so is one outside the cwd");
+    assert.doesNotMatch(diff, /latest\.md/, "pear's own churn stays out");
+  });
+
+  it("changedLineStats and workingDiffText agree from a subdirectory", () => {
+    // These two feed the same review: one prices it, the other is the evidence.
+    // If they disagree about scope, the human is quizzed on work the agent
+    // cannot see.
+    const dir = repo();
+    mkdirSync(join(dir, "sub"), { recursive: true });
+    writeFileSync(join(dir, "root.txt"), "one\n");
+    commit(dir);
+    writeFileSync(join(dir, "root.txt"), "one\ntwo\n");
+
+    const stats = changedLineStats(join(dir, "sub"));
+    assert.ok(stats.ok);
+    assert.equal(stats.stats.files, 1, "priced the root-level change");
+    assert.match(workingDiffText(join(dir, "sub")) ?? "", /root\.txt/, "and showed it");
+  });
 });

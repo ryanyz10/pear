@@ -19,7 +19,8 @@ const PLAN: PlanSpec = {
   risks: ["Might change request timing"],
 };
 
-const NOW = () => new Date("2025-06-01T12:34:56.000Z").getTime();
+const AT = new Date("2025-06-01T12:34:56.000Z").getTime();
+const NOW = () => AT;
 
 /** In-memory ConfigFs; the failure seams are injected per-test. */
 function fakeFs(over: Partial<ConfigFs> = {}): { fs: ConfigFs; files: Map<string, string> } {
@@ -46,13 +47,13 @@ describe("plan file paths", () => {
   });
 
   it("timestamps approved snapshots, filename-safe", () => {
-    assert.equal(approvedPlanPath(DIR, NOW), "/proj/.pear/plans/approved-2025-06-01T12-34-56-000Z.md");
+    assert.equal(approvedPlanPath(DIR, AT), "/proj/.pear/plans/approved-2025-06-01T12-34-56-000Z.md");
   });
 });
 
 describe("renderPlanMarkdown", () => {
   it("leads with a pear plan header and carries the full document", () => {
-    const text = renderPlanMarkdown(PLAN, NOW);
+    const text = renderPlanMarkdown(PLAN, AT);
     assert.match(text, /^# pear plan · 2025-06-01T12:34:56\.000Z\n\n/);
     assert.ok(text.includes(formatPlan(PLAN)), "the whole plan document is inside");
   });
@@ -64,7 +65,7 @@ describe("writePlanDraft", () => {
     writePlanDraft(DIR, PLAN, fs, NOW);
     const written = files.get("/proj/.pear/plans/latest.md");
     assert.ok(written !== undefined, "latest.md exists");
-    assert.equal(written, renderPlanMarkdown(PLAN, NOW));
+    assert.equal(written, renderPlanMarkdown(PLAN, AT));
   });
 
   it("throws when the directory cannot be created", () => {
@@ -90,11 +91,30 @@ describe("writePlanApproved", () => {
   it("writes latest.md plus a timestamped snapshot", () => {
     const { fs, files } = fakeFs();
     writePlanApproved(DIR, PLAN, fs, NOW);
-    assert.equal(files.get("/proj/.pear/plans/latest.md"), renderPlanMarkdown(PLAN, NOW));
+    assert.equal(files.get("/proj/.pear/plans/latest.md"), renderPlanMarkdown(PLAN, AT));
     assert.equal(
       files.get("/proj/.pear/plans/approved-2025-06-01T12-34-56-000Z.md"),
-      renderPlanMarkdown(PLAN, NOW),
+      renderPlanMarkdown(PLAN, AT),
     );
+  });
+
+  it("returns the snapshot path, not latest.md", () => {
+    const { fs } = fakeFs();
+    assert.equal(
+      writePlanApproved(DIR, PLAN, fs, NOW),
+      "/proj/.pear/plans/approved-2025-06-01T12-34-56-000Z.md",
+    );
+  });
+
+  it("stamps the filename and the header with ONE instant", () => {
+    // A clock that moves on every read is what a real one does between two
+    // calls; the snapshot's name and its contents must still agree.
+    let tick = AT;
+    const { fs, files } = fakeFs();
+    const snapshot = writePlanApproved(DIR, PLAN, fs, () => tick++);
+    const nameStamp = snapshot.replace(/^.*approved-|\.md$/g, "");
+    assert.match(files.get(snapshot) ?? "", new RegExp(nameStamp.replace(/-/g, "[-:.]")));
+    assert.equal(files.get(snapshot), files.get("/proj/.pear/plans/latest.md"));
   });
 
   it("throws when either write fails", () => {
