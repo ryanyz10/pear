@@ -390,10 +390,15 @@ export function quizPrompt(files: string[], insertions: number, deletions: numbe
  * because claiming "since we last talked" while showing a whole-tree count
  * would be the one thing worse than showing a bigger number.
  */
-export function nudgeLines(files: number, lines: number, due: boolean): string[] {
+export function nudgeLines(
+  files: number,
+  lines: number,
+  due: boolean,
+  icon = false,
+): string[] {
   const scale = `${files} file${files === 1 ? "" : "s"}, ~${lines} line${lines === 1 ? "" : "s"}`;
   return [
-    `pear · ${scale} uncommitted`,
+    `${pearName(icon)} · ${scale} uncommitted`,
     due ? "worth talking through — /pear-explain" : "ready when you are",
   ];
 }
@@ -442,6 +447,19 @@ export const RESULT_CHECKPOINT_NOT_DRIVING =
 // Human-facing status
 // ---------------------------------------------------------------------------
 
+/**
+ * What pear calls itself on screen.
+ *
+ * The icon carries no information the word doesn't, so it is opt-in and
+ * cosmetic — but it costs two columns instead of five in a status bar that has
+ * to share space with everything else pi puts there. Only display strings use
+ * it: notifications, block reasons and prompts keep saying "pear", so what the
+ * model reads and what a bug report greps for stay stable.
+ */
+export function pearName(icon: boolean): string {
+  return icon ? "🍐" : "pear";
+}
+
 /** Status-bar text. */
 export function statusLine(
   mode: string,
@@ -449,16 +467,19 @@ export function statusLine(
   points: number,
   budget: number,
   extra?: string,
+  icon = false,
 ): string {
+  // The colon reads as punctuation after a word and as clutter after a glyph.
+  const name = icon ? pearName(true) : "pear:";
   let base: string;
   if (mode === "off") {
-    base = "pear: off";
+    base = `${name} off`;
   } else if (phase === "scoping") {
     // Both drivers scope the same way, so the driver is not worth showing yet.
-    base = "pear: scoping";
+    base = `${name} scoping`;
   } else {
     const role = mode === "human-driver" ? "watching" : "driver";
-    base = `pear: ${role} ${points}/${budget}`;
+    base = `${name} ${role} ${points}/${budget}`;
   }
   return extra === undefined ? base : `${base} · ${extra}`;
 }

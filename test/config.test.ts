@@ -14,12 +14,17 @@ import {
   MAX_BUDGET,
   MIN_BUDGET,
   SOFT_FRACTION,
+  CONFIG_KEYS,
+  CONFIG_SPECS,
   configPath,
+  formatConfigValue,
+  isConfigKey,
   isMode,
   isValidBudget,
   loadConfig,
   loadTier,
   nodeFs,
+  parseConfigValue,
   saveConfig,
   type ConfigFs,
 } from "../core/config.ts";
@@ -68,6 +73,129 @@ describe("loadTier", () => {
     // Admit-first depends on this: the first change in a window always runs.
     for (const budget of [MIN_BUDGET, 200, MAX_BUDGET]) {
       assert.notEqual(loadTier(0, budget), "blocked", `budget ${budget}`);
+    }
+  });
+});
+
+describe("loadTier: configured boundaries", () => {
+  it("moves the soft line with softFraction", () => {
+    assert.equal(loadTier(50, 200, 0.1, 2), "soft");
+    assert.equal(loadTier(50, 200, 0.9, 2), "quiet");
+  });
+
+  it("moves the block line with blockMultiple", () => {
+    assert.equal(loadTier(300, 200, 0.5, 1.5), "blocked");
+    assert.equal(loadTier(300, 200, 0.5, 4), "due");
+  });
+
+  it("keeps due at the budget itself, whatever the fractions", () => {
+    // "due" is the budget by definition; only the tiers around it move.
+    for (const [soft, block] of [
+      [0.1, 1.2],
+      [0.9, 8],
+    ] as const) {
+      assert.equal(loadTier(199, 200, soft, block), soft <= 0.995 ? "soft" : "quiet");
+      assert.equal(loadTier(200, 200, soft, block), "due");
+    }
+  });
+
+  it("defaults to the exported constants", () => {
+    assert.equal(loadTier(100, 200), loadTier(100, 200, SOFT_FRACTION, BLOCK_MULTIPLE));
+    assert.equal(loadTier(400, 200), loadTier(400, 200, SOFT_FRACTION, BLOCK_MULTIPLE));
+  });
+});
+
+describe("CONFIG_SPECS", () => {
+  it("covers every key of the defaults, and only those", () => {
+    // The table is what loadConfig and saveConfig both walk, so a key missing
+    // from it is a key that silently never loads.
+    assert.deepEqual([...CONFIG_KEYS].sort(), Object.keys(DEFAULTS).sort());
+  });
+
+  it("accepts its own defaults", () => {
+    for (const key of CONFIG_KEYS) {
+      assert.equal(CONFIG_SPECS[key].validate(DEFAULTS[key]), true, key);
+    }
+  });
+
+  it("rejects values that would invert the tier ordering", () => {
+    for (const bad of [0, 1, -0.5, 1.5, "0.5", NaN, Infinity]) {
+      assert.equal(CONFIG_SPECS.softFraction.validate(bad), false, String(bad));
+    }
+    for (const bad of [1, 0.5, -2, "2", NaN]) {
+      assert.equal(CONFIG_SPECS.blockMultiple.validate(bad), false, String(bad));
+    }
+  });
+
+  it("takes any list of strings as the read-only commands", () => {
+    // The list is the human's policy; pear only checks the shape.
+    assert.equal(CONFIG_SPECS.allowedReadOnlyCommands.validate(["rm -rf"]), true);
+    assert.equal(CONFIG_SPECS.allowedReadOnlyCommands.validate([]), true);
+    assert.equal(CONFIG_SPECS.allowedReadOnlyCommands.validate(["ok", 2]), false);
+    assert.equal(CONFIG_SPECS.allowedReadOnlyCommands.validate("ls"), false);
+  });
+
+  it("bounds the watcher timings away from zero", () => {
+    assert.equal(CONFIG_SPECS.pollMs.validate(0), false);
+    assert.equal(CONFIG_SPECS.pollMs.validate(2_000), true);
+    assert.equal(CONFIG_SPECS.pollMs.validate(2_000.5), false);
+    assert.equal(CONFIG_SPECS.maxPollFailures.validate(0), false);
+    assert.equal(CONFIG_SPECS.maxPollFailures.validate(1), true);
+  });
+});
+
+describe("parseConfigValue", () => {
+  it("reads booleans the several ways a human writes them", () => {
+    for (const yes of ["true", "on", "YES", "1"]) {
+      assert.deepEqual(parseConfigValue("statusIcon", yes), { ok: true, value: true }, yes);
+    }
+    for (const no of ["false", "off", "No", "0"]) {
+      assert.deepEqual(parseConfigValue("statusIcon", no), { ok: true, value: false }, no);
+    }
+    assert.deepEqual(parseConfigValue("statusIcon", "maybe"), { ok: false });
+  });
+
+  it("splits command lists on commas, not spaces", () => {
+    // `git log` is one entry: splitting on whitespace would break every
+    // subcommand in the default list.
+    assert.deepEqual(parseConfigValue("allowedReadOnlyCommands", "git log, ls , cat"), {
+      ok: true,
+      value: ["git log", "ls", "cat"],
+    });
+    assert.deepEqual(parseConfigValue("allowedReadOnlyCommands", ""), { ok: true, value: [] });
+  });
+
+  it("refuses an empty number rather than reading it as zero", () => {
+    // Number("") is 0, which would silently set a budget of nothing.
+    assert.deepEqual(parseConfigValue("reviewBudget", "  "), { ok: false });
+    assert.deepEqual(parseConfigValue("pollMs", ""), { ok: false });
+  });
+
+  it("applies the same bounds a write would", () => {
+    assert.deepEqual(parseConfigValue("reviewBudget", "300"), { ok: true, value: 300 });
+    assert.deepEqual(parseConfigValue("reviewBudget", "1"), { ok: false });
+    assert.deepEqual(parseConfigValue("softFraction", "0.25"), { ok: true, value: 0.25 });
+    assert.deepEqual(parseConfigValue("softFraction", "2"), { ok: false });
+    assert.deepEqual(parseConfigValue("mode", "agent-driver"), {
+      ok: true,
+      value: "agent-driver",
+    });
+    assert.deepEqual(parseConfigValue("mode", "driver"), { ok: false });
+  });
+
+  it("round-trips through formatConfigValue", () => {
+    for (const key of CONFIG_KEYS) {
+      const shown = formatConfigValue(DEFAULTS[key]);
+      assert.deepEqual(parseConfigValue(key, shown), { ok: true, value: DEFAULTS[key] }, key);
+    }
+  });
+});
+
+describe("isConfigKey", () => {
+  it("accepts every key and nothing else", () => {
+    for (const key of CONFIG_KEYS) assert.equal(isConfigKey(key), true, key);
+    for (const no of ["budget", "", "toString", "constructor", 3, null]) {
+      assert.equal(isConfigKey(no), false, String(no));
     }
   });
 });

@@ -35,7 +35,7 @@
  * Thresholds live in `core/config.ts` and the tiering lives in the runtime.
  */
 
-import { isReadOnlyBashCommand } from "./bash.ts";
+import { DEFAULT_READ_ONLY_COMMANDS, isReadOnlyBashCommand } from "./bash.ts";
 
 /**
  * Charged once per distinct file in a review window.
@@ -120,13 +120,15 @@ function writeCost(input: unknown): ChangeCost {
   return { paths: [rec.path], lines: countLines(rec.content), opaque: false };
 }
 
-function bashCost(input: unknown): ChangeCost | undefined {
+function bashCost(input: unknown, allowed: readonly string[]): ChangeCost | undefined {
   const rec = asRecord(input);
   if (rec === undefined || typeof rec.command !== "string") return UNREADABLE;
   // Read-only commands are not changes at all, so they are not priced.
-  // `isReadOnlyBashCommand` rejects anything it cannot trivially prove safe,
-  // so "unclassifiable" already lands on the mutating side.
-  return isReadOnlyBashCommand(rec.command) ? undefined : { paths: [], lines: 0, opaque: true };
+  // `isReadOnlyBashCommand` rejects anything it cannot prove safe, so
+  // "unclassifiable" already lands on the mutating side.
+  return isReadOnlyBashCommand(rec.command, allowed)
+    ? undefined
+    : { paths: [], lines: 0, opaque: true };
 }
 
 /**
@@ -135,14 +137,19 @@ function bashCost(input: unknown): ChangeCost | undefined {
  * This is also the single source of truth for "is this tool mutating" — callers
  * should test for `undefined` rather than keeping their own tool-name set.
  */
-export function estimateChange(toolName: string, input: unknown): ChangeCost | undefined {
+export function estimateChange(
+  toolName: string,
+  input: unknown,
+  /** Commands the human considers read-only. Only consulted for `bash`. */
+  allowed: readonly string[] = DEFAULT_READ_ONLY_COMMANDS,
+): ChangeCost | undefined {
   switch (toolName) {
     case "edit":
       return editCost(input);
     case "write":
       return writeCost(input);
     case "bash":
-      return bashCost(input);
+      return bashCost(input, allowed);
     default:
       return undefined;
   }

@@ -27,6 +27,7 @@ import {
   writeFileSync as realWriteFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { DEFAULT_READ_ONLY_COMMANDS } from "./bash.ts";
 import { FILE_POINTS } from "./load.ts";
 
 /** Modes this version can actually run. */
@@ -58,6 +59,27 @@ export type PearConfig = {
   planPhase?: boolean;
   /** Prune tools that are neither pi built-ins nor pear's at session start. */
   exclusive?: boolean;
+  /**
+   * Commands that count as inspection: not priced, and allowed while scoping
+   * or after a stop. Entries match leading tokens, so `git log` covers its
+   * flags. See `core/bash.ts` — the list is the policy, and pear does not
+   * second-guess what is on it.
+   */
+  allowedReadOnlyCommands?: readonly string[];
+  /** Show a pear instead of the word, in the status line and the nudge. */
+  statusIcon?: boolean;
+  /** Human-driver: show the passive nudge above the prompt at all. */
+  nudge?: boolean;
+  /** Human-driver: how often the working tree is sampled, in milliseconds. */
+  pollMs?: number;
+  /** Human-driver: how long the tree must be quiet before it is priced. */
+  debounceMs?: number;
+  /** Human-driver: consecutive git failures before the watcher parks. */
+  maxPollFailures?: number;
+  /** Fraction of the budget at which pear starts mentioning it. */
+  softFraction?: number;
+  /** Multiple of the budget at which mutating calls are refused. */
+  blockMultiple?: number;
 };
 
 export const DEFAULTS = {
@@ -65,6 +87,14 @@ export const DEFAULTS = {
   reviewBudget: 200,
   planPhase: true,
   exclusive: false,
+  allowedReadOnlyCommands: DEFAULT_READ_ONLY_COMMANDS,
+  statusIcon: false,
+  nudge: true,
+  pollMs: 2_000,
+  debounceMs: 8_000,
+  maxPollFailures: 5,
+  softFraction: 0.5,
+  blockMultiple: 2,
 } as const satisfies Required<PearConfig>;
 
 /**
@@ -93,8 +123,8 @@ export const LEGACY_CHANGE_POINTS = FILE_POINTS;
  * How much of the budget must be used before pear starts nagging, and how far
  * past it the agent gets before mutating tools are blocked outright.
  */
-export const SOFT_FRACTION = 0.5;
-export const BLOCK_MULTIPLE = 2;
+export const SOFT_FRACTION = DEFAULTS.softFraction;
+export const BLOCK_MULTIPLE = DEFAULTS.blockMultiple;
 
 /**
  * What pear does at a given review load.
@@ -111,15 +141,30 @@ export const BLOCK_MULTIPLE = 2;
  */
 export type LoadTier = "quiet" | "soft" | "due" | "blocked";
 
-export function loadTier(points: number, budget: number): LoadTier {
-  if (points >= budget * BLOCK_MULTIPLE) return "blocked";
+export function loadTier(
+  points: number,
+  budget: number,
+  soft: number = SOFT_FRACTION,
+  block: number = BLOCK_MULTIPLE,
+): LoadTier {
+  if (points >= budget * block) return "blocked";
   if (points >= budget) return "due";
-  if (points >= budget * SOFT_FRACTION) return "soft";
+  if (points >= budget * soft) return "soft";
   return "quiet";
 }
 
 export function isMode(v: unknown): v is Mode {
   return v === "off" || v === "agent-driver" || v === "human-driver";
+}
+
+/** A whole number within an inclusive range. Rejects NaN, floats, strings. */
+function isIntBetween(v: unknown, min: number, max: number): boolean {
+  return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+}
+
+/** A finite number strictly inside an open range. */
+function isNumberBetween(v: unknown, low: number, high: number): boolean {
+  return typeof v === "number" && Number.isFinite(v) && v > low && v < high;
 }
 
 export function isLegacyMode(v: unknown): v is string {
@@ -139,6 +184,138 @@ export function isValidBudget(v: unknown): v is number {
 /** The old key's bounds, kept only so a legacy value can be recognised. */
 export function isValidLegacyBudget(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 1000;
+}
+
+export type ConfigKey = keyof Required<PearConfig>;
+
+/**
+ * What each key accepts, in one place.
+ *
+ * `loadConfig` and `saveConfig` both consult this, which is the point: a key
+ * that reads back differently from how it validates on write is how a config
+ * silently loses a setting. `describe` is shown to the human — in a write
+ * error, and in `/pear-config` — so it is written as a sentence, not a schema.
+ */
+export type ConfigSpec = {
+  validate: (value: unknown) => boolean;
+  /** What a valid value looks like, for humans. */
+  describe: string;
+  /** One line about what the key does, for `/pear-config`. */
+  summary: string;
+};
+
+export const CONFIG_SPECS: Record<ConfigKey, ConfigSpec> = {
+  mode: {
+    validate: isMode,
+    describe: MODES.join(" | "),
+    summary: "who is driving, or off",
+  },
+  reviewBudget: {
+    validate: isValidBudget,
+    describe: `a whole number from ${MIN_BUDGET} to ${MAX_BUDGET}`,
+    summary: "review points allowed between checkpoints",
+  },
+  planPhase: {
+    validate: (v) => typeof v === "boolean",
+    describe: "true or false",
+    summary: "start in scoping, with editing closed until a plan is approved",
+  },
+  exclusive: {
+    validate: (v) => typeof v === "boolean",
+    describe: "true or false",
+    summary: "turn off tools from other extensions at session start",
+  },
+  allowedReadOnlyCommands: {
+    // Deliberately unvalidated beyond the shape: the list is the human's
+    // policy, and pear does not get an opinion about what is on it.
+    validate: (v) => Array.isArray(v) && v.every((e) => typeof e === "string"),
+    describe: "a list of commands, matched on their leading words",
+    summary: "commands that count as inspection rather than change",
+  },
+  statusIcon: {
+    validate: (v) => typeof v === "boolean",
+    describe: "true or false",
+    summary: "show 🍐 instead of the word pear",
+  },
+  nudge: {
+    validate: (v) => typeof v === "boolean",
+    describe: "true or false",
+    summary: "show the passive line above your prompt while you drive",
+  },
+  pollMs: {
+    validate: (v) => isIntBetween(v, 250, 60_000),
+    describe: "milliseconds, from 250 to 60000",
+    summary: "how often your working tree is checked for changes",
+  },
+  debounceMs: {
+    validate: (v) => isIntBetween(v, 500, 600_000),
+    describe: "milliseconds, from 500 to 600000",
+    summary: "how long the tree must be quiet before pear prices it",
+  },
+  maxPollFailures: {
+    validate: (v) => isIntBetween(v, 1, 1_000),
+    describe: "a whole number from 1 to 1000",
+    summary: "consecutive git errors before pear stops watching",
+  },
+  softFraction: {
+    // Strictly between 0 and 1 so the quiet/soft/due ordering cannot invert.
+    validate: (v) => isNumberBetween(v, 0, 1),
+    describe: "a fraction above 0 and below 1",
+    summary: "share of the budget at which pear starts mentioning it",
+  },
+  blockMultiple: {
+    // Strictly above 1, or "blocked" would swallow "due".
+    validate: (v) => isNumberBetween(v, 1, 1_000),
+    describe: "a number above 1",
+    summary: "multiple of the budget at which changes are refused",
+  },
+};
+
+export const CONFIG_KEYS = Object.keys(CONFIG_SPECS) as ConfigKey[];
+
+export function isConfigKey(v: unknown): v is ConfigKey {
+  return typeof v === "string" && Object.prototype.hasOwnProperty.call(CONFIG_SPECS, v);
+}
+
+/** A value as a human types it, and as `/pear-config` shows it back. */
+export function formatConfigValue(value: unknown): string {
+  return Array.isArray(value) ? value.join(", ") : String(value);
+}
+
+/**
+ * Read one typed setting out of what a human typed.
+ *
+ * Every value arrives as a string — from a command argument or a text input —
+ * so this is where a string becomes a boolean, a number, or a list. It ends by
+ * running the same validator a write would, so the command line and the file
+ * cannot disagree about what is acceptable.
+ *
+ * Lists are comma-separated because the entries contain spaces: `git log` is
+ * one entry, not two.
+ */
+export function parseConfigValue(
+  key: ConfigKey,
+  text: string,
+): { ok: true; value: unknown } | { ok: false } {
+  const trimmed = text.trim();
+  let value: unknown = trimmed;
+
+  if (key === "allowedReadOnlyCommands") {
+    value = trimmed === ""
+      ? []
+      : trimmed.split(",").map((e) => e.trim()).filter((e) => e !== "");
+  } else if (typeof DEFAULTS[key] === "boolean") {
+    const yes = ["true", "on", "yes", "1"].includes(trimmed.toLowerCase());
+    const no = ["false", "off", "no", "0"].includes(trimmed.toLowerCase());
+    if (!yes && !no) return { ok: false };
+    value = yes;
+  } else if (typeof DEFAULTS[key] === "number") {
+    // Number("") is 0, which would quietly accept an empty input.
+    if (trimmed === "") return { ok: false };
+    value = Number(trimmed);
+  }
+
+  return CONFIG_SPECS[key].validate(value) ? { ok: true, value } : { ok: false };
 }
 
 export type LoadedConfig = {
@@ -238,24 +415,26 @@ export function loadConfig(projectDir: string, fs: ConfigFs = nodeFs): LoadedCon
   let legacyMode: string | undefined;
   let migratedBudgetFrom: number | undefined;
 
-  if (isMode(raw.mode)) {
-    config.mode = raw.mode;
-  } else if (isLegacyMode(raw.mode)) {
-    legacyMode = raw.mode;
+  // Every key is read the same way it is written, from CONFIG_SPECS. A value
+  // that fails validation is left at its default rather than rejected: one bad
+  // key must not cost the human the rest of their config.
+  const settable = config as Record<string, unknown>;
+  for (const key of CONFIG_KEYS) {
+    const value = raw[key];
+    if (value !== undefined && CONFIG_SPECS[key].validate(value)) settable[key] = value;
   }
+
+  // A mode this version cannot run is reported rather than coerced, and the
+  // file is left alone so re-adding the mode later is non-destructive.
+  if (!isMode(raw.mode) && isLegacyMode(raw.mode)) legacyMode = raw.mode;
 
   // An explicit reviewBudget always wins. Only fall back to the legacy key when
   // there is no new one to honour, so a config carrying both is unambiguous.
-  if (isValidBudget(raw.reviewBudget)) {
-    config.reviewBudget = raw.reviewBudget;
-  } else if (isValidLegacyBudget(raw[LEGACY_BUDGET_KEY])) {
+  if (!isValidBudget(raw.reviewBudget) && isValidLegacyBudget(raw[LEGACY_BUDGET_KEY])) {
     const legacy = raw[LEGACY_BUDGET_KEY] as number;
     config.reviewBudget = clampBudget(legacy * LEGACY_CHANGE_POINTS);
     migratedBudgetFrom = legacy;
   }
-
-  if (typeof raw.planPhase === "boolean") config.planPhase = raw.planPhase;
-  if (typeof raw.exclusive === "boolean") config.exclusive = raw.exclusive;
 
   const loaded: LoadedConfig = { config, raw, malformed: false, missing: false };
   if (legacyMode !== undefined) loaded.legacyMode = legacyMode;
@@ -302,24 +481,17 @@ export function saveConfig(
   fs: ConfigFs = nodeFs,
   now: () => number = Date.now,
 ): void {
-  if (patch.mode !== undefined && !isMode(patch.mode)) {
-    throw new ConfigWriteError(`refusing to persist invalid mode ${JSON.stringify(patch.mode)}`, undefined);
-  }
-  if (patch.reviewBudget !== undefined && !isValidBudget(patch.reviewBudget)) {
+  // A patch comes from pear's own code paths, so an invalid value is a bug
+  // rather than user error: it throws instead of being quietly dropped.
+  const patched = patch as Record<string, unknown>;
+  for (const key of CONFIG_KEYS) {
+    const value = patched[key];
+    if (value === undefined || CONFIG_SPECS[key].validate(value)) continue;
     throw new ConfigWriteError(
-      `refusing to persist invalid reviewBudget ${JSON.stringify(patch.reviewBudget)}` +
-        ` (want an integer in [${MIN_BUDGET}, ${MAX_BUDGET}])`,
+      `refusing to persist invalid ${key} ${JSON.stringify(value)}` +
+        ` (want ${CONFIG_SPECS[key].describe})`,
       undefined,
     );
-  }
-  for (const key of ["planPhase", "exclusive"] as const) {
-    const value = patch[key];
-    if (value !== undefined && typeof value !== "boolean") {
-      throw new ConfigWriteError(
-        `refusing to persist invalid ${key} ${JSON.stringify(value)} (want a boolean)`,
-        undefined,
-      );
-    }
   }
 
   const dir = configDir(projectDir);
@@ -349,10 +521,10 @@ export function saveConfig(
   // the file — including the legacy budget key and settings from other pear
   // versions — round-trips verbatim.
   const merged: Record<string, unknown> = { ...existing.raw };
-  if (patch.mode !== undefined) merged.mode = patch.mode;
-  if (patch.reviewBudget !== undefined) merged.reviewBudget = patch.reviewBudget;
-  if (patch.planPhase !== undefined) merged.planPhase = patch.planPhase;
-  if (patch.exclusive !== undefined) merged.exclusive = patch.exclusive;
+  for (const key of CONFIG_KEYS) {
+    const value = patched[key];
+    if (value !== undefined) merged[key] = value;
+  }
 
   const tmp = join(dir, `config.json.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
   try {

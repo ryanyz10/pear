@@ -20,8 +20,15 @@
  *    tool open while the human reads.
  */
 
+import { DEFAULT_READ_ONLY_COMMANDS } from "../../core/bash.ts";
 import { createCheckpoint, type Checkpoint, type FileState } from "../../core/checkpoint.ts";
-import { loadTier, type LoadTier, type Mode } from "../../core/config.ts";
+import {
+  BLOCK_MULTIPLE,
+  SOFT_FRACTION,
+  loadTier,
+  type LoadTier,
+  type Mode,
+} from "../../core/config.ts";
 import { estimateChange } from "../../core/load.ts";
 import {
   BLOCK_HUMAN_DRIVER,
@@ -142,6 +149,16 @@ export type RuntimeDeps = {
   reviewBudget: number;
   /** Whether a fresh session starts in scoping. */
   planPhase: boolean;
+  /**
+   * Commands the human considers read-only, and so not worth reviewing. Only
+   * `bash` consults it. Omitted means `DEFAULT_READ_ONLY_COMMANDS`.
+   */
+  allowedReadOnlyCommands?: readonly string[];
+  /** Where the tiers sit relative to the budget. Omitted means the defaults. */
+  softFraction?: number;
+  blockMultiple?: number;
+  /** Render a pear instead of the word, wherever pear names itself. */
+  statusIcon?: boolean;
   /** Capture current file state; returns null when git is unavailable. */
   captureFiles: () => FileState | null;
   now?: () => number;
@@ -168,6 +185,11 @@ export type PearRuntime = {
 
   setMode: (mode: Mode) => void;
   setBudget: (points: number) => void;
+  /** Swap the read-only command list without restarting the session. */
+  setAllowedReadOnlyCommands: (commands: readonly string[]) => void;
+  /** Move the tier boundaries without restarting the session. */
+  setTiers: (soft: number, block: number) => void;
+  setStatusIcon: (on: boolean) => void;
   /** Hand the keyboard over, keeping the plan and the session. */
   swap: () => Driver;
   /**
@@ -225,6 +247,11 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
   const now = deps.now ?? (() => Date.now());
   let mode: Mode = deps.mode;
   let budget = deps.reviewBudget;
+  let allowedCommands: readonly string[] =
+    deps.allowedReadOnlyCommands ?? DEFAULT_READ_ONLY_COMMANDS;
+  let softFraction = deps.softFraction ?? SOFT_FRACTION;
+  let blockMultiple = deps.blockMultiple ?? BLOCK_MULTIPLE;
+  let statusIcon = deps.statusIcon ?? false;
   let phase: Phase = deps.planPhase ? "scoping" : "building";
   let plan: PlanSpec | null = null;
   /** Seeded from the mode; `swap()` moves it without touching the mode. */
@@ -259,7 +286,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
    */
   const points = (): number =>
     driver === "human" ? treeLoad : checkpoint.snapshot().points;
-  const tier = (): LoadTier => loadTier(points(), budget);
+  const tier = (): LoadTier => loadTier(points(), budget, softFraction, blockMultiple);
 
   const resolvePending = (answer: TeardownAnswer): void => {
     pending?.teardown(answer);
@@ -365,6 +392,19 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       budget = next;
     },
 
+    setAllowedReadOnlyCommands(next) {
+      allowedCommands = next;
+    },
+
+    setTiers(soft, block) {
+      softFraction = soft;
+      blockMultiple = block;
+    },
+
+    setStatusIcon(on) {
+      statusIcon = on;
+    },
+
     swap() {
       driver = driver === "agent" ? "human" : "agent";
       // A swap is a clean handover: whatever the previous driver was part-way
@@ -435,7 +475,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
 
       // `estimateChange` is the single source of truth for "does this mutate":
       // read-only bash and every non-mutating tool price as undefined.
-      const cost = estimateChange(toolName, input);
+      const cost = estimateChange(toolName, input, allowedCommands);
       if (cost === undefined) return undefined;
 
       // Nothing may be changed before a plan is approved. edit/write are also
@@ -459,7 +499,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       // on the next one. Blocking on this call's own estimate would force a
       // checkpoint with nothing yet to review.
       const before = points();
-      if (loadTier(before, budget) === "blocked") {
+      if (loadTier(before, budget, softFraction, blockMultiple) === "blocked") {
         return { block: true, reason: blockOverBudget(before, budget) };
       }
 
@@ -476,7 +516,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       if (pending !== null || stopped || paused || explaining !== null) return undefined;
 
       const total = points();
-      switch (loadTier(total, budget)) {
+      switch (loadTier(total, budget, softFraction, blockMultiple)) {
         case "quiet":
           return undefined;
         case "soft":
@@ -615,7 +655,7 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     },
 
     statusText() {
-      if (mode === "off") return statusLine(mode, phase, 0, budget);
+      if (mode === "off") return statusLine(mode, phase, 0, budget, undefined, statusIcon);
       const flags: string[] = [];
       if (stopped) flags.push("stopped");
       if (quizzing) flags.push("awaiting your explanation");
@@ -623,7 +663,14 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
       else if (paused) flags.push("paused");
       if (pending !== null) flags.push("awaiting you");
       if (phase === "scoping" && planDrafts > 0) flags.push(`draft ${planDrafts}`);
-      return statusLine(mode, phase, points(), budget, flags.length ? flags.join(", ") : undefined);
+      return statusLine(
+        mode,
+        phase,
+        points(),
+        budget,
+        flags.length ? flags.join(", ") : undefined,
+        statusIcon,
+      );
     },
 
     filesSinceBaseline() {

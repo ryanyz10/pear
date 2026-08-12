@@ -1,3 +1,14 @@
+```
+         |/
+        (_)
+       .' '.
+      /     \
+     |       |
+     |       |
+      \     /
+       `---'
+```
+
 # pear
 
 A pair-programming loop for [pi](https://github.com/earendil-works/pi). You agree
@@ -147,7 +158,9 @@ driving for this session only, without touching the file.
 | `/pear-swap` | Hand the keyboard over, either way |
 | `/pear-explain` | Talk the agent through what you changed |
 | `/pear-mode [off\|agent-driver\|human-driver]` | Switch mode |
-| `/pear-config [n]` | Review load allowed between checkpoints (default 200) |
+| `/pear-config` | Every setting, in a picker showing its current value |
+| `/pear-config <key> <value>` | Set one setting |
+| `/pear-config <n>` | Shorthand for `reviewBudget` |
 | `/pear-exclusive` | Turn off tools from other extensions |
 
 ## How the pacing works
@@ -198,9 +211,37 @@ blocked, so an exhausted budget can never wedge the session.
 
 ### Tuning it
 
-`/pear-config` sets the budget. Lower means more checkpoints. The default is a
-starting guess — if a real session checkpoints more often than feels useful,
-raise it.
+`/pear-config reviewBudget 300` sets the budget. Lower means more checkpoints.
+The default is a starting guess — if a real session checkpoints more often than
+feels useful, raise it.
+
+The tiers themselves move too. `softFraction` is where the mention starts (0.5
+of the budget) and `blockMultiple` is where changes are refused (2× it). Set
+`softFraction` to 0.9 to be left alone until a checkpoint is nearly due, or
+`blockMultiple` to 1.2 to be stopped almost as soon as one is.
+
+### What counts as a change
+
+Inspection is free: a command on the `allowedReadOnlyCommands` list is never
+priced, never blocked while scoping, and still allowed after you have said stop.
+Entries match on leading words, so `git log` covers `git log --oneline -n 5`,
+and a shorter entry is a broader permission — `git` alone would allow every
+subcommand.
+
+A command has to be simple enough to read before the list is consulted at all:
+no expansion (`$…`, backticks), no operators, no redirection, no env prefix, no
+path-qualified binary. Quoted arguments are fine — `grep "foo bar" file` reads
+as three words, because tokenizing is done by a parser rather than by splitting
+on spaces.
+
+The defaults include `git diff` and `git show`. They can invoke a pager, an
+external diff driver or a textconv filter, all of which run programs named in
+git config — that risk is accepted, because reading the diff is most of what
+inspection is *for*, and the config that would exploit it lives in the repo
+whose test suite the agent already runs. Take them off the list if you disagree.
+The one thing the list cannot permit is a flag that names a file to write
+(`--output` anywhere, `-o` for git), since that is the definition of not
+read-only.
 
 ## What the file list means
 
@@ -250,14 +291,42 @@ tool for that project.
   "mode": "agent-driver",
   "reviewBudget": 200,
   "planPhase": true,
-  "exclusive": false
+  "exclusive": false,
+  "statusIcon": false,
+  "nudge": true,
+  "pollMs": 2000,
+  "debounceMs": 8000,
+  "maxPollFailures": 5,
+  "softFraction": 0.5,
+  "blockMultiple": 2,
+  "allowedReadOnlyCommands": ["ls", "cat", "grep", "git status", "git diff", "..."]
 }
 ```
 
-`mode` is `off`, `agent-driver`, or `human-driver`.
+Every one of these is settable from `/pear-config`, which shows the current
+value of each and validates what you type against the same rules a file write
+uses.
 
-- `reviewBudget` is a whole number from 40 to 100000.
-- `planPhase: false` skips scoping and starts building immediately.
+| Key | Default | What it does |
+| --- | --- | --- |
+| `mode` | `off` | `off`, `agent-driver`, or `human-driver` |
+| `reviewBudget` | 200 | Review points allowed between checkpoints (40–100000) |
+| `planPhase` | true | Start in scoping, with editing closed until a plan is approved |
+| `exclusive` | false | Turn off tools from other extensions at session start |
+| `statusIcon` | false | Show 🍐 instead of the word, in the status line and the nudge |
+| `nudge` | true | Show the passive line above your prompt while you drive |
+| `pollMs` | 2000 | How often your working tree is checked (250–60000) |
+| `debounceMs` | 8000 | How long the tree must be quiet before it is priced (500–600000) |
+| `maxPollFailures` | 5 | Consecutive git errors before pear stops watching |
+| `softFraction` | 0.5 | Share of the budget at which pear starts mentioning it |
+| `blockMultiple` | 2 | Multiple of the budget at which changes are refused |
+| `allowedReadOnlyCommands` | see above | Commands that count as inspection rather than change |
+
+- `planPhase: false` skips scoping and starts building immediately, and is the
+  one key that only takes effect on the next session.
+- `nudge: false` silences the passive line only. The load is still counted and
+  the review turn still happens — turning off the warning shot cannot turn off
+  the conversation.
 - The older `maxChangesPerCheckpoint` key is still read — it is translated into
   points and **left on disk untouched**, so downgrading loses nothing.
 - Unknown keys are **preserved** across writes, so a newer pear's settings

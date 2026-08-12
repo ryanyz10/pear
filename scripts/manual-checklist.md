@@ -143,3 +143,31 @@ yourself.
 49. With another extension's tools active, startup mentions it once.
 50. `/pear-exclusive` disables them and persists. pi's own tools and pear's
     remain.
+
+## I. Cards in a real terminal
+
+Unit tests price the windowing but cannot see it. These need eyes.
+
+51. **A plan taller than your terminal.** Every card body is windowed against
+    the real height, with a `↑ n above · ↓ n below` marker. PgUp/PgDn move it;
+    ↑↓ still move the options and Enter still answers. This is the bug that
+    made a long plan unreadable — check a checkpoint with many files too.
+52. **Resize while a card is open.** The card re-lays-out at the new width and
+    height. Stale lines here mean the render cache lost its dimension key: pi
+    answers a resize with `requestRender()` alone and never `invalidate()`.
+53. **Shrink the terminal until only the chrome fits.** The body floors at three
+    rows and overflows rather than collapsing to nothing.
+
+## J. Settings
+
+54. `/pear-config` with no arguments lists every key with its current value.
+    Booleans and `mode` offer a pick rather than a text box; Esc at either step
+    leaves everything unchanged.
+55. `/pear-config statusIcon true` — the status line and the human-driver nudge
+    switch to 🍐 immediately, and notifications still say "pear" in words.
+56. `/pear-config pollMs 500` then edit a file: the nudge appears sooner. The
+    watcher is rebuilt, so it re-adopts the current tree — work already in the
+    tree at that moment is not re-raised until you touch something again.
+57. `/pear-config allowedReadOnlyCommands ls, cat` — the list *replaces* the
+    defaults, so `git status` starts costing review points. Set it back with
+    `/pear-config` and no value to see the current list first.

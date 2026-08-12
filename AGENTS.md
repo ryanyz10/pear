@@ -33,7 +33,9 @@ to read" means.
 ## Repository layout
 
 - `core/` — host-free logic. **Nothing here may import a host SDK.**
-  - `config.ts` — `.pear/config.json` I/O, validation, `loadTier`
+  - `config.ts` — `.pear/config.json` I/O, validation, `loadTier`. Every setting
+  is one entry in `CONFIG_SPECS`, which `loadConfig`, `saveConfig` and
+  `/pear-config` all read: adding a key anywhere else is a bug.
   - `load.ts` — pricing a tool call, or a working tree, in review-load points
   - `watch.ts` — the human-driver scheduler (debounce, tiers, parking)
   - `checkpoint.ts` — review-load accounting, file-state provenance
@@ -275,13 +277,28 @@ Unknown keys round-trip. Legacy `human-driver` is reported, never rewritten. An
 unparseable file is backed up before replacement. Writes are temp-file +
 rename. Write failures are surfaced as "not persisted", never swallowed.
 
-### Command classification is reject-unless-trivial
+### Command classification is two layers, and only one is policy
 
-`core/bash.ts` classifies a command read-only only if it has no shell
-metacharacters, quotes, or backslashes **and** its verb is allowlisted. Adding
-a dual-purpose program to the allowlist is a bug: `git diff`/`show`/`log -p`
-are excluded because they can invoke pagers, external diff drivers, and
-textconv helpers. When in doubt, mutating.
+`core/bash.ts` answers read-only only if **both** hold: the command is simple
+enough to tokenize (no expansion, no operators, no redirection, no env prefix,
+no path-qualified binary), **and** its leading tokens match the allowlist.
+
+The first layer is not configurable and is not a judgement about programs — it
+is what makes the second mean anything. The second layer *is* the user's:
+`allowedReadOnlyCommands` is config, entries match as token prefixes, and pear
+does not second-guess what is on it. `git diff` and `git show` are in the
+defaults deliberately; the pager/textconv risk is documented in the module
+header and accepted.
+
+Tokenizing is `shell-quote`'s `parse`. **A successful parse is not a safety
+verdict.** It does not treat backticks as operators, and `$` expansion
+disappears into an empty string — so both are rejected by scanning the raw
+string *before* parsing. Anything structural (pipes, redirects, subshells,
+globs, comments) comes back as a non-string element and is rejected wholesale.
+A flag naming an output file is refused whatever the list says.
+
+When adding to the defaults: dual-purpose programs stay out (`sort -o`,
+`git branch -d`, `xargs`, `find -delete`). When in doubt, mutating.
 
 ## Testing
 

@@ -361,6 +361,25 @@ does reach the hook and is treated as the answer. That is a genuine turn the
 model sees, so the diff is not misdelivered — it is just attached to a message
 about something else. Accepted.
 
+### A `ui.custom` component is told its width, but must ask for its height
+
+`Component.render(width)` (`pi-tui/dist/tui.d.ts`) receives **only** the width.
+The height is reachable through the TUI handed to the `ui.custom` factory:
+`Terminal` exposes `get rows()` alongside `get columns()`
+(`pi-tui/dist/terminal.d.ts`), and `TUI.terminal` is public.
+
+This matters because a component that returns more lines than the terminal has
+is simply cut off at the top, and a component with `handleInput` can consume
+the keys that would otherwise scroll. `adapters/pi/cards/card.ts` therefore
+windows its body against `tui.terminal.rows` and pages it with PgUp/PgDn.
+
+**A resize does not invalidate a component.** `TUI.start` passes
+`() => this.requestRender()` as the terminal's resize handler
+(`pi-tui/dist/tui.js:435`) — `invalidate()` is called on theme change and full
+redraw, not on resize. Any render cache must therefore be keyed on the
+dimensions it was built for, or it will serve lines laid out for the old
+terminal.
+
 ### `sendUserMessage` is the only injection that fires `before_agent_start`
 
 `sendUserMessage` routes through `prompt()`, which fires `input` and

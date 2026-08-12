@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { askCard } from "../adapters/pi/cards/ask.ts";
-import { plainLines, type CardOption, type CardSpec } from "../adapters/pi/cards/card.ts";
+import {
+  MIN_BODY_ROWS,
+  plainLines,
+  scrollHint,
+  windowBody,
+  type CardOption,
+  type CardSpec,
+} from "../adapters/pi/cards/card.ts";
 import { checkpointCard, reviewableFiles } from "../adapters/pi/cards/checkpoint.ts";
 import { planCard } from "../adapters/pi/cards/plan.ts";
 
@@ -217,5 +224,87 @@ describe("plainLines", () => {
     const lines = plainLines(spec);
     assert.ok(lines.includes(""), "blank separators survive");
     assert.ok(lines.includes("  a.ts"), "items are indented");
+  });
+});
+
+/** `["0", "1", ... ]`, so a slice says exactly where it came from. */
+const numbered = (n: number): string[] => Array.from({ length: n }, (_, i) => String(i));
+
+describe("windowBody", () => {
+  it("leaves a body that fits alone", () => {
+    const lines = numbered(4);
+    const window = windowBody(lines, 10, 0);
+    assert.deepEqual(window, { lines, above: 0, below: 0, offset: 0 });
+  });
+
+  it("ignores a stale offset when everything fits", () => {
+    // A resize can grow the viewport past the body while an offset is still set.
+    const window = windowBody(numbered(4), 10, 3);
+    assert.equal(window.offset, 0);
+    assert.equal(window.lines.length, 4);
+  });
+
+  it("shows the top of a long body first", () => {
+    const window = windowBody(numbered(20), 5, 0);
+    assert.deepEqual(window.lines, ["0", "1", "2", "3", "4"]);
+    assert.equal(window.above, 0);
+    assert.equal(window.below, 15);
+  });
+
+  it("counts what is hidden on both sides", () => {
+    const window = windowBody(numbered(20), 5, 7);
+    assert.deepEqual(window.lines, ["7", "8", "9", "10", "11"]);
+    assert.equal(window.above, 7);
+    assert.equal(window.below, 8);
+    assert.equal(window.above + window.lines.length + window.below, 20);
+  });
+
+  it("clamps an offset past the end to the last screenful", () => {
+    // Paging repeatedly must land on the bottom, never past it: the last line
+    // of the body has to be reachable and has to stay reachable.
+    const window = windowBody(numbered(20), 5, 999);
+    assert.equal(window.offset, 15);
+    assert.deepEqual(window.lines, ["15", "16", "17", "18", "19"]);
+    assert.equal(window.below, 0);
+  });
+
+  it("clamps a negative offset to the top", () => {
+    const window = windowBody(numbered(20), 5, -4);
+    assert.equal(window.offset, 0);
+    assert.equal(window.above, 0);
+  });
+
+  it("never returns an empty window", () => {
+    // A terminal too short to render anything must still render something.
+    const window = windowBody(numbered(20), 0, 0);
+    assert.equal(window.lines.length, 1);
+  });
+
+  it("keeps every line reachable by paging", () => {
+    const lines = numbered(37);
+    const viewport = MIN_BODY_ROWS;
+    const seen = new Set<string>();
+    for (let offset = 0; offset <= lines.length; offset += Math.max(1, viewport - 1)) {
+      for (const line of windowBody(lines, viewport, offset).lines) seen.add(line);
+    }
+    assert.equal(seen.size, lines.length, "a screenful-minus-one page reaches every line");
+  });
+});
+
+describe("scrollHint", () => {
+  it("names only the direction that has more", () => {
+    assert.match(scrollHint(windowBody(numbered(20), 5, 0)), /15 below/);
+    assert.doesNotMatch(scrollHint(windowBody(numbered(20), 5, 0)), /above/);
+    assert.doesNotMatch(scrollHint(windowBody(numbered(20), 5, 15)), /below/);
+  });
+
+  it("names both when the body is windowed in the middle", () => {
+    const hint = scrollHint(windowBody(numbered(20), 5, 7));
+    assert.match(hint, /7 above/);
+    assert.match(hint, /8 below/);
+  });
+
+  it("says which keys scroll it", () => {
+    assert.match(scrollHint(windowBody(numbered(20), 5, 0)), /PgUp\/PgDn/);
   });
 });

@@ -20,15 +20,20 @@ import {
   workingDiffText,
 } from "../../../core/git.ts";
 import {
+  CONFIG_KEYS,
+  CONFIG_SPECS,
   ConfigWriteError,
-  MAX_BUDGET,
-  MIN_BUDGET,
+  DEFAULTS,
   MODES,
-  isValidBudget,
+  formatConfigValue,
+  isConfigKey,
   loadConfig,
   nodeFs,
+  parseConfigValue,
   saveConfig,
+  type ConfigKey,
   type Mode,
+  type PearConfig,
 } from "../../../core/config.ts";
 import {
   latestPlanPath,
@@ -121,14 +126,6 @@ const PLAN_ENTRY = "pear-plan";
  */
 const SAVED_PLAN_ANSWERS = new Set(["approve", "revise", "explore", "dismissed"]);
 
-/**
- * How often the human-driver watcher looks at the working tree.
- *
- * Cheap by construction: the poll only hashes files git already reports as
- * dirty, and the expensive line-counting read happens once the tree settles.
- */
-const POLL_MS = 2_000;
-
 /** Widget key for the passive nudge. Keyed so re-setting it refreshes in place. */
 const NUDGE_KEY = "pear-nudge";
 
@@ -191,6 +188,17 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
   // actually running, which can differ from what is on disk (see the headless
   // policy below). Deliberately not mirrored in a second variable.
   let runtime: PearRuntime | null = null;
+
+  /**
+   * The settings this session is running with.
+   *
+   * Deliberately not the source of truth for anything the runtime owns —
+   * `runtime.mode` is still the only answer to "what mode is this session", and
+   * this may differ from it (headless fail-closed). It exists because the
+   * watcher and the nudge need values that live nowhere else, and because
+   * `/pear-config` has to show what is in force rather than what is on disk.
+   */
+  let settings: Required<PearConfig> = { ...DEFAULTS };
 
   /**
    * Tools pear took away when it entered scoping, so it can put back exactly
@@ -307,6 +315,8 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
     if (runtime === null || runtime.driver !== "human") return;
 
     watcher = createWatcher({
+      debounceMs: settings.debounceMs,
+      maxFailures: settings.maxPollFailures,
       sample: () => {
         const state = captureGitState(ctx.cwd);
         if (!state.ok) return { ok: false, detail: state.detail };
@@ -335,7 +345,7 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
         // A throw here would take down the interval and silently stop watching.
         // The watcher's own failure counter is what handles persistent trouble.
       }
-    }, POLL_MS);
+    }, settings.pollMs);
     // Never hold the process open just to poll.
     pollTimer.unref?.();
   };
@@ -369,15 +379,25 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
 
     switch (effect.kind) {
       case "nudge":
+        // The load is recorded either way. Turning the nudge off silences the
+        // warning shot, not the accounting — the trigger that starts a review
+        // turn is the blocked tier and is not affected by this.
         rt.setWorkingTreeLoad(effect.points);
-        try {
-          ctx.ui.setWidget(
-            NUDGE_KEY,
-            nudgeLines(effect.files, effect.insertions + effect.deletions, effect.tier === "due"),
-            { placement: "aboveEditor" },
-          );
-        } catch {
-          /* setWidget is TUI-only; RPC simply gets no warning shot */
+        if (settings.nudge) {
+          try {
+            ctx.ui.setWidget(
+              NUDGE_KEY,
+              nudgeLines(
+                effect.files,
+                effect.insertions + effect.deletions,
+                effect.tier === "due",
+                settings.statusIcon,
+              ),
+              { placement: "aboveEditor" },
+            );
+          } catch {
+            /* setWidget is TUI-only; RPC simply gets no warning shot */
+          }
         }
         refreshStatus(ctx);
         return;
@@ -470,6 +490,7 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
 
   pi.on("session_start", (_event, ctx) => {
     const loaded = loadConfig(ctx.cwd);
+    settings = loaded.config;
 
     if (loaded.legacyMode !== undefined) {
       ctx.ui.notify(
@@ -520,6 +541,10 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       mode: startMode,
       reviewBudget: loaded.config.reviewBudget,
       planPhase: loaded.config.planPhase,
+      allowedReadOnlyCommands: loaded.config.allowedReadOnlyCommands,
+      softFraction: loaded.config.softFraction,
+      blockMultiple: loaded.config.blockMultiple,
+      statusIcon: loaded.config.statusIcon,
       captureFiles: captureFiles(ctx.cwd),
     });
 
@@ -1227,33 +1252,140 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
     },
   });
 
+  /**
+   * Put a setting into force without restarting the session.
+   *
+   * `settings` is updated first so the watcher and the nudge read the new value
+   * on their next tick; the runtime is then told the parts it owns. Keys that
+   * only apply to a fresh session (`planPhase`) change nothing here, which is
+   * why the caller says so.
+   */
+  const applySetting = (ctx: ExtensionContext, key: ConfigKey, value: unknown): void => {
+    const rt = runtime;
+    if (rt === null) return;
+    settings = { ...settings, [key]: value } as Required<PearConfig>;
+
+    switch (key) {
+      case "mode":
+        // Same rule as /pear-mode: a mode is only run where a human can answer.
+        rt.setMode(canShowDialogs(ctx) ? (value as Mode) : "off");
+        syncPhaseTools();
+        syncWatcher(ctx);
+        break;
+      case "reviewBudget":
+        rt.setBudget(value as number);
+        break;
+      case "allowedReadOnlyCommands":
+        rt.setAllowedReadOnlyCommands(value as string[]);
+        break;
+      case "softFraction":
+      case "blockMultiple":
+        rt.setTiers(settings.softFraction, settings.blockMultiple);
+        break;
+      case "statusIcon":
+        rt.setStatusIcon(value as boolean);
+        break;
+      case "exclusive":
+        // Turning it on takes effect now; turning it off cannot, because the
+        // tools it dropped are gone for this session. The caller says so.
+        if (value === true) applyExclusive(ctx);
+        break;
+      case "nudge":
+      case "pollMs":
+      case "debounceMs":
+      case "maxPollFailures":
+        // The watcher takes these at construction, so it is rebuilt. It adopts
+        // the current tree as its baseline, exactly as /pear-swap does.
+        syncWatcher(ctx);
+        break;
+      case "planPhase":
+        break;
+    }
+    refreshStatus(ctx);
+  };
+
+  /** Ask for one value, in whatever way suits its type. */
+  const promptForValue = async (
+    ctx: ExtensionContext,
+    key: ConfigKey,
+    current: unknown,
+  ): Promise<string | undefined> => {
+    const spec = CONFIG_SPECS[key];
+    if (key === "mode") return await ctx.ui.select("pear mode:", [...MODES]);
+    if (typeof DEFAULTS[key] === "boolean") {
+      return await ctx.ui.select(`${key} — ${spec.summary}`, ["true", "false"]);
+    }
+    return await ctx.ui.input(
+      `${key} (${spec.describe}), currently ${formatConfigValue(current)}:`,
+    );
+  };
+
   pi.registerCommand("pear-config", {
-    description: "Set the review load allowed between checkpoints",
+    description: `Change a pear setting: ${CONFIG_KEYS.join(" | ")}`,
     handler: async (args, ctx) => {
       const rt = needRuntime(ctx);
       if (rt === null) return;
+      // What is on disk, so the command reports the file it is about to edit
+      // rather than a session that may have diverged from it.
       const current = loadConfig(ctx.cwd).config;
-      let raw = args.trim();
+      const raw = args.trim();
+
+      let key: ConfigKey | undefined;
+      let valueText: string | undefined;
 
       if (raw === "") {
         if (!ctx.hasUI) {
           ctx.ui.notify(
-            `pear-config needs a number here (${MIN_BUDGET}-${MAX_BUDGET}); currently ${current.reviewBudget}`,
+            `pear-config needs a key and a value here. ` +
+              CONFIG_KEYS.map((k) => `${k}=${formatConfigValue(current[k])}`).join(", "),
             "warning",
           );
           return;
         }
-        const typed = await ctx.ui.input(
-          `Review points allowed between checkpoints (${MIN_BUDGET}-${MAX_BUDGET}), currently ${current.reviewBudget}:`,
+        const labels = CONFIG_KEYS.map(
+          (k) => `${k} = ${formatConfigValue(current[k])}  — ${CONFIG_SPECS[k].summary}`,
         );
-        if (typed === undefined) return;
-        raw = typed.trim();
+        const picked = await ctx.ui.select("pear settings:", labels);
+        if (picked === undefined) return;
+        key = CONFIG_KEYS[labels.indexOf(picked)];
+        if (key === undefined) return;
+        valueText = await promptForValue(ctx, key, current[key]);
+        if (valueText === undefined) return;
+      } else {
+        const [first = "", ...rest] = raw.split(" ").filter((t) => t !== "");
+        if (isConfigKey(first)) {
+          key = first;
+          valueText = rest.join(" ");
+          if (valueText === "" && key !== "allowedReadOnlyCommands") {
+            if (!ctx.hasUI) {
+              ctx.ui.notify(
+                `pear: ${key} wants ${CONFIG_SPECS[key].describe}; currently ` +
+                  formatConfigValue(current[key]),
+                "warning",
+              );
+              return;
+            }
+            const typed = await promptForValue(ctx, key, current[key]);
+            if (typed === undefined) return;
+            valueText = typed;
+          }
+        } else if (/^[0-9]+$/.test(raw)) {
+          // Back-compat: /pear-config used to take nothing but a budget.
+          key = "reviewBudget";
+          valueText = raw;
+        } else {
+          ctx.ui.notify(
+            `pear: unknown setting "${first}" — try one of ${CONFIG_KEYS.join(", ")}`,
+            "error",
+          );
+          return;
+        }
       }
 
-      const value = Number(raw);
-      if (!isValidBudget(value)) {
+      const parsed = parseConfigValue(key, valueText);
+      if (!parsed.ok) {
         ctx.ui.notify(
-          `pear: need a whole number between ${MIN_BUDGET} and ${MAX_BUDGET}`,
+          `pear: ${key} wants ${CONFIG_SPECS[key].describe} — "${valueText}" isn't one`,
           "error",
         );
         return;
@@ -1262,18 +1394,25 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
       let persisted = true;
       let detail = "";
       try {
-        saveConfig(ctx.cwd, { reviewBudget: value });
+        saveConfig(ctx.cwd, { [key]: parsed.value } as PearConfig);
       } catch (e) {
         persisted = false;
         detail = e instanceof ConfigWriteError ? e.message : String(e);
       }
 
-      rt.setBudget(value);
-      refreshStatus(ctx);
+      applySetting(ctx, key, parsed.value);
+
+      const shown = `${key} = ${formatConfigValue(parsed.value)}`;
+      // Two keys cannot change this session: scoping has already been decided,
+      // and tools already dropped cannot be handed back. Saying so is the
+      // difference between a setting that looks broken and one that is pending.
+      const later =
+        key === "planPhase" || (key === "exclusive" && parsed.value === false);
+      const laterNote = later ? " (takes effect next session)" : "";
       ctx.ui.notify(
         persisted
-          ? `pear: up to ${value} review point(s) between checkpoints`
-          : `pear: set to ${value} for this session only — NOT persisted: ${detail}`,
+          ? `pear: ${shown}${laterNote}`
+          : `pear: ${shown} for this session only — NOT persisted: ${detail}`,
         persisted ? "info" : "warning",
       );
     },

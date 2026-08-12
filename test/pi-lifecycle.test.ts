@@ -188,6 +188,8 @@ function fakeTimers() {
   return {
     started: () => started,
     liveCount: () => live.size,
+    /** The periods of every live interval, so a configured one can be checked. */
+    periods: () => [...live].map((t) => t.ms),
     /** Run every live interval, advancing the clock by its period each time. */
     poll: (times = 1) => {
       for (let i = 0; i < times; i++) {
@@ -1099,6 +1101,100 @@ describe("source hygiene", () => {
       const returned = hook(writeCall("sync", "f.ts"), b.ctx);
       assert.notEqual(typeof (returned as any)?.then, "function", "must not return a promise");
     }
+  });
+});
+
+/* --------------------------------------------------------- config levers */
+
+describe("settings take effect", () => {
+  it("polls at the configured interval", async () => {
+    const b = await boot(navigator({ pollMs: 500 }));
+    assert.deepEqual(b.timers.periods(), [500]);
+  });
+
+  it("waits the configured debounce before pricing anything", async () => {
+    // A debounce longer than the test could ever wait proves the value is the
+    // one in force, not the module default.
+    const b = await boot(navigator({ reviewBudget: 200, debounceMs: 600_000 }));
+    adopt(b);
+    humanEdits(b, "work.ts", 400);
+    b.timers.poll(12);
+    assert.deepEqual(b.widgets.filter(([, c]) => c !== undefined), [], "nothing priced yet");
+    assert.deepEqual(b.sentUserMessages, [], "and nothing asked");
+  });
+
+  it("with nudge off, stays quiet but still starts the review turn", async () => {
+    // Silencing the warning shot must not silence the conversation.
+    const quiet = await boot(navigator({ reviewBudget: 200, nudge: false }));
+    adopt(quiet);
+    humanEdits(quiet, "work.ts", 80); // soft tier
+    quiet.timers.poll(12);
+    assert.deepEqual(
+      quiet.widgets.filter(([key, c]) => key === "pear-nudge" && c !== undefined),
+      [],
+      "no nudge widget",
+    );
+
+    const loud = await boot(navigator({ reviewBudget: 200, nudge: false }));
+    adopt(loud);
+    humanEdits(loud, "big.ts", 400); // blocked tier
+    loud.timers.poll(12);
+    assert.equal(loud.sentUserMessages.length, 1, "the trigger is not a nudge");
+  });
+
+  it("blocks at the configured multiple of the budget", async () => {
+    const b = await boot(driver({ reviewBudget: 200, blockMultiple: 1.2 }));
+    await approvePlan(b);
+    // 40 + 200 = 240 points, which is over 200 * 1.2 but under the default 400.
+    await b.emit("tool_call", writeCall("a", "a.ts", 200), b.ctx);
+    await b.emit("tool_result", { toolCallId: "a", isError: false, content: [] }, b.ctx);
+    const [decision] = await b.emit("tool_call", writeCall("b", "b.ts", 1), b.ctx);
+    assert.equal(decision?.block, true, "blocked earlier than the default would");
+    assert.match(decision.reason, /checkpoint overdue/);
+  });
+
+  it("mentions the budget at the configured fraction", async () => {
+    const b = await boot(driver({ reviewBudget: 200, softFraction: 0.1 }));
+    await approvePlan(b);
+    // 41 points: soft at 0.1 of the budget, silent at the default 0.5.
+    await b.emit("tool_call", writeCall("a", "a.ts", 1), b.ctx);
+    const [result] = await b.emit(
+      "tool_result",
+      { toolCallId: "a", isError: false, content: [{ type: "text", text: "ok" }] },
+      b.ctx,
+    );
+    assert.match(result.content.at(-1)?.text ?? "", /look for a good place to check in/);
+  });
+
+  it("treats a configured command as inspection rather than change", async () => {
+    const b = await boot(driver({ allowedReadOnlyCommands: ["npm test"] }));
+    await approvePlan(b);
+    const [free] = await b.emit(
+      "tool_call",
+      { toolCallId: "a", toolName: "bash", input: { command: "npm test" } },
+      b.ctx,
+    );
+    assert.equal(free, undefined, "not blocked");
+    // The list replaces the defaults, so git status is no longer free.
+    await b.emit(
+      "tool_call",
+      { toolCallId: "b", toolName: "bash", input: { command: "git status" } },
+      b.ctx,
+    );
+    await b.emit("tool_result", { toolCallId: "b", isError: false, content: [] }, b.ctx);
+    const status = b.statuses.at(-1)?.[1] ?? "";
+    assert.match(status, /60\/200/, "priced as an opaque command");
+  });
+
+  it("shows a pear in the status line when asked", async () => {
+    const b = await boot(driver({ statusIcon: true }));
+    assert.match(b.statuses.at(-1)?.[1] ?? "", /🍐/);
+    assert.doesNotMatch(b.statuses.at(-1)?.[1] ?? "", /pear/);
+  });
+
+  it("says the word by default", async () => {
+    const b = await boot(driver());
+    assert.match(b.statuses.at(-1)?.[1] ?? "", /^pear:/);
   });
 });
 

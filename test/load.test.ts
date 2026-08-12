@@ -111,6 +111,25 @@ describe("estimateChange: bash", () => {
   it("is charged more than a file touch, since an unreadable change is worse", () => {
     assert.ok(OPAQUE_POINTS > FILE_POINTS);
   });
+
+  it("honours the caller's read-only list", () => {
+    // The human decides what counts as inspection; pricing follows.
+    assert.equal(estimateChange("bash", { command: "npm test" }, ["npm test"]), undefined);
+    assert.deepEqual(estimateChange("bash", { command: "git status" }, ["npm test"]), {
+      paths: [],
+      lines: 0,
+      opaque: true,
+    });
+  });
+
+  it("only consults the list for bash", () => {
+    // An allowlist entry cannot make an edit free.
+    assert.deepEqual(estimateChange("write", { path: "a.ts", content: "x" }, ["write"]), {
+      paths: ["a.ts"],
+      lines: 1,
+      opaque: false,
+    });
+  });
 });
 
 describe("estimateChange: unreadable input errs toward oversight", () => {

@@ -84,6 +84,57 @@ export function plainLines<A>(spec: CardSpec<A>): string[] {
   return spec.lines.map((l) => (l.text === "" ? "" : `${" ".repeat(l.indent)}${l.text}`));
 }
 
+/**
+ * The smallest body worth showing. Below this a card is all chrome and no
+ * content, so we overflow the terminal rather than render something useless.
+ */
+export const MIN_BODY_ROWS = 3;
+
+/** Rows to assume when the terminal will not say how tall it is. */
+export const FALLBACK_ROWS = 24;
+
+export type BodyWindow = {
+  /** The slice to render. */
+  lines: string[];
+  /** Lines above and below the slice; both zero when nothing is hidden. */
+  above: number;
+  below: number;
+  /** The offset actually used, after clamping. */
+  offset: number;
+};
+
+/**
+ * Window a card body to the rows available for it.
+ *
+ * Pure on purpose: the windowing is the part worth testing, and it can be
+ * tested without a terminal. The renderer supplies the measured viewport and
+ * the current scroll offset and draws whatever comes back.
+ *
+ * Clamping happens here rather than in the input handler because the viewport
+ * is only known at render time — a resize can make a previously valid offset
+ * point past the end of the body.
+ */
+export function windowBody(lines: string[], viewport: number, offset: number): BodyWindow {
+  const height = Math.max(1, Math.floor(viewport));
+  if (lines.length <= height) return { lines, above: 0, below: 0, offset: 0 };
+  const max = lines.length - height;
+  const at = Math.min(max, Math.max(0, Math.floor(offset)));
+  return {
+    lines: lines.slice(at, at + height),
+    above: at,
+    below: lines.length - (at + height),
+    offset: at,
+  };
+}
+
+/** The one-line "there is more" marker shown under a windowed body. */
+export function scrollHint(window: BodyWindow): string {
+  const parts: string[] = [];
+  if (window.above > 0) parts.push(`↑ ${window.above} above`);
+  if (window.below > 0) parts.push(`↓ ${window.below} below`);
+  return `${parts.join(" · ")} · PgUp/PgDn to scroll`;
+}
+
 const THEME_KEY: Record<Tone, ThemeColor> = {
   text: "text",
   muted: "muted",
@@ -108,6 +159,18 @@ export function renderCard<A>(
   let index = 0;
   let mode: Mode = { at: "options" };
   let cached: string[] | undefined;
+  /**
+   * The cache is keyed on the viewport it was rendered for. pi's TUI answers a
+   * resize with `requestRender()` alone and never calls `invalidate()`, so a
+   * cache that ignored the dimensions would keep serving lines laid out for the
+   * old terminal.
+   */
+  let cachedWidth = -1;
+  let cachedRows = -1;
+  /** First body line on screen. Clamped at render time, when the viewport is known. */
+  let bodyOffset = 0;
+  /** Body rows the last render had room for, so paging can move by a screenful. */
+  let lastViewport = MIN_BODY_ROWS;
 
   const editorTheme: EditorTheme = {
     borderColor: (s) => theme.fg("accent", s),
@@ -124,6 +187,27 @@ export function renderCard<A>(
   const invalidate = () => {
     cached = undefined;
     tui.requestRender();
+  };
+
+  /**
+   * How tall the terminal is. `render` is only told the width, but the card is
+   * handed the TUI, and `Terminal` exposes `rows`. A terminal that will not say
+   * gets a conservative guess rather than an unscrollable card.
+   */
+  const terminalRows = (): number => {
+    try {
+      const rows = tui.terminal.rows;
+      return typeof rows === "number" && Number.isFinite(rows) && rows > 0 ? rows : FALLBACK_ROWS;
+    } catch {
+      return FALLBACK_ROWS;
+    }
+  };
+
+  /** Move the body window. Paging is by a screenful less one line of overlap. */
+  const scrollBody = (direction: -1 | 1): void => {
+    const step = Math.max(1, lastViewport - 1);
+    bodyOffset = Math.max(0, bodyOffset + direction * step);
+    invalidate();
   };
 
   const optionAt = (i: number): CardOption<A> | undefined => spec.options[i];
@@ -205,6 +289,16 @@ export function renderCard<A>(
       return;
     }
 
+    // Paging is bound separately from ↑↓ on purpose: the arrows belong to the
+    // options, and a card whose body does not fit must still be readable.
+    if (matchesKey(data, Key.pageUp)) {
+      scrollBody(-1);
+      return;
+    }
+    if (matchesKey(data, Key.pageDown)) {
+      scrollBody(1);
+      return;
+    }
     if (matchesKey(data, Key.up)) {
       index = Math.max(0, index - 1);
       invalidate();
@@ -225,39 +319,45 @@ export function renderCard<A>(
   }
 
   function render(width: number): string[] {
-    if (cached !== undefined) return cached;
-
     const w = Math.max(20, width);
-    const out: string[] = [];
+    const rows = terminalRows();
+    if (cached !== undefined && cachedWidth === w && cachedRows === rows) return cached;
 
-    const wrapped = (text: string, prefix = "") => {
+    // Built as three pieces so the body can be measured against what is left
+    // after the chrome, which is the whole point of knowing the height.
+    const head: string[] = [];
+    const bodyLines: string[] = [];
+    const tail: string[] = [];
+
+    const wrapInto = (out: string[], text: string, prefix = "") => {
       const pw = visibleWidth(prefix);
       const chunk = wrapTextWithAnsi(text, Math.max(1, w - pw));
       chunk.forEach((line, i) => out.push(`${i === 0 ? prefix : " ".repeat(pw)}${line}`));
     };
+    const wrapped = (text: string, prefix = "") => wrapInto(tail, text, prefix);
 
     const rule = theme.fg("accent", "─".repeat(w));
-    out.push(rule);
-    wrapped(theme.fg("accent", theme.bold(spec.title)), " ");
-    out.push("");
+    head.push(rule);
+    wrapInto(head, theme.fg("accent", theme.bold(spec.title)), " ");
+    head.push("");
 
     for (const line of spec.lines) {
       if (line.text === "") {
-        out.push("");
+        bodyLines.push("");
         continue;
       }
-      wrapped(theme.fg(THEME_KEY[line.tone], line.text), ` ${" ".repeat(line.indent)}`);
+      wrapInto(bodyLines, theme.fg(THEME_KEY[line.tone], line.text), ` ${" ".repeat(line.indent)}`);
     }
 
-    out.push("");
+    tail.push("");
 
     for (let i = 0; i < spec.options.length; i++) {
       const option = spec.options[i];
       if (option === undefined) continue;
-      const selected = i === index && mode.at === "options";
+      const optionSelected = i === index && mode.at === "options";
       const active = mode.at !== "options" && mode.option === i;
-      const marker = selected ? theme.fg("accent", "› ") : "  ";
-      const color = selected || active ? "accent" : "text";
+      const marker = optionSelected ? theme.fg("accent", "› ") : "  ";
+      const color = optionSelected || active ? "accent" : "text";
       wrapped(
         theme.fg(color, option.label) +
           (option.hint === undefined ? "" : theme.fg("dim", `  ${option.hint}`)),
@@ -267,17 +367,17 @@ export function renderCard<A>(
 
     if (mode.at === "editor") {
       const option = optionAt(mode.option);
-      out.push("");
+      tail.push("");
       if (option !== undefined && "editor" in option) {
         wrapped(theme.fg("muted", option.editor.prompt), " ");
       }
-      for (const line of editor.render(Math.max(1, w - 2))) out.push(` ${line}`);
+      for (const line of editor.render(Math.max(1, w - 2))) tail.push(` ${line}`);
     }
 
     if (mode.at === "pick") {
       const option = optionAt(mode.option);
       const picked = mode.index;
-      out.push("");
+      tail.push("");
       if (option !== undefined && "pick" in option) {
         wrapped(theme.fg("muted", option.pick.prompt), " ");
         option.pick.items.forEach((item, i) => {
@@ -290,7 +390,7 @@ export function renderCard<A>(
       }
     }
 
-    out.push("");
+    tail.push("");
     wrapped(
       theme.fg(
         "dim",
@@ -303,9 +403,32 @@ export function renderCard<A>(
       ),
       " ",
     );
-    out.push(rule);
+    tail.push(rule);
+
+    // What is left for the body once the chrome has taken its share. The card
+    // may still overflow a very short terminal — MIN_BODY_ROWS says a body of
+    // one line is worse than a card that runs off the top.
+    const available = rows - head.length - tail.length;
+    const out = [...head];
+    if (bodyLines.length <= available) {
+      // Everything fits: no window, no marker, and no stale offset left behind.
+      bodyOffset = 0;
+      lastViewport = Math.max(MIN_BODY_ROWS, bodyLines.length);
+      out.push(...bodyLines);
+    } else {
+      // One row goes to the marker, so the human can tell there is more.
+      const viewport = Math.max(MIN_BODY_ROWS, available - 1);
+      const window = windowBody(bodyLines, viewport, bodyOffset);
+      bodyOffset = window.offset;
+      lastViewport = viewport;
+      out.push(...window.lines);
+      wrapInto(out, theme.fg("dim", scrollHint(window)), " ");
+    }
+    out.push(...tail);
 
     cached = out;
+    cachedWidth = w;
+    cachedRows = rows;
     return out;
   }
 
