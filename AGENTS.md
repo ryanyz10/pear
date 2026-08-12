@@ -2,140 +2,327 @@
 
 ## Project overview
 
-`pear` is a pair-programming **loop core** plus thin **host adapters**. The loop runs in exactly one of three mutually exclusive modes per project — `off` (default), `agent-driver` (gates mutating tool calls with wall-clock + change-count checkpoints), or `human-driver` (runs a background **navigator** that reviews the human's uncommitted changes with a two-stage review). Findings are human-only by default.
+`pear` is a pair-programming loop for the **pi** harness. Either party can hold
+the keyboard.
+
+Both start the same way: a **scoping** phase gated by `pear_plan`, where nothing
+can be edited until an approach is agreed. After that the `driver` decides what
+the **building** phase looks like.
+
+- **`agent-driver`** — the agent builds in digestible increments, punctuated by
+  `pear_checkpoint`. At each one you can keep going, have a file walked through,
+  change direction, or stop.
+- **`human-driver`** — you build; the agent watches the working tree through
+  git, nudges when enough has piled up, and eventually starts a turn asking you
+  to talk it through. It reads the diff alongside your explanation and says what
+  it thinks you got wrong. It cannot edit anything.
+
+`/pear-swap` hands the keyboard over either way, mid-session, keeping the plan.
+
+One review-load budget paces both, so the two never disagree about what "a lot
+to read" means.
 
 - Runtime: Node.js **>= 22.19.0** (`.tool-versions` pins the local version).
-- Language: TypeScript in native ESM / `NodeNext` mode.
-- Package manager: npm; commit `package-lock.json` when dependencies change.
-- Execution model: TypeScript is run directly with Node’s type-stripping support; this project does not build emitted JavaScript.
-- Primary ship: **pi extension** (`pi install` / `pi -e`). Follow-on adapters: opencode, Claude Code, Cursor.
+- Language: TypeScript in native ESM / `NodeNext`, run directly via Node's
+  type stripping. Nothing is compiled.
+- Package manager: npm. **All dependencies are pinned exactly**; `.npmrc` sets
+  `save-exact=true`. Use `npm ci`. Commit `package-lock.json` with any
+  dependency change.
+- Only host: pi. Other adapters were removed deliberately (see git history).
 
 ## Repository layout
 
-- `core/` — host-free loop: git inspection, navigator scheduler, review parse/triage, config thresholds, checkpoint accounting, LLM review seam.
-- `adapters/pi/` — pi extension (`extensions/pear.ts`) + testable `runtime.ts`.
-- `adapters/opencode/`, `adapters/claude-code/`, `adapters/cursor/` — follow-on host plugins/hooks.
-- `adapters/shared/` — conversational block template + navigator daemon kit (Claude Code / Cursor).
-- `skills/pear-pairing/` — driver/navigator discipline skill (portable prompt layer).
-- `test/` — `node:test` suites for core + pi gate/lifecycle + conversational contracts.
-- `scripts/smoke-pi.sh` — pi `-e` and packaged-install smoke.
+- `core/` — host-free logic. **Nothing here may import a host SDK.**
+  - `config.ts` — `.pear/config.json` I/O, validation, `loadTier`
+  - `load.ts` — pricing a tool call, or a working tree, in review-load points
+  - `watch.ts` — the human-driver scheduler (debounce, tiers, parking)
+  - `checkpoint.ts` — review-load accounting, file-state provenance
+  - `git.ts` — porcelain-v2 state tokens, line stats, and the review diff
+  - `bash.ts` — "is this command provably read-only?"
+  - `prompts.ts` — every string the model or human reads
+- `adapters/pi/runtime.ts` — session state machine (phases, holds, accounting).
+  Still host-free and fully injectable; the pi extension is a thin wiring layer
+  over it.
+- `adapters/pi/cards/` — the TUI cards and their dialog fallback. A card is
+  **data** (`CardSpec`); `card.ts` renders it in a terminal and `dialogs.ts`
+  renders the same spec through `ui.select`/`ui.input`, so the two cannot drift.
+  Lives outside `extensions/` on purpose (see invariant below).
+- `adapters/pi/extensions/` — the only pi-specific code. **Only files meant to
+  be loaded as extensions may live here** (see invariant below).
+- `skills/pear-pairing/` — the same discipline as a portable prompt.
+- `probe/probe.ts` — standalone API probe, not part of the extension.
+- `docs/pi-api-notes.md` — verified pi API facts. **Read this before changing
+  anything that touches the host.**
 
-Core rule: nothing under `core/` imports a host SDK. Adapters import core, never each other (except `adapters/shared/`).
-
-## Setup and common commands
+## Commands
 
 ```sh
-npm install
+npm ci
 npm test
 npm run typecheck
 npm run smoke:pi
 ```
 
-Install as a pi package (from this repo):
+Focused runs:
 
 ```sh
-pi install "$(git rev-parse --show-toplevel)"
-# or: pi -e ./adapters/pi/extensions/pear.ts
+node --experimental-strip-types --test test/runtime.test.ts
+node --experimental-strip-types --test test/pi-lifecycle.test.ts
 ```
 
-Focused tests:
+Run `npm test && npm run typecheck` before handing off any change.
 
-```sh
-node --experimental-strip-types --test test/checkpoint.test.ts
-node --experimental-strip-types --test test/pi-gate.test.ts
-node --experimental-strip-types --test test/navigate.test.ts
-```
-
-Run both validation commands before handing off a meaningful change:
-
-```sh
-npm test && npm run typecheck
-```
-
-There is no configured formatter or linter. Preserve the surrounding file’s formatting and use TypeScript’s type checker as the primary static validation.
+There is no formatter or linter. Match the surrounding file's style: double
+quotes, semicolons, trailing commas in multiline constructs.
 
 ## TypeScript conventions
 
-- Keep source and tests as `.ts`; use explicit `.ts` extensions for local ESM imports:
-  ```ts
-  import { changedLines } from "../core/git.ts";
-  ```
-- `tsconfig.json` is strict, uses `NodeNext`, has `erasableSyntaxOnly`, and has `noEmit: true`.
-- Prefer standard erasable TypeScript syntax. Do not introduce enums, parameter properties, namespaces, or other syntax incompatible with Node type stripping / `erasableSyntaxOnly`.
-- Keep types narrow and explicit at boundaries. Use `unknown` for untrusted data, then validate it before casting or using it.
-- Use `import type` for type-only imports, consistent with existing source.
-- Follow existing style: double quotes, semicolons, trailing commas in multiline constructs, and compact helpers where they remain readable.
-- Use non-null assertions only when an immediately evident local invariant establishes presence; otherwise handle the absent case.
-- Keep pure policy/threshold logic in small exported functions where it can be tested without I/O.
+- `.ts` everywhere, explicit `.ts` extensions on local imports.
+- `tsconfig.json` is strict with `erasableSyntaxOnly` and `noEmit`. **No enums,
+  parameter properties, or namespaces** — they break Node's type stripping.
+- Node's type stripper also rejects `a ?? b && c`; parenthesise explicitly.
+- `import type` for type-only imports.
+- Validate `unknown` at boundaries rather than casting through it.
+- Keep pure policy in small exported functions so it can be tested without I/O.
 
-## Core invariants
+## Invariants
 
-### Checkpoint accounting (`core/checkpoint.ts`)
+Violating any of these is a bug even if the tests pass.
 
-- Mutation counters are **relative to the last reset**; the mutation baseline is always 0.
-- Time+count baseline: `checkpointDue` (in `core/config.ts`) fires when elapsed wall-clock time ≥ `checkpointSeconds` OR change count ≥ `maxChangesPerCheckpoint` — a pure OR gate.
-- `check` before `reserve`; settle by `toolCallId` (unknown ids no-op).
-- `resetBaseline(now, fileHashes)` is synchronous and immediate — no rebase/deferral exists. Both the time baseline and the file-hash baseline advance together, always, at every reset site.
-- `filesSinceBaseline` / `filesSincePersistedBaseline` return only paths whose hash changed since the last reset — a checkpoint summary never re-lists a file an earlier checkpoint already showed.
-- Contract strings are canonical and cross-host: `STEERING_CONTRACT`, `ACK_CONTRACT`.
+### Never abort the agent run
 
-### Mode exclusivity (all adapters)
+`ctx.abort()` must not appear in pear. The previous implementation called it
+when blocking a tool call, which killed the run before the model could see the
+block reason — that is the "checkpoints terminate the session" bug this rewrite
+exists to fix. Blocking is expressed **only** by returning
+`{ block: true, reason }` from `tool_call`. A test asserts there are zero call
+sites.
 
-- Exactly one mode is active per project at a time: `off`, `human-driver`, `agent-driver` — resolved via `core/config.ts`'s `resolveConfig` from `.pear/config.json` (project) + `~/.pear/config.json` (global model fallback only; mode/cadence have no global fallback).
-- `agent-driver` → checkpoint only, no scheduler/poll. `human-driver` → scheduler/poll only, no checkpoint gate. `off` → neither. Never both loops at once, in any adapter.
-- Pi/omp: `/pear-mode` and `/pear-config` in-chat commands drive `PearSession.setMode`. Hook hosts (Cursor, Claude Code, OpenCode) have no in-chat command surface: mode/config is file-only, via `.pear/config.json` and `npm run setup`.
+### Hooks decide synchronously; tools may wait
 
-### Pi/omp adapter gate (`adapters/shared/pear-runtime.ts`)
+A `tool_call` handler must never await a human. It computes a decision and
+returns. Waiting for a person happens inside `pear_checkpoint.execute`, which
+is allowed to take as long as it takes.
 
-- Mutating tools: `write` / `edit` / `bash`.
-- The checkpoint gate is active only in `agent-driver` mode. Over budget + UI → always **block** the triggering call (`ACK_CONTRACT` or `STEERING_CONTRACT + text`) and suppress the rest of the batch until `turn_end`.
-- Headless (`hasUI=false`) allows without reserving.
-- Git detection via `gitOk(cwd)`. All file-hash reads go through a guarded `safeFileHashes` helper, never unguarded.
+### Only loadable extensions live in `extensions/`
 
-### Navigator scheduler (`core/navigate.ts`)
+pi loads *every* file in a directory listed under the manifest's
+`"pi".extensions` key. A helper without a default export sitting there is a
+load error waiting to happen, so cards, the runtime, and anything else shared
+live one level up in `adapters/pi/`.
 
-- States: `IDLE`, `PENDING`, `WAITING_INTERVAL`, `REVIEWING`.
-- Single in-flight review. No agent-turn coupling — in `human-driver` mode the agent is never the one editing, so there is nothing to park (`setAgentActive`/`isParked`/`markReviewed` do not exist).
-- Reviews are debounced, min-size gated, interval-limited, and deduplicated by content-sensitive state hash.
-- The 2-second poll uses `quickStateHash` (metadata-only, cheap, never reads file contents); the authoritative `diffText`/full-content `stateHash` only run once debounce/min-lines gating decides to review.
-- Scheduler changes are race-prone — add fake-timer tests for every state transition.
+### The loop can always be unwedged
 
-### Review protocol
+`pear_ask` and `pear_checkpoint` are never gated and never counted, and
+`/pear-checkpoint` opens the same card without the model's involvement. Any
+change that could make opening a checkpoint fail because of checkpoint state is
+wrong.
 
-- `REVIEW_SYSTEM` requires a JSON array of findings; `FILTER_SYSTEM` has a second, stronger model filter those findings. Keep both schemas in `core/review.ts` synchronized with the prompts.
-- Parse defensively. Malformed responses become navigator errors, not session crashes.
-- Two-stage filtering replaces the old heuristic triage: only findings the filter model echoes back (matching file/line/issue) survive; an invented finding is dropped.
-- Findings are human-only by default on every host.
+### No card answer parks the agent
 
-### Non-git cwd
+Every option on every card resolves its tool immediately. "Walk me through a
+file" is an *answer*, not a pause: it returns an instruction and relies on the
+agent calling `pear_checkpoint` again. Holding a tool open while a human reads
+is the failure this design exists to avoid — the agent cannot answer questions
+while it is parked inside `execute`.
 
-- `agent-driver`'s cadence is git-independent (pure wall-clock + count); file-hash display degrades gracefully to an empty list on git failure.
-- `human-driver` requires git; a non-git cwd falls back to `off` for that session without changing persisted config.
+### The gate is admit-first
 
-## Testing guidance
+`tool_call` compares the load accrued **before** the call it is considering,
+then admits. A call is never blocked on its own estimated cost, so a single
+oversized change always runs and the block lands on the next one. Blocking the
+first write of a window would force a checkpoint with nothing to review.
 
-- Tests use `node:test` and `node:assert/strict`.
-- Keep tests independent and deterministic. Temp Git repos via `mkdtempSync` + local `git init`.
-- Especially cover: unborn repos; staged/unstaged/untracked; binary/unreadable files; checkpoint continue vs steering; concurrent-sibling reservations; mode-exclusivity transitions; checkpoint file-hash provenance across resets; scheduler races; malformed reviews.
-- Pi gate/lifecycle tests use injectable fakes — no pi runtime required.
-- When modifying a pure helper, add focused cases in its existing test file.
+### The tool-result override appends, never replaces
+
+`ToolResultEventResult.content` **replaces** what the model sees. The budget nag
+must return `[...event.content, note]`. Dropping the original blinds the model
+to its own tool output.
+
+### `setActiveTools` restores what was observed
+
+Scoping removes `edit` and `write`. Restoring adds back exactly the names pear
+removed, on top of whatever is active now — never a hardcoded list and never a
+stale snapshot. Another extension may legitimately have changed the tool set
+while pear was scoping.
+
+### Accounting errs toward more oversight
+
+- Admitted and priced on `tool_call`, settled on `tool_result`, exactly once.
+- A failed call frees its cost; a call that never reports back becomes `stale`
+  and **still counts**. Never promote an unknown result to "confirmed success".
+- The window total is **recomputed** from surviving entries, never accumulated.
+  That is what makes a released file charge correct without refcounting, and
+  what makes the total independent of admission order.
+- Sweeping happens on `agent_settled` only — `agent_end` can be followed by
+  retries or queued continuations.
+- Reused call ids **fail closed**: the older entry is settled before the new one
+  is admitted, so a cost is never silently lost.
+
+### `agent_settled`, not `agent_end`
+
+Anything that must happen once per settled run hangs off `agent_settled`.
+
+### Only real user input clears a stop
+
+`InputEvent.source` distinguishes `"extension"` (i.e. `sendUserMessage`) from
+`"interactive"`/`"rpc"`. Only the latter clears the stop latch, so another
+extension cannot override the human. No agent lifecycle event ever clears it.
+
+### One source of truth for the running mode
+
+`runtime.mode` is the mode the session is actually running. It can differ from
+what is on disk (headless fail-closed, or a mode saved for later). Do not mirror
+it in a second variable in the extension — that copy will drift.
+
+### `ctx.mode`, not `hasUI`, gates the card
+
+`hasUI` is true in RPC too, where `ui.custom` silently no-ops. The full card
+requires `ctx.mode === "tui"`; RPC uses dialogs; print/json fail closed to
+`off`. **pear never auto-approves a checkpoint.**
+
+### Acknowledgement semantics
+
+`continue`, `steer`, and an approved plan re-baseline (the human saw the
+git-verified list before answering). `explain`, `dismissed`, and a failed
+checkpoint do **not** — unreviewed files must still appear next time.
+`mode-off` neither acknowledges nor stops.
+
+Stop and dismiss are different holds. **Stop** latches until real user input.
+**Dismiss** is run-scoped and expires at `agent_settled`, because the human
+never said stop — they just walked away. Neither ends the session.
+
+### Git may drive the human-driver trigger, never the agent-driver gate
+
+Agent-driver prices changes from tool inputs and never reads git, so a wrong or
+missing file list can only produce a worse-looking card. Human-driver has no
+tool calls to price and git is its only witness, so it does depend on
+`core/git.ts` — bounded the other way: a git failure means **no trigger**, never
+a nag and never a block, and the watcher parks rather than retrying.
+
+### The agent never edits in human-driver
+
+Write tools are suppressed and mutating `bash` is blocked by the hook, in both
+phases. This is not only discipline: it means anything appearing in the working
+tree is the human's by construction, which is what makes change attribution
+unnecessary. Attribution by timestamp or by `isIdle()` is racy at turn
+boundaries; not needing it at all is not.
+
+### The watcher parks after repeated failure
+
+`MAX_POLL_FAILURES` consecutive git errors stop the poll, report **once**, and
+wait for a restart. The predecessor to `core/watch.ts` retried forever with no
+backoff and produced 106 KB of identical log lines from a single
+misconfiguration. Sample and measure failures are counted separately, because a
+healthy sample would otherwise keep wiping a persistently broken measure.
+
+### Background resources start in `session_start`, never in the factory
+
+pi documents this (`extensions.md:220`): a factory can run in an invocation that
+never opens a session. Clear them in `session_shutdown`. Session switches
+re-fire both, so the watcher self-heals rather than stacking.
+
+### Acknowledgement means the *reviewing* party saw the changes
+
+In agent-driver that is the human, so `continue`/`steer` re-baseline and
+`dismissed` does not. In human-driver the agent is the navigator, so the
+baseline moves once it has been shown the diff — **including when the human
+replied "not now"**. Erring toward oversight pulls the wrong way here and would
+re-quiz someone about work already discussed.
+
+### The human-driver measurement is gross; the pacing is net
+
+`changedLineStats` prices the working tree against `HEAD`, and a human driver
+rarely commits between reviews — so the work just explained is still in the
+tree. `core/watch.ts` therefore credits `acknowledgedPoints` at acknowledgement
+and tiers on `gross - credit`; otherwise the two keystrokes after explaining a
+400-line change re-price all 402 and ask again. The credit is dropped whenever
+the gross measurement falls below it, because that means a commit or a revert
+and a stale credit would mute the watcher permanently.
+
+The counts *shown* stay gross, because the diff handed to the agent is also the
+whole uncommitted tree. `/pear-explain` measures outside the watcher, so it must
+call `watcher.observe(points)` or its acknowledgement credits nothing.
+
+### An undeliverable trigger must be re-armed, not dropped
+
+The watcher sits on `triggered` until acknowledged, so it does not nag someone
+who is deliberately ignoring it. But the auto-trigger declines when the agent is
+mid-turn or the human is part-way through a message — and a declined trigger has
+nobody to answer it. `pear.ts` calls `watcher.rearm()` whenever `startQuiz`
+returns false; without it the watcher goes silent for the rest of the session.
+`rearm` deliberately does *not* acknowledge: nothing was reviewed, so the credit
+and the baseline stay put.
+
+A residual, accepted: `acknowledge()` samples its new baseline at settle time,
+so edits made *while the agent was replying* land inside it. Their points are
+uncredited, but they will only be re-measured on the human's next edit. It
+self-heals on any keystroke.
+
+### A quiz spans two agent runs
+
+pear injects a message, the agent asks its question, and *that run settles* —
+all before the human has typed a word. So `agent_settled` alone cannot end a
+quiz. `runtime.quizAnswered`, set from the `input` hook, is what distinguishes
+the question turn from the answer turn; ending on the first would rebaseline
+over work nobody discussed and the diff would never be attached. Any test of
+this path must emit the settle for the question turn, or it is testing an
+ordering that never happens.
+
+### Config is never destroyed
+
+Unknown keys round-trip. Legacy `human-driver` is reported, never rewritten. An
+unparseable file is backed up before replacement. Writes are temp-file +
+rename. Write failures are surfaced as "not persisted", never swallowed.
+
+### Command classification is reject-unless-trivial
+
+`core/bash.ts` classifies a command read-only only if it has no shell
+metacharacters, quotes, or backslashes **and** its verb is allowlisted. Adding
+a dual-purpose program to the allowlist is a bug: `git diff`/`show`/`log -p`
+are excluded because they can invoke pagers, external diff drivers, and
+textconv helpers. When in doubt, mutating.
+
+## Testing
+
+`node:test` + `node:assert/strict`. Temp git repos via `mkdtempSync` + `git init`.
+
+**`core/watch.ts` is race-prone.** Its clock and both git reads are parameters
+precisely so every transition can be driven deterministically — add a
+fake-timer case for any change to it. `test/pi-lifecycle.test.ts` injects a
+clock and timer through the factory's optional second argument, which exists
+only for that purpose.
+
+Cover in particular: tier boundaries and admit-first; every resolution path of
+the pending-card state machine and their races; phase and driver transitions and
+out-of-phase calls; stop-latch provenance; orphaned calls; id reuse;
+staged-vs-worktree and rename/delete/symlink/unmerged git states; unreadable
+files; config failure paths via the injected `fs` seam (not chmod, which
+behaves differently as root); TUI/RPC/headless tiers.
+
+Card content is pure data, so `test/cards.test.ts` asserts on it without a
+terminal. Prefer adding a case there over reaching into the renderer.
+
+`test/pi-lifecycle.test.ts` drives the real extension through a fake
+`ExtensionAPI` — no pi runtime needed.
 
 ## Change workflow
 
-1. Read the relevant `core/` or `adapters/` module and its tests.
-2. Make the smallest focused change that satisfies the task.
-3. Add or update tests with the implementation.
-4. Run the focused test file during iteration.
-5. Run `npm test` and `npm run typecheck` before completion.
-6. For pi packaging changes, run `npm run smoke:pi`.
-7. Inspect `git diff --check` and `git diff`.
+1. Read the relevant module, its tests, and `docs/pi-api-notes.md` if the host
+   is involved.
+2. Make the smallest change that does the job.
+3. Update tests alongside it.
+4. `npm test && npm run typecheck`.
+5. `npm run smoke:pi` for packaging or lifecycle changes.
+6. Re-read your own diff before handing off.
 
-Avoid unrelated refactors, dependency upgrades, generated artifacts, or changes to runtime defaults unless the task requires them.
+If you change the pinned pi version, re-run the `docs/pi-api-notes.md`
+checklist — the exact pin exists so host behaviour cannot drift silently.
 
-## Human collaboration expectations
+## Working with the human
 
-- State intent briefly before making a change.
-- Prefer small, reviewable edits and validate them promptly.
-- Respect human steering immediately, including steering received mid-tool invocation.
-- Do not claim commands, writes, or tests ran unless their output confirms they did.
-- Surface assumptions, validation gaps, and behavior changes clearly in the handoff.
+- Say what you intend before changing it.
+- Small, reviewable steps beat big ones.
+- Honour steering immediately, including mid-task.
+- Never claim a command, test, or write happened unless you saw it happen.
+- Surface assumptions and gaps in validation explicitly.

@@ -1,155 +1,345 @@
-import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULTS, loadUserConfig, saveUserConfig, resolveConfig } from "../core/config.ts";
+import { describe, it } from "node:test";
+import {
+  BLOCK_MULTIPLE,
+  ConfigWriteError,
+  DEFAULTS,
+  LEGACY_BUDGET_KEY,
+  LEGACY_CHANGE_POINTS,
+  LEGACY_MODES,
+  MODES,
+  MAX_BUDGET,
+  MIN_BUDGET,
+  SOFT_FRACTION,
+  configPath,
+  isMode,
+  isValidBudget,
+  loadConfig,
+  loadTier,
+  nodeFs,
+  saveConfig,
+  type ConfigFs,
+} from "../core/config.ts";
 
-function withDir<T>(fn: (dir: string) => T): T {
-  const dir = mkdtempSync(join(tmpdir(), "pear-config-test-"));
-  try {
-    return fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+function tempProject(): string {
+  return mkdtempSync(join(tmpdir(), "pear-cfg-"));
 }
 
-describe("loadUserConfig", () => {
-  it("returns {} for a missing directory", () => {
-    withDir((dir) => {
-      assert.deepEqual(loadUserConfig(join(dir, "missing")), {});
-    });
+function writeConfig(dir: string, contents: string): void {
+  mkdirSync(join(dir, ".pear"), { recursive: true });
+  writeFileSync(configPath(dir), contents);
+}
+
+describe("loadTier", () => {
+  const B = 200;
+
+  it("is quiet below the soft fraction", () => {
+    assert.equal(loadTier(0, B), "quiet");
+    assert.equal(loadTier(99, B), "quiet");
   });
 
-  it("returns {} for malformed JSON", () => {
-    withDir((dir) => {
-      mkdirSync(join(dir, ".pear"), { recursive: true });
-      writeFileSync(join(dir, ".pear", "config.json"), "{not json");
-      assert.deepEqual(loadUserConfig(dir), {});
-    });
+  it("nags softly from the soft fraction up to the budget", () => {
+    assert.equal(loadTier(100, B), "soft");
+    assert.equal(loadTier(199, B), "soft");
   });
 
-  it("drops an invalid reviewModel spec but keeps the rest of a valid file", () => {
-    withDir((dir) => {
-      mkdirSync(join(dir, ".pear"), { recursive: true });
-      writeFileSync(
-        join(dir, ".pear", "config.json"),
-        JSON.stringify({ reviewModel: "bad", mode: "agent-driver", checkpointSeconds: 60 }),
-      );
-      assert.deepEqual(loadUserConfig(dir), { mode: "agent-driver", checkpointSeconds: 60 });
-    });
+  it("says a checkpoint is due at the budget", () => {
+    assert.equal(loadTier(200, B), "due");
+    assert.equal(loadTier(399, B), "due");
   });
 
-  it("drops an invalid mode but keeps the rest of a valid file", () => {
-    withDir((dir) => {
-      mkdirSync(join(dir, ".pear"), { recursive: true });
-      writeFileSync(
-        join(dir, ".pear", "config.json"),
-        JSON.stringify({ mode: "not-a-mode", minLines: 20 }),
-      );
-      assert.deepEqual(loadUserConfig(dir), { minLines: 20 });
-    });
+  it("blocks at the block multiple", () => {
+    assert.equal(loadTier(400, B), "blocked");
+    assert.equal(loadTier(4000, B), "blocked");
   });
 
-  it("drops a non-positive-integer cadence field but keeps the rest", () => {
-    withDir((dir) => {
-      mkdirSync(join(dir, ".pear"), { recursive: true });
-      writeFileSync(
-        join(dir, ".pear", "config.json"),
-        JSON.stringify({ checkpointSeconds: -5, maxChangesPerCheckpoint: 2.5, minLines: 10 }),
-      );
-      assert.deepEqual(loadUserConfig(dir), { minLines: 10 });
-    });
+  it("derives its boundaries from the exported constants", () => {
+    // Guards against the thresholds and the constants drifting apart.
+    assert.equal(loadTier(B * SOFT_FRACTION, B), "soft");
+    assert.equal(loadTier(B * SOFT_FRACTION - 1, B), "quiet");
+    assert.equal(loadTier(B * BLOCK_MULTIPLE, B), "blocked");
+    assert.equal(loadTier(B * BLOCK_MULTIPLE - 1, B), "due");
   });
 
-  it("silently ignores unknown/legacy keys", () => {
-    withDir((dir) => {
-      mkdirSync(join(dir, ".pear"), { recursive: true });
-      writeFileSync(
-        join(dir, ".pear", "config.json"),
-        JSON.stringify({ navModel: "openai/gpt-test", pauseLines: 150, minLines: 10 }),
-      );
-      assert.deepEqual(loadUserConfig(dir), { minLines: 10 });
-    });
+  it("never blocks at zero load, whatever the budget", () => {
+    // Admit-first depends on this: the first change in a window always runs.
+    for (const budget of [MIN_BUDGET, 200, MAX_BUDGET]) {
+      assert.notEqual(loadTier(0, budget), "blocked", `budget ${budget}`);
+    }
   });
 });
 
-describe("saveUserConfig", () => {
-  it("round-trips through loadUserConfig, creating .pear/ if absent", () => {
-    withDir((dir) => {
-      assert.equal(existsSync(join(dir, ".pear")), false);
-      saveUserConfig(dir, { mode: "agent-driver", checkpointSeconds: 120 });
-      assert.equal(existsSync(join(dir, ".pear", "config.json")), true);
-      assert.deepEqual(loadUserConfig(dir), { mode: "agent-driver", checkpointSeconds: 120 });
+describe("isValidBudget", () => {
+  const bad = [
+    0,
+    -3,
+    2.5,
+    MIN_BUDGET - 1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    MAX_BUDGET + 1,
+    "200",
+    null,
+    undefined,
+    {},
+  ];
+  for (const v of bad) {
+    it(`rejects ${JSON.stringify(v) ?? String(v)}`, () => {
+      assert.equal(isValidBudget(v), false);
     });
+  }
+  for (const v of [MIN_BUDGET, 200, MAX_BUDGET]) {
+    it(`accepts ${v}`, () => {
+      assert.equal(isValidBudget(v), true);
+    });
+  }
+});
+
+describe("loadConfig", () => {
+  it("returns defaults when the file is missing", () => {
+    const dir = tempProject();
+    const loaded = loadConfig(dir);
+    assert.deepEqual(loaded.config, { ...DEFAULTS });
+    assert.equal(loaded.missing, true);
+    assert.equal(loaded.malformed, false);
   });
 
-  it("drops an invalid model instead of persisting it", () => {
-    withDir((dir) => {
-      saveUserConfig(dir, { reviewModel: "bad", mode: "off" });
-      assert.deepEqual(loadUserConfig(dir), { mode: "off" });
-    });
+  it("reads a valid config", () => {
+    const dir = tempProject();
+    writeConfig(
+      dir,
+      JSON.stringify({ mode: "agent-driver", reviewBudget: 320, planPhase: false, exclusive: true }),
+    );
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.mode, "agent-driver");
+    assert.equal(loaded.config.reviewBudget, 320);
+    assert.equal(loaded.config.planPhase, false);
+    assert.equal(loaded.config.exclusive, true);
+    assert.equal(loaded.legacyMode, undefined);
+    assert.equal(loaded.migratedBudgetFrom, undefined);
   });
 
-  it("writes pretty JSON with a trailing newline", () => {
-    withDir((dir) => {
-      saveUserConfig(dir, { reviewModel: "openai/gpt-test" });
-      const raw = readFileSync(join(dir, ".pear", "config.json"), "utf8");
-      assert.ok(raw.endsWith("\n"));
-      assert.deepEqual(JSON.parse(raw), { reviewModel: "openai/gpt-test" });
-    });
+  it("drops an out-of-range value but keeps the rest of the file", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ mode: "agent-driver", reviewBudget: 0 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.mode, "agent-driver");
+    assert.equal(loaded.config.reviewBudget, DEFAULTS.reviewBudget);
+  });
+
+  it("ignores non-boolean flags rather than coercing them", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ planPhase: "yes", exclusive: 1 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.planPhase, DEFAULTS.planPhase);
+    assert.equal(loaded.config.exclusive, DEFAULTS.exclusive);
+  });
+
+  it("runs a human-driver config that older versions only warned about", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ mode: "human-driver", reviewModel: "x/y" }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.mode, "human-driver");
+    assert.equal(loaded.legacyMode, undefined, "no longer a legacy mode");
+    // and the raw object still carries the unknown field
+    assert.equal(loaded.raw.reviewModel, "x/y");
+  });
+
+  it("still reports a mode it cannot run at all", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ mode: "telepathy" }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.mode, DEFAULTS.mode);
+    assert.equal(loaded.legacyMode, undefined, "unknown is not the same as legacy");
+  });
+
+  it("flags malformed JSON without throwing", () => {
+    const dir = tempProject();
+    writeConfig(dir, "{ this is not json");
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.malformed, true);
+    assert.deepEqual(loaded.config, { ...DEFAULTS });
+  });
+
+  it("treats a non-object JSON document as malformed", () => {
+    const dir = tempProject();
+    writeConfig(dir, "[1,2,3]");
+    assert.equal(loadConfig(dir).malformed, true);
   });
 });
 
-describe("resolveConfig", () => {
-  it("prefers project models over global when both are valid", () => {
-    withDir((project) =>
-      withDir((home) => {
-        saveUserConfig(project, { reviewModel: "anthropic/claude-opus-4" });
-        saveUserConfig(home, { reviewModel: "openai/gpt-test" });
-        assert.equal(resolveConfig(project, home).reviewModel, "anthropic/claude-opus-4");
-      }),
+describe("loadConfig: legacy budget migration", () => {
+  it("derives reviewBudget from the old call-count key and reports it", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 5 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.reviewBudget, 5 * LEGACY_CHANGE_POINTS);
+    assert.equal(loaded.migratedBudgetFrom, 5);
+  });
+
+  it("leaves the legacy key on disk so a downgrade still works", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 5 }));
+    loadConfig(dir);
+    saveConfig(dir, { mode: "agent-driver" });
+    const onDisk = JSON.parse(readFileSync(configPath(dir), "utf8")) as Record<string, unknown>;
+    assert.equal(onDisk[LEGACY_BUDGET_KEY], 5, "legacy key must survive a write");
+  });
+
+  it("prefers an explicit reviewBudget over the legacy key", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ reviewBudget: 300, [LEGACY_BUDGET_KEY]: 5 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.reviewBudget, 300);
+    assert.equal(loaded.migratedBudgetFrom, undefined, "no migration happened");
+  });
+
+  it("clamps a migrated value into range rather than falling back to the default", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 1000 }));
+    const loaded = loadConfig(dir);
+    assert.equal(isValidBudget(loaded.config.reviewBudget), true);
+    assert.equal(loaded.migratedBudgetFrom, 1000);
+  });
+
+  it("ignores an out-of-range legacy value", () => {
+    const dir = tempProject();
+    writeConfig(dir, JSON.stringify({ [LEGACY_BUDGET_KEY]: 0 }));
+    const loaded = loadConfig(dir);
+    assert.equal(loaded.config.reviewBudget, DEFAULTS.reviewBudget);
+    assert.equal(loaded.migratedBudgetFrom, undefined);
+  });
+});
+
+describe("saveConfig", () => {
+  it("round-trips and preserves unknown/legacy fields", () => {
+    const dir = tempProject();
+    writeConfig(
+      dir,
+      JSON.stringify({ mode: "human-driver", reviewModel: "a/b", futureSetting: { deep: true } }),
+    );
+
+    saveConfig(dir, { reviewBudget: 280 });
+
+    const onDisk = JSON.parse(readFileSync(configPath(dir), "utf8")) as Record<string, unknown>;
+    assert.equal(onDisk.reviewBudget, 280);
+    // untouched:
+    assert.equal(onDisk.mode, "human-driver");
+    assert.equal(onDisk.reviewModel, "a/b");
+    assert.deepEqual(onDisk.futureSetting, { deep: true });
+  });
+
+  it("creates .pear when missing", () => {
+    const dir = tempProject();
+    saveConfig(dir, { mode: "agent-driver" });
+    assert.equal(loadConfig(dir).config.mode, "agent-driver");
+  });
+
+  it("refuses to persist an invalid value", () => {
+    const dir = tempProject();
+    assert.throws(() => saveConfig(dir, { reviewBudget: 0 }), ConfigWriteError);
+    assert.throws(
+      () => saveConfig(dir, { planPhase: "yes" as unknown as boolean }),
+      ConfigWriteError,
+    );
+    assert.throws(
+      () => saveConfig(dir, { mode: "telepathy" as unknown as "off" }),
+      ConfigWriteError,
     );
   });
 
-  it("falls back to the global model when project config has none", () => {
-    withDir((project) =>
-      withDir((home) => {
-        saveUserConfig(home, { filterModel: "openai/gpt-test" });
-        assert.equal(resolveConfig(project, home).filterModel, "openai/gpt-test");
-      }),
-    );
+  it("backs up an unparseable file before replacing it", () => {
+    const dir = tempProject();
+    writeConfig(dir, "{ broken");
+    saveConfig(dir, { mode: "agent-driver" }, nodeFs, () => 1234);
+
+    const backup = readFileSync(join(dir, ".pear", "config.json.corrupt-1234"), "utf8");
+    assert.equal(backup, "{ broken");
+    assert.equal(loadConfig(dir).config.mode, "agent-driver");
   });
 
-  it("returns DEFAULTS when neither project nor global is set", () => {
-    withDir((project) =>
-      withDir((home) => {
-        assert.deepEqual(resolveConfig(project, home), DEFAULTS);
-      }),
-    );
+  it("leaves no temp file behind when the rename fails", () => {
+    const dir = tempProject();
+    const written: string[] = [];
+    const failing: ConfigFs = {
+      ...nodeFs,
+      writeFileSync: (p, d) => {
+        written.push(p);
+        nodeFs.writeFileSync(p, d);
+      },
+      renameSync: () => {
+        throw new Error("EXDEV: simulated");
+      },
+    };
+
+    assert.throws(() => saveConfig(dir, { mode: "agent-driver" }, failing), ConfigWriteError);
+
+    const leftovers = readdirSync(join(dir, ".pear")).filter((f) => f.endsWith(".tmp"));
+    assert.deepEqual(leftovers, [], "temp file should be cleaned up");
+    assert.equal(written.length, 1);
   });
 
-  it("mode is project-only: a global mode never applies", () => {
-    withDir((project) =>
-      withDir((home) => {
-        saveUserConfig(home, { mode: "agent-driver" });
-        assert.equal(resolveConfig(project, home).mode, DEFAULTS.mode);
-        saveUserConfig(project, { mode: "human-driver" });
-        assert.equal(resolveConfig(project, home).mode, "human-driver");
-      }),
-    );
+  it("reports a write failure rather than silently succeeding", () => {
+    const dir = tempProject();
+    const failing: ConfigFs = {
+      ...nodeFs,
+      writeFileSync: () => {
+        throw new Error("EACCES: simulated");
+      },
+    };
+    assert.throws(() => saveConfig(dir, { mode: "agent-driver" }, failing), (e: unknown) => {
+      assert.ok(e instanceof ConfigWriteError);
+      assert.match(String((e as ConfigWriteError).cause), /EACCES/);
+      return true;
+    });
   });
 
-  it("cadence fields are project-only: a global value never applies", () => {
-    withDir((project) =>
-      withDir((home) => {
-        saveUserConfig(home, { checkpointSeconds: 900, minLines: 5 });
-        const resolved = resolveConfig(project, home);
-        assert.equal(resolved.checkpointSeconds, DEFAULTS.checkpointSeconds);
-        assert.equal(resolved.minLines, DEFAULTS.minLines);
-        saveUserConfig(project, { checkpointSeconds: 30 });
-        assert.equal(resolveConfig(project, home).checkpointSeconds, 30);
-      }),
-    );
+  it("refuses to clobber an unparseable file it cannot back up", () => {
+    const dir = tempProject();
+    writeConfig(dir, "{ broken");
+    const failing: ConfigFs = {
+      ...nodeFs,
+      copyFileSync: () => {
+        throw new Error("EACCES: simulated");
+      },
+    };
+    assert.throws(() => saveConfig(dir, { mode: "agent-driver" }, failing), ConfigWriteError);
+    // original bytes intact
+    assert.equal(readFileSync(configPath(dir), "utf8"), "{ broken");
+  });
+
+  it("uses a unique temp filename per write", () => {
+    const dir = tempProject();
+    const seen = new Set<string>();
+    const spy: ConfigFs = {
+      ...nodeFs,
+      writeFileSync: (p, d) => {
+        seen.add(p);
+        nodeFs.writeFileSync(p, d);
+      },
+    };
+    saveConfig(dir, { reviewBudget: 240 }, spy);
+    saveConfig(dir, { reviewBudget: 280 }, spy);
+    assert.equal(seen.size, 2, "temp paths must not collide");
+  });
+});
+
+describe("modes", () => {
+  it("accepts every mode this version can run", () => {
+    for (const mode of MODES) assert.equal(isMode(mode), true, mode);
+  });
+
+  it("includes human-driver, and no longer treats it as legacy", () => {
+    assert.ok(MODES.includes("human-driver"));
+    assert.deepEqual([...LEGACY_MODES], [], "nothing is deferred any more");
+  });
+
+  it("rejects anything not in the list", () => {
+    for (const v of ["", "driver", "HUMAN-DRIVER", null, undefined, 1, {}]) {
+      assert.equal(isMode(v), false, JSON.stringify(v) ?? String(v));
+    }
   });
 });
