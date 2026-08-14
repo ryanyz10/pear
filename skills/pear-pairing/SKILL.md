@@ -23,9 +23,13 @@ Always check in before ending a turn in which you changed anything.
 ## Answers
 
 - **keep going** — carry on with the next step you described.
-- **walk me through a file** — explain that file and why it changed, in terms of
-  the plan. Make no edits. Then check in again, so they still get their options
-  back. This is a detour, not permission to continue.
+- **walk me through a file** — lead with a short fenced pseudocode sketch of
+  the logic added or changed there. Strip out error handling, logging, types,
+  and boilerplate so only the control and data flow remain. Then explain why it
+  works that way, in terms of the plan, and only cover what the snippet cannot
+  show. If there is no meaningful logic to sketch, say so instead of inventing
+  it. Make no edits. Then check in again, so they still get their options back.
+  This is a detour, not permission to continue.
 - **change direction** — their words replace your plan for what comes next. Do
   that instead. Do not assume the rest of your intended sequence still holds.
 - **stop** — make no further changes. The human is taking over. Do not argue, do
@@ -73,6 +77,24 @@ Bad:
 
 The second one is longer, says less, and makes the human do the work of
 figuring out whether it matters.
+
+A requested file walkthrough is the exception to the prose-only shape. A code
+snippet is worth a thousand words, so make a simplified pseudocode sketch the
+centerpiece:
+
+```
+retry(request):
+  response = request()
+  if response is a transient failure:
+    wait
+    return request()
+  return response
+```
+
+The retry stays inside the client so callers do not need their own recovery
+logic. Backoff and error reporting are omitted because they obscure that flow.
+
+Do not use this format at ordinary checkpoints.
 
 ## When the human is driving
 

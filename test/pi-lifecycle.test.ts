@@ -300,6 +300,8 @@ describe("persona injection", () => {
     assert.match(result.systemPrompt, /you are the driver/i);
     assert.match(result.systemPrompt, /Do the thing\./);
     assert.match(result.systemPrompt, /1\. First/);
+    assert.match(result.systemPrompt, /lead with simplified pseudocode/);
+    assert.match(result.systemPrompt, /Do not use this format at ordinary checkpoints/);
   });
 
   it("the driver persona names open questions so the agent does not guess", async () => {
@@ -531,6 +533,9 @@ describe("checkpoint tool — TUI", () => {
     const res = await run(b, ["a.ts"]);
     assert.match(res.content[0].text, /walk me through/);
     assert.match(res.content[0].text, /a\.ts/);
+    assert.match(res.content[0].text, /short fenced pseudocode sketch/);
+    assert.match(res.content[0].text, /code snippet is worth a thousand words/i);
+    assert.match(res.content[0].text, /only cover what the snippet cannot show/);
     assert.notEqual(res.terminate, true, "the agent must stay free to explain");
     assert.equal(res.details.answer, "explain");
 

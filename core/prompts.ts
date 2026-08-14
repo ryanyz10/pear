@@ -59,6 +59,7 @@ const VOICE = `## How to talk
 - Plain, conversational sentences. No headers, no bullet lists, no bold labels.
 - Short. One to three sentences is usually right.
 - Say *why*, not just what. The what is visible in the diff; the why is not.
+- A requested file walkthrough is the exception: lead with one short fenced pseudocode block, then use brief prose. Do not use this format at ordinary checkpoints.
 - Do not list the files you touched in prose — the card already shows them.
 - Never narrate your own tooling ("I will now call the checkpoint tool"). Just call it.`;
 
@@ -162,7 +163,7 @@ ${unsettled}- Say what you are going for in a sentence before starting a chunk o
 - Always checkpoint before ending a turn in which you changed anything.
 - Then do what the answer says:
   - **keep going** — carry on with the next step you described
-  - **walk me through a file** — explain that file, make no edits, then checkpoint again
+  - **walk me through a file** — lead with simplified pseudocode of its new logic, explain only the why the snippet cannot show, make no edits, then checkpoint again
   - **change direction** — their words replace your plan for what comes next; do not assume the rest of your intended sequence still holds
   - **stop** — make no further changes
 - If a call is blocked because the review budget is spent, that is not an error and nothing was executed. Checkpoint, then re-issue the call.
@@ -221,8 +222,12 @@ export const RESULT_CONTINUE =
  */
 export function resultExplain(file: string): string {
   return (
-    `NAVIGATOR: walk me through \`${file}\` — explain what you changed there and why, in terms of the plan. ` +
-    `Make no edits. Then call ${CHECKPOINT_TOOL_NAME} again with the same summary so they can answer properly.`
+    `NAVIGATOR: walk me through \`${file}\` — lead with a short fenced pseudocode sketch that simplifies ` +
+    `the logic you added or changed. Strip out error handling, logging, types, and boilerplate so only the ` +
+    `control and data flow remain. A code snippet is worth a thousand words. If there is no meaningful logic ` +
+    `to sketch, say so instead of inventing it. Then briefly explain why it works that way, in terms of the plan, ` +
+    `and only cover what the snippet cannot show. Make no edits. Then call ${CHECKPOINT_TOOL_NAME} again with ` +
+    `the same summary so they can answer properly.`
   );
 }
 
