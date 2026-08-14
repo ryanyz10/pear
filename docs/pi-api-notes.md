@@ -1,10 +1,11 @@
 # pi extension API — verified notes
 
-Verification target: `@earendil-works/pi-coding-agent` **0.83.0** (exact pin; see
+Verification target: `@earendil-works/pi-coding-agent` **0.84.1** (exact pin; see
 `package.json`). Everything below was read from the shipped type definitions in
 `node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts`
 (and `@earendil-works/pi-agent-core/dist/types.d.ts` for tool result types), not
-from prose documentation alone. Line numbers are from the 0.83.0 `.d.ts` files.
+from prose documentation alone. Older line references originated against 0.83.0;
+the card, TUI-mode, and working-row APIs were rechecked against 0.84.1.
 
 Re-run this checklist whenever the pinned version changes. `npm run typecheck`
 is the compile gate; `npm run smoke:pi` is the integration gate.
@@ -222,7 +223,7 @@ uses **no** `ctx.abort()`, a tool that awaits the human inside `execute`,
 abort/shutdown resolution, `terminate: true`, `input.source`, and
 `agent_end` vs `agent_settled`.
 
-Status: the probe **compiles against the pinned 0.83.0 types** and is included in
+Status: the probe **compiles against the pinned 0.84.1 types** and is included in
 `npm run typecheck`, which mechanically verifies every signature claimed above.
 
 ## Assumptions deliberately NOT relied upon
@@ -235,7 +236,7 @@ Status: the probe **compiles against the pinned 0.83.0 types** and is included i
 
 Each is handled by a conservative fallback rather than an assumption.
 
-## Verified for v3 (still 0.83.0)
+## Verified for v3 (introduced under 0.83.0)
 
 ### `tool_result` can rewrite what the model sees
 
@@ -338,7 +339,7 @@ nothing.
 Removals (entering scoping, `exclusive`) happen at `session_start` or in command
 handlers, not during tool execution, so the additive rule does not bind them.
 
-## Verified for v4 (still 0.83.0)
+## Verified for v4 (rechecked against 0.84.1)
 
 ### Extension commands never reach the `input` hook
 
@@ -368,17 +369,24 @@ The height is reachable through the TUI handed to the `ui.custom` factory:
 `Terminal` exposes `get rows()` alongside `get columns()`
 (`pi-tui/dist/terminal.d.ts`), and `TUI.terminal` is public.
 
-This matters because a component that returns more lines than the terminal has
-is simply cut off at the top, and a component with `handleInput` can consume
-the keys that would otherwise scroll. `adapters/pi/cards/card.ts` therefore
-windows its body against `tui.terminal.rows` and pages it with PgUp/PgDn.
+Without `{ overlay: true }`, `ui.custom` replaces pi's editor-container child
+(`interactive-mode.js:2094-2152`). In regular TUI mode that component participates
+in the terminal's ordinary output buffer: an over-tall card keeps its options at
+the live bottom while earlier body rows remain in native terminal scrollback. In
+pi's separate fullscreen TUI mode, the editor container lives in a shrinking dock
+(`interactive-mode.js:624-650`) and there is no native scrollback, so pear windows
+only that mode's body against `tui.terminal.rows` and keeps explicit scroll keys.
 
-**A resize does not invalidate a component.** `TUI.start` passes
-`() => this.requestRender()` as the terminal's resize handler
-(`pi-tui/dist/tui.js:435`) — `invalidate()` is called on theme change and full
-redraw, not on resize. Any render cache must therefore be keyed on the
-dimensions it was built for, or it will serve lines laid out for the old
-terminal.
+`ExtensionUIContext.setWorkingVisible(false)` hides and disposes pi's animated
+working status row (`interactive-mode.js:1607-1620`). pear brackets every inline
+card with this call and restores `true` in `finally`. This removes the redraw
+loop that previously made a tall inline card clear regular-mode scrollback on
+every spinner frame.
+
+**A resize does not invalidate a component.** The terminal resize handler only
+requests a render. Runtime switching between regular and fullscreen TUI modes
+also leaves the component mounted. The card cache is therefore keyed on width,
+height, and `tui.mode`, or it can serve the wrong layout after either transition.
 
 ### `sendUserMessage` is the only injection that fires `before_agent_start`
 
@@ -387,55 +395,19 @@ terminal.
 `_runAgentPrompt` directly and skips both. The human-driver auto-trigger must
 use the former or the model runs the review turn without the navigator persona.
 
-## Mouse input: pi receives it but never asks for it
+## Mouse input: pear never enables it
 
-This is the one place pear writes to the terminal outside pi's API. Re-check it
-whenever the pin moves.
+pi 0.84 introduced a fullscreen TUI with its own mouse tracking and scrollable
+viewport. Regular TUI mode deliberately leaves the wheel to the terminal, which
+is exactly what pear needs: the full inline card body is ordinary terminal
+scrollback, and native wheel scrolling and text selection keep working.
 
-**pi has no mouse API.** Nothing in `pi-tui` enables tracking, and neither
-`Component`, `keys.d.ts` nor `OverlayOptions` mentions a mouse. `mouseTracking`
-and the `ScrollView` component exist only in the oh-my-pi fork, not here.
+Fullscreen mode has no native terminal scrollback. pi already requests SGR mouse
+reports there, and its stdin buffer passes a complete report verbatim to the
+focused card. `adapters/pi/cards/mouse.ts` only parses those existing reports so
+the fullscreen body window can move. It never writes mode-set sequences, owns no
+refcount or process hook, and cannot leave the terminal in a changed state.
 
-**But the receiving half is already built.** `pi-tui/dist/stdin-buffer.js`
-recognises SGR mouse reports explicitly:
-
-```js
-// Special handling for SGR mouse sequences
-// Format: ESC[<B;X;Ym or ESC[<B;X;YM
-if (payload.startsWith("<")) {
-    const mouseMatch = /^<\d+;\d+;\d+[Mm]$/.test(payload);
-```
-
-It buffers them until complete (they arrive split across `data` events), and
-`Terminal.forwardInputSequence` passes them **verbatim** to `TUI.handleInput`,
-which hands anything that is not `shift+ctrl+d` to `focusedComponent.handleInput`.
-So a focused component already receives wheel reports as raw strings; nothing has
-asked the terminal to send them.
-
-`adapters/pi/cards/mouse.ts` therefore supplies the two missing halves:
-
-- **The mode-set sequences**, written straight to `process.stdout`:
-  `\x1b[?1000h\x1b[?1006h` on, `\x1b[?1006l\x1b[?1000l` off. `1000` is button
-  reporting (the wheel rides on it); `1006` is SGR encoding, which survives past
-  column 223. Motion reporting (`1002`/`1003`) is deliberately not requested.
-- **A parser**, because pi exposes none.
-
-Two consequences worth knowing:
-
-- **A terminal left in reporting mode is a user-visible break** — clicks emit
-  escape codes into the shell and native selection stops working until `reset`.
-  Disabling is therefore idempotent, refcounted, and hangs off three hooks: the
-  card's `dispose`, `session_shutdown`, and `process.on("exit")`. The
-  `session_shutdown` hook is not redundant: resolving pear's pending card promise
-  does **not** dispose pi's component, so a card can still be mounted there.
-- **Keys the terminal claims never arrive.** `shift+up`/`shift+down` look like
-  the natural scroll binding and are bound nowhere in pi, but many terminals use
-  them for their own scrollback and never forward the sequence. The card uses
-  `j`/`k` and `^U`/`^D` instead, which no terminal intercepts. Enabling mouse
-  reporting is the same negotiation in reverse: it asks the terminal to stop
-  handling the wheel itself.
-
-### Assumption deliberately NOT relied upon
-
-That `dispose` will run. It is the happy path only, which is why teardown is
-triple-hooked rather than trusted.
+Keyboard scrolling (`j`/`k`, `^U`/`^D`, PgUp/PgDn, Home/End) remains available
+in fullscreen mode because terminals routinely claim some navigation keys before
+an application can receive them.

@@ -1,6 +1,6 @@
 /**
  * The shared pear card: one selectable list with a body above it, an optional
- * inline editor, and an optional sub-select.
+ * text editor, and an optional sub-select. It mounts inline in pi's editor slot.
  *
  * All three pear tools render through this. The important structural choice is
  * that a card is **data** (`CardSpec`) rather than a component: the TUI renderer
@@ -12,7 +12,7 @@
  */
 
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { enableMouse, parseWheel } from "./mouse.ts";
+import { parseWheel } from "./mouse.ts";
 import {
   Editor,
   type EditorTheme,
@@ -87,12 +87,14 @@ export function plainLines<A>(spec: CardSpec<A>): string[] {
 
 /**
  * The smallest body worth showing. A card with less than this is all chrome and
- * no content, but it is still answerable, which is what matters: the card is
- * rendered as a full-height overlay and the compositor *slices* anything past
- * the terminal height, so growing past it would cut the options off the bottom
- * and leave a card nobody can answer. The body is squeezed instead.
+ * no content, but it is still answerable, which is what matters: when the inline
+ * card and pi's dock exceed the terminal, rows disappear from the top. The body
+ * is squeezed before the options can be pushed out of reach.
  */
 export const MIN_BODY_ROWS = 3;
+
+/** Rows kept for pi's footer and at least one row of transcript. */
+export const INLINE_RESERVED_ROWS = 4;
 
 /** Rows to assume when the terminal will not say how tall it is. */
 export const FALLBACK_ROWS = 24;
@@ -141,10 +143,9 @@ export function windowBody(lines: string[], viewport: number, offset: number): B
 /**
  * The one-line "there is more" marker shown under a windowed body.
  *
- * Every working key is named, not just one. The card is a fullscreen overlay,
- * so it contributes nothing to the terminal's scrollback and these keys are the
- * *only* way to reach the rest of the body — and laptops routinely have no
- * PgUp/PgDn, which is exactly how this went unnoticed.
+ * Every working key is named, not just one. A windowed body only renders its
+ * current slice, so these keys are the only way to reach the rest — and laptops
+ * routinely have no PgUp/PgDn, which is exactly how this went unnoticed.
  */
 export function scrollHint(window: BodyWindow): string {
   const parts: string[] = [];
@@ -171,11 +172,7 @@ export function renderCard<A>(
   theme: Theme,
   done: (answer: A | null) => void,
   spec: CardSpec<A>,
-): Component & { dispose: () => void } {
-  // Asked for as the card opens and released in `dispose`. See mouse.ts for why
-  // the teardown does not rely on this one path alone.
-  const releaseMouse = enableMouse();
-
+): Component {
   type Mode = { at: "options" } | { at: "editor"; option: number } | { at: "pick"; option: number; index: number };
 
   let index = 0;
@@ -189,6 +186,7 @@ export function renderCard<A>(
    */
   let cachedWidth = -1;
   let cachedRows = -1;
+  let cachedTuiMode = "";
   /** First body line on screen. Clamped at render time, when the viewport is known. */
   let bodyOffset = 0;
   /** Body rows the last render had room for, so paging can move by a screenful. */
@@ -214,22 +212,18 @@ export function renderCard<A>(
   };
 
   /**
-   * How tall the terminal is. `render` is only told the width, but the card is
-   * handed the TUI, and `Terminal` exposes `rows`. A terminal that will not say
-   * gets a conservative guess rather than an unscrollable card.
-   *
-   * This is the card's real budget only because it is shown as an overlay at
-   * `maxHeight: "100%"` — an overlay owns the whole screen. Rendered inline it
-   * would have to share the buffer with pi's status, widget and footer rows,
-   * and sizing to the full height is what used to push pi's spinner out of the
-   * viewport and force a screen-clearing redraw on every spinner tick.
+   * How many rows the inline card may use. `render` is only told the width, but
+   * the card is handed the TUI, and `Terminal` exposes `rows`. The reserve keeps
+   * pi's footer and one transcript row from competing with the card. A terminal
+   * that will not report its height gets the same conservative fallback.
    */
-  const terminalRows = (): number => {
+  const cardRows = (): number => {
     try {
       const rows = tui.terminal.rows;
-      return typeof rows === "number" && Number.isFinite(rows) && rows > 0 ? rows : FALLBACK_ROWS;
+      const measured = typeof rows === "number" && Number.isFinite(rows) && rows > 0 ? rows : FALLBACK_ROWS;
+      return Math.max(1, measured - INLINE_RESERVED_ROWS);
     } catch {
-      return FALLBACK_ROWS;
+      return FALLBACK_ROWS - INLINE_RESERVED_ROWS;
     }
   };
 
@@ -284,9 +278,9 @@ export function renderCard<A>(
   }
 
   function handleInput(data: string): void {
-    // Before the mode dispatch: the wheel means the same thing everywhere, and
-    // in editor mode the raw report would otherwise be typed into the editor.
-    const wheel = parseWheel(data);
+    // Fullscreen pi already asks the terminal for mouse reports. Regular mode
+    // deliberately does not: its complete body lives in native scrollback.
+    const wheel = tui.mode === "fullscreen" ? parseWheel(data) : undefined;
     if (wheel !== undefined) {
       scrollBodyBy(wheel === "up" ? -WHEEL_LINES : WHEEL_LINES);
       return;
@@ -335,47 +329,44 @@ export function renderCard<A>(
       return;
     }
 
-    // Scrolling is bound to everything *except* plain ↑↓, which belong to the
-    // options. Several bindings rather than one because a card whose body does
-    // not fit must still be readable on a keyboard that lacks any given key.
-    if (matchesKey(data, Key.pageUp)) {
-      scrollBody(-1);
-      return;
-    }
-    if (matchesKey(data, Key.pageDown)) {
-      scrollBody(1);
-      return;
-    }
-    // ^U/^D page as well, as the alias for a keyboard with no PgUp/PgDn.
-    if (matchesKey(data, Key.ctrl("u"))) {
-      scrollBody(-1);
-      return;
-    }
-    if (matchesKey(data, Key.ctrl("d"))) {
-      scrollBody(1);
-      return;
-    }
-    // Plain letters for the line step. Deliberately not shift+↑↓, which reads as
-    // the obvious choice and does not work: terminals commonly bind those to
-    // their own scrollback and never send them to the application at all.
-    if (matchesKey(data, "k")) {
-      scrollBodyBy(-1);
-      return;
-    }
-    if (matchesKey(data, "j")) {
-      scrollBodyBy(1);
-      return;
-    }
-    if (matchesKey(data, Key.home)) {
-      bodyOffset = 0;
-      invalidate();
-      return;
-    }
-    if (matchesKey(data, Key.end)) {
-      // Past the end on purpose; the render clamps to whatever fits.
-      bodyOffset = lastBodyLines;
-      invalidate();
-      return;
+    // Fullscreen has no terminal scrollback, so its body keeps explicit keys.
+    // Regular mode renders every line and leaves these keys to the terminal.
+    if (tui.mode === "fullscreen") {
+      if (matchesKey(data, Key.pageUp)) {
+        scrollBody(-1);
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        scrollBody(1);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("u"))) {
+        scrollBody(-1);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("d"))) {
+        scrollBody(1);
+        return;
+      }
+      if (matchesKey(data, "k")) {
+        scrollBodyBy(-1);
+        return;
+      }
+      if (matchesKey(data, "j")) {
+        scrollBodyBy(1);
+        return;
+      }
+      if (matchesKey(data, Key.home)) {
+        bodyOffset = 0;
+        invalidate();
+        return;
+      }
+      if (matchesKey(data, Key.end)) {
+        // Past the end on purpose; the render clamps to whatever fits.
+        bodyOffset = lastBodyLines;
+        invalidate();
+        return;
+      }
     }
     if (matchesKey(data, Key.up)) {
       index = Math.max(0, index - 1);
@@ -398,8 +389,14 @@ export function renderCard<A>(
 
   function render(width: number): string[] {
     const w = Math.max(20, width);
-    const rows = terminalRows();
-    if (cached !== undefined && cachedWidth === w && cachedRows === rows) return cached;
+    const rows = cardRows();
+    const tuiMode = tui.mode;
+    if (
+      cached !== undefined &&
+      cachedWidth === w &&
+      cachedRows === rows &&
+      cachedTuiMode === tuiMode
+    ) return cached;
 
     // Built as three pieces so the body can be measured against what is left
     // after the chrome, which is the whole point of knowing the height.
@@ -483,39 +480,42 @@ export function renderCard<A>(
     );
     tail.push(rule);
 
-    // What is left for the body once the chrome has taken its share. Never
-    // rounded up: the card is composited as an overlay and the compositor slices
-    // an over-tall one from the *bottom*, so every row the body borrows beyond
-    // the terminal is taken out of the options — a card nobody can answer.
-    // MIN_BODY_ROWS is the preference; fitting is the requirement.
-    const budget = rows - head.length - tail.length;
     lastBodyLines = bodyLines.length;
     const out = [...head];
-    if (bodyLines.length <= budget) {
-      // Everything fits: no window, no marker, and no stale offset left behind.
+    if (tuiMode === "regular") {
+      // The complete body becomes ordinary terminal scrollback. The options
+      // stay at the live bottom of the inline component.
       bodyOffset = 0;
       lastViewport = Math.max(MIN_BODY_ROWS, bodyLines.length);
       out.push(...bodyLines);
-    } else if (budget >= 2) {
-      // One row goes to the marker, so the human can tell there is more.
-      const viewport = budget - 1;
-      const window = windowBody(bodyLines, viewport, bodyOffset);
-      bodyOffset = window.offset;
-      lastViewport = viewport;
-      out.push(...window.lines);
-      wrapInto(out, theme.fg("dim", scrollHint(window)), " ");
     } else {
-      // A terminal too short for the chrome alone. Nothing can be shown without
-      // costing the options, so the body is dropped entirely and the human is
-      // left with a card they can still answer.
-      bodyOffset = 0;
-      lastViewport = MIN_BODY_ROWS;
+      // Fullscreen has a fixed viewport and clips an over-tall editor dock, so
+      // keep the body inside the rows left after the card chrome.
+      const budget = rows - head.length - tail.length;
+      if (bodyLines.length <= budget) {
+        bodyOffset = 0;
+        lastViewport = Math.max(MIN_BODY_ROWS, bodyLines.length);
+        out.push(...bodyLines);
+      } else if (budget >= 2) {
+        // One row goes to the marker, so the human can tell there is more.
+        const viewport = budget - 1;
+        const window = windowBody(bodyLines, viewport, bodyOffset);
+        bodyOffset = window.offset;
+        lastViewport = viewport;
+        out.push(...window.lines);
+        wrapInto(out, theme.fg("dim", scrollHint(window)), " ");
+      } else {
+        // A terminal too short for the chrome alone. Keep the options usable.
+        bodyOffset = 0;
+        lastViewport = MIN_BODY_ROWS;
+      }
     }
     out.push(...tail);
 
     cached = out;
     cachedWidth = w;
     cachedRows = rows;
+    cachedTuiMode = tuiMode;
     return out;
   }
 
@@ -525,6 +525,5 @@ export function renderCard<A>(
       cached = undefined;
     },
     handleInput,
-    dispose: releaseMouse,
   };
 }

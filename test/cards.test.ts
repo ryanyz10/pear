@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { askCard } from "../adapters/pi/cards/ask.ts";
 import {
+  INLINE_RESERVED_ROWS,
   MIN_BODY_ROWS,
   body,
   plainLines,
@@ -411,23 +412,10 @@ describe("scrollHint", () => {
   });
 });
 
-/**
- * The renderer, exercised against a stub terminal.
- *
- * Normally card *content* is asserted as data and the renderer is left alone,
- * but the height it renders to is not content — it is the one thing a data test
- * cannot see, and getting it wrong is now silent. The card is shown as an
- * overlay, and pi's compositor slices an over-tall overlay from the bottom, so
- * a card one line too tall loses its options and becomes unanswerable rather
- * than merely ugly.
- *
- * `Editor`'s constructor only stores its arguments, so a stub TUI is enough.
- */
+/** The renderer, exercised against a stub terminal in both pi TUI modes. */
 describe("renderCard", () => {
-  const stubTui = (rows: number) =>
-    ({ terminal: { rows, columns: 80 }, requestRender: () => {} }) as unknown as TUI;
-  // Identity styling: the assertions are about how many lines come back, and
-  // real colour codes would only make a width mismatch harder to read.
+  const stubTui = (rows: number, mode: "regular" | "fullscreen") =>
+    ({ mode, terminal: { rows, columns: 80 }, requestRender: () => {} }) as unknown as TUI;
   const stubTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as unknown as Theme;
 
   const spec = (bodyRows: number): CardSpec<string> => {
@@ -440,20 +428,26 @@ describe("renderCard", () => {
     };
   };
 
-  const rendered = (rows: number, bodyRows: number): string[] => {
-    const card = renderCard(stubTui(rows), stubTheme, () => {}, spec(bodyRows));
-    return card.render(80);
-  };
+  const rendered = (
+    rows: number,
+    bodyRows: number,
+    mode: "regular" | "fullscreen",
+  ): string[] => renderCard(stubTui(rows, mode), stubTheme, () => {}, spec(bodyRows)).render(80);
 
-  it("never renders taller than the terminal", () => {
+  it("renders the complete body into regular terminal scrollback", () => {
+    const lines = rendered(24, 200, "regular").join("\n");
+    assert.match(lines, /body line 0/);
+    assert.match(lines, /body line 199/);
+    assert.doesNotMatch(lines, /below/);
+    assert.match(lines, /keep going/);
+  });
+
+  it("bounds fullscreen cards to the rows left after pi's dock reserve", () => {
     for (const rows of [8, 12, 24, 40, 80]) {
-      // A terminal shorter than the card's own chrome cannot be satisfied by any
-      // amount of squeezing, so that is the floor the invariant is measured
-      // against — rendered rather than hardcoded, so it tracks the chrome.
-      const chromeOnly = rendered(rows, 0).length;
-      const ceiling = Math.max(rows, chromeOnly);
+      const chromeOnly = rendered(rows, 0, "fullscreen").length;
+      const ceiling = Math.max(rows - INLINE_RESERVED_ROWS, chromeOnly);
       for (const bodyRows of [0, 1, 5, 30, 200, 1000]) {
-        const lines = rendered(rows, bodyRows);
+        const lines = rendered(rows, bodyRows, "fullscreen");
         assert.ok(
           lines.length <= ceiling,
           `${bodyRows} body lines in ${rows} rows rendered ${lines.length}, over ${ceiling}`,
@@ -462,48 +456,49 @@ describe("renderCard", () => {
     }
   });
 
-  it("fits exactly on any terminal that can hold its chrome", () => {
-    // The case that matters in practice. Below this the card is unusable anyway.
-    for (const rows of [12, 24, 40, 80]) {
-      assert.ok(rendered(rows, 1000).length <= rows, `overflowed a ${rows}-row terminal`);
-    }
-  });
-
-  it("keeps the options even when the body cannot fit", () => {
-    // The failure this guards: the body growing to MIN_BODY_ROWS used to push
-    // the card past the screen, and an overlay is sliced from the bottom.
+  it("keeps fullscreen options when the body cannot fit", () => {
     for (const rows of [8, 10, 14]) {
-      const lines = rendered(rows, 500).join("\n");
+      const lines = rendered(rows, 500, "fullscreen").join("\n");
       assert.match(lines, /keep going/, `options lost at ${rows} rows`);
       assert.match(lines, /stop/, `options lost at ${rows} rows`);
     }
   });
 
-  it("shows the whole body when it fits, with no scroll marker", () => {
-    const lines = rendered(40, 5).join("\n");
+  it("shows a fitting fullscreen body without a scroll marker", () => {
+    const lines = rendered(40, 5, "fullscreen").join("\n");
     assert.match(lines, /body line 4/);
     assert.doesNotMatch(lines, /below/);
   });
 
-  it("marks a windowed body as scrollable", () => {
-    const lines = rendered(24, 200).join("\n");
+  it("marks a windowed fullscreen body as scrollable", () => {
+    const lines = rendered(24, 200, "fullscreen").join("\n");
     assert.match(lines, /below/);
     assert.match(lines, /PgUp\/PgDn/);
+  });
+
+  it("invalidates the cache when pi switches TUI modes", () => {
+    const tui = stubTui(24, "fullscreen") as TUI & { mode: "regular" | "fullscreen" };
+    const card = renderCard(tui, stubTheme, () => {}, spec(200));
+    assert.match(card.render(80).join("\n"), /below/);
+
+    tui.mode = "regular";
+    const regular = card.render(80).join("\n");
+    assert.match(regular, /body line 199/);
+    assert.doesNotMatch(regular, /below/);
   });
 });
 
 /**
  * Scroll bindings, driven as real key sequences.
  *
- * The card is a fullscreen overlay and contributes nothing to the terminal's
- * scrollback, so these keys are the only way to read past the first screenful.
- * A laptop with no PgUp/PgDn made the body unreachable entirely, which is why
- * more than one binding is asserted here.
+ * pi's fullscreen TUI has no native terminal scrollback, so these keys are the
+ * fallback for reading past the first screenful there. Regular mode renders the
+ * whole body and does not need these bindings.
  *
  * The sequences are the legacy forms pi's `matchesKey` accepts (keys.js:236 and
  * the CSI-with-modifier form at :438), not invented ones.
  */
-describe("scrolling the card body", () => {
+describe("scrolling the fullscreen card body", () => {
   const KEYS = {
     lineUp: "k",
     lineDown: "j",
@@ -518,7 +513,7 @@ describe("scrolling the card body", () => {
   };
 
   const stubTui = (rows: number) =>
-    ({ terminal: { rows, columns: 80 }, requestRender: () => {} }) as unknown as TUI;
+    ({ mode: "fullscreen", terminal: { rows, columns: 80 }, requestRender: () => {} }) as unknown as TUI;
   const stubTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as unknown as Theme;
 
   /** A card whose body is far too long to fit, so it is always windowed. */

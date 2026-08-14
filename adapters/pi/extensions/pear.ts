@@ -58,7 +58,6 @@ import {
 import { createWatcher, type WatchEffect, type Watcher } from "../../../core/watch.ts";
 import { askCard } from "../cards/ask.ts";
 import { renderCard, type CardSpec } from "../cards/card.ts";
-import { forceDisableMouse } from "../cards/mouse.ts";
 import { checkpointCard, type CheckpointView } from "../cards/checkpoint.ts";
 import { settingCard, settingsCard } from "../cards/config.ts";
 import { runCardViaDialogs } from "../cards/dialogs.ts";
@@ -633,10 +632,6 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
   pi.on("session_shutdown", (_event, ctx) => {
     runtime?.resolvePending({ kind: "dismissed" });
     stopWatching(ctx);
-    // Resolving the pending promise does not dispose pi's component, so a card
-    // can still be mounted here with mouse reporting on. Leaving a terminal in
-    // that state breaks clicking and text selection until `reset`.
-    forceDisableMouse();
   });
 
   // ----------------------------------------------------------------- persona
@@ -750,6 +745,17 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
 
   // ------------------------------------------------------------------- cards
 
+  let cardWorkingVisible = true;
+  const setCardWorkingVisible = (ctx: ExtensionContext, visible: boolean): void => {
+    if (cardWorkingVisible === visible) return;
+    try {
+      ctx.ui.setWorkingVisible(visible);
+      cardWorkingVisible = visible;
+    } catch {
+      /* an older host may not expose this cosmetic control */
+    }
+  };
+
   /**
    * Show a card and return the human's answer, or `null` if they walked away.
    *
@@ -758,25 +764,18 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
    */
   async function show<A>(ctx: ExtensionContext, spec: CardSpec<A>): Promise<A | null> {
     if (canShowCard(ctx)) {
-      return await ctx.ui.custom<A | null>(
-        (tui, theme, _kb, done) => renderCard(tui, theme, done, spec),
-        {
-          // An overlay, not an inline component, and the reason is the render
-          // loop rather than looks. Inline, the card is appended to the buffer
-          // below the whole chat, so a long one pushes pi's spinner above the
-          // viewport top; the spinner ticks ~10x a second, and every tick then
-          // lands a change above the viewport, which pi can only answer with a
-          // full redraw that clears the screen *and* the scrollback. That is
-          // the stutter. Overlays are composited screen-relative and never grow
-          // the buffer, so the spinner stays visible and the diff stays local.
-          overlay: true,
-          // Resolved per render so a resize is picked up. Full width because
-          // the compositor pads an overlay line to its declared width, which is
-          // what stops the chat behind it showing through; bottom-anchored so a
-          // short card sits where the editor was.
-          overlayOptions: () => ({ width: "100%", maxHeight: "100%", anchor: "bottom-center" }),
-        },
-      );
+      // Inline custom components replace pi's editor instead of covering the
+      // transcript. Hide the animated working row while the card is mounted:
+      // when a tall inline card pushes that row out of view, every spinner tick
+      // otherwise forces a full redraw that can clear terminal scrollback.
+      setCardWorkingVisible(ctx, false);
+      try {
+        return await ctx.ui.custom<A | null>((tui, theme, _kb, done) =>
+          renderCard(tui, theme, done, spec),
+        );
+      } finally {
+        setCardWorkingVisible(ctx, true);
+      }
     }
     return await runCardViaDialogs(ctx, spec);
   }
@@ -831,7 +830,13 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
         started.pending.settle(resolved);
         return resolved;
       });
-      answer = await Promise.race([started.pending.promise, answered]);
+      try {
+        answer = await Promise.race([started.pending.promise, answered]);
+      } finally {
+        // Abort, mode changes, and session shutdown can resolve the runtime's
+        // promise without resolving ui.custom, so show()'s finally may not run.
+        setCardWorkingVisible(ctx, true);
+      }
     } catch (e) {
       // A UI failure must not leave the card pending or the baseline moved.
       rt.resolvePending({ kind: "dismissed" });
@@ -891,9 +896,9 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
   /**
    * Paint an approved plan into the transcript.
    *
-   * This is the durable, scrollable copy: the card is a fullscreen overlay that
-   * vanishes when answered and contributes nothing to the terminal's scrollback,
-   * so without this the plan you agreed to is unreadable a minute later.
+   * This is the durable copy after the interactive component vanishes. Regular
+   * mode may retain card rows in terminal scrollback, while fullscreen mode
+   * cannot; the transcript entry gives both modes the same lasting plan.
    *
    * Rendered in full regardless of `expanded`. Entries honour pi's collapse
    * toggle, but a plan collapsed to one line is exactly the thing this is meant

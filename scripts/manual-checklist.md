@@ -45,8 +45,8 @@ you cannot type, that is a bug regardless of anything else on this list.
 8. **Esc** → turn ends, nothing approved, you can type normally.
 9. **Looks good** → editing opens and it starts on step 1.
 9b. The approved plan is written into the chat transcript, so it is still
-    readable once the card is gone — the card is a fullscreen overlay and leaves
-    nothing in the scrollback. Only on approval: revise, keep exploring and Esc
+    readable once the interactive card is gone in either TUI mode. Only on
+    approval: revise, keep exploring and Esc
     must write nothing, or a scoping round leaves four copies behind. Then
     `/reload` and confirm it appears once, not twice.
 
@@ -159,37 +159,33 @@ yourself.
 
 ## I. Cards in a real terminal
 
-Unit tests price the windowing but cannot see it, and nothing about scrolling or
-terminal state can be tested at all. These need eyes.
+These checks need a real terminal. Run them once in default mode and once with
+`pi --tui-mode fullscreen -e /path/to/pear/adapters/pi/extensions/pear.ts`.
 
-The card is a **fullscreen overlay**. That is deliberate and it is what stops the
-stutter: rendered inline, a card taller than the space left over pushed pi's
-spinner above the viewport, and pi answers a change above the viewport by
-clearing the screen *and* the scrollback — ten times a second, because the
-spinner ticks. See `docs/pi-api-notes.md`.
+Cards mount inline in pi's editor slot. pear hides the animated working row while
+a card is open; otherwise a tall inline card can make every spinner frame redraw
+above the viewport and clear regular-mode scrollback.
 
-51. **A plan taller than your terminal.** The body is windowed with a
-    `↑ n above · ↓ n below` marker. It must not stutter, jump to the bottom, or
-    wipe your scrollback. Check a checkpoint with many files too.
-52. **Every scroll key.** `j`/`k` a line, `^U`/`^D` a page, PgUp/PgDn a page,
-    Home/End to the ends. ↑↓ still move the options and Enter still answers.
-    **Do not add shift+↑↓** — most terminals bind those to their own scrollback
-    and never forward them, which is how this went unnoticed once already.
-53. **The mouse wheel**, three lines a notch, in the body and in the editor and
-    pick sub-modes. pi has no mouse API; pear asks the terminal directly, so
-    this is the check most likely to differ between terminals.
-54. **Terminal state is handed back.** The dangerous one. With a card open, kill
-    pi hard (`kill -9` from another shell), then click around and select text in
-    your shell. If clicking emits `[<0;40;12M` or selection is dead, mouse
-    reporting was left on and you need `reset`. Repeat for: answering a card
-    normally, Esc, `/pear-mode off` mid-card, and quitting with Ctrl-D.
-55. **Resize while a card is open.** The card re-lays-out at the new width and
-    height. Stale lines here mean the render cache lost its dimension key: pi
-    answers a resize with `requestRender()` alone and never `invalidate()`.
-56. **Shrink the terminal until only the chrome fits.** The body squeezes and
-    then disappears entirely — but the options stay visible and answerable.
-    Losing the options is the failure: pi slices an over-tall overlay from the
-    *bottom*, so a card that grows past the screen becomes unanswerable.
+51. **History stays usable.** Scroll well above the chat bottom, then trigger a
+    short question or checkpoint. The card must not cover history or trap the
+    wheel. Native selection still works, and arrowing to the bottom still finds
+    the inline card.
+52. **Default mode, plan taller than the terminal.** The full body goes into
+    native terminal scrollback with the options at the live bottom. Wheel upward
+    to read the start, select text, then return and answer. There is no pear
+    `above/below` marker in this mode.
+53. **No redraw loop.** Leave that tall card open for ten seconds while the agent
+    is otherwise working. It must not stutter, jump, or wipe scrollback. Answer,
+    dismiss, and force a UI error; the normal working row must return each time.
+54. **pi fullscreen mode, tall card.** This mode has no terminal scrollback, so
+    the body is windowed with an `↑ n above · ↓ n below` marker. The wheel moves
+    three lines; `j`/`k`, `^U`/`^D`, PgUp/PgDn, and Home/End all work. ↑↓ still
+    move options and Enter still answers.
+55. **Resize and switch modes while open.** Width, height, and regular/fullscreen
+    transitions must re-layout immediately. Stale lines mean the render cache
+    missed one of those keys.
+56. **Fullscreen terminal with only chrome room.** The body disappears before
+    the options do. Every answer remains visible and usable.
 
 ## J. Settings
 
@@ -215,5 +211,6 @@ spinner ticks. See `docs/pi-api-notes.md`.
     card with the full list in the body — it does **not** empty the list, which
     is what the argument form used to do. Add three commands from the card in a
     row: it returns to the same card each time, with the new value shown.
-64. Set the list long enough to overflow the terminal: the card body scrolls
-    with the wheel and with `j`/`k` and the options below it stay put.
+64. Set the list long enough to overflow the terminal. Default mode puts the
+    full list in native scrollback; pi fullscreen windows it for the wheel and
+    `j`/`k`. The options stay reachable in both.

@@ -110,6 +110,8 @@ function fakeCtx(opts: CtxOptions) {
   const statuses: Array<[string, string | undefined]> = [];
   const selects: Array<{ title: string; options: string[] }> = [];
   const widgets: Array<[string, string[] | undefined]> = [];
+  const workingVisibility: boolean[] = [];
+  const customOptions: unknown[] = [];
   const queue = [...(opts.selectAnswers ?? [])];
   let abortCalls = 0;
   // Mutable so a test can answer two cards differently — revise, then approve.
@@ -129,7 +131,9 @@ function fakeCtx(opts: CtxOptions) {
     ui: {
       notify: (message: string, type?: string) => notifications.push({ message, type }),
       setStatus: (k: string, t: string | undefined) => statuses.push([k, t]),
-      custom: async (_factory: unknown) => {
+      setWorkingVisible: (visible: boolean) => workingVisibility.push(visible),
+      custom: async (_factory: unknown, options?: unknown) => {
+        customOptions.push(options);
         if (opts.customThrows) throw opts.customThrows;
         return cardAnswer ?? null;
       },
@@ -149,6 +153,8 @@ function fakeCtx(opts: CtxOptions) {
     statuses,
     selects,
     widgets,
+    workingVisibility,
+    customOptions,
     abortCalls: () => abortCalls,
     /** The human finished (or abandoned) what they were typing. */
     setEditorText: (text: string) => {
@@ -511,6 +517,24 @@ describe("checkpoint tool — TUI", () => {
     assert.equal(res.details.answer, "continue");
   });
 
+  it("mounts inline and hides the working row only while the card is open", async () => {
+    const b = await boot(driver());
+    let answer: (value: unknown) => void = () => {};
+    (b.ctx.ui as any).custom = (_factory: unknown, options?: unknown) => {
+      b.customOptions.push(options);
+      return new Promise((resolve) => (answer = resolve));
+    };
+
+    const pending = run(b);
+    await Promise.resolve();
+    assert.deepEqual(b.customOptions, [undefined], "no overlay options");
+    assert.deepEqual(b.workingVisibility, [false], "hidden while awaiting the human");
+
+    answer({ kind: "continue" });
+    await pending;
+    assert.deepEqual(b.workingVisibility, [false, true], "restored after the answer");
+  });
+
   it("change direction passes the human's words through verbatim", async () => {
     const b = await boot({
       ...driver(),
@@ -844,8 +868,8 @@ describe("plan persistence across a reload", () => {
  * The approved plan, written into the transcript so it can still be read once
  * the card is gone.
  *
- * The card is a fullscreen overlay: it vanishes when answered and contributes
- * nothing to the terminal's scrollback, so this entry is the only durable copy.
+ * The interactive card vanishes when answered. Regular terminal scrollback is
+ * incidental and fullscreen has none, so this entry is the durable copy.
  */
 describe("the plan in the chat history", () => {
   const viewEntries = (b: { entries: Entry[] }) =>
@@ -1060,6 +1084,7 @@ describe("checkpoint tool — failure and teardown", () => {
     assert.match(res.content[0].text, /could not be shown/);
     assert.match(res.content[0].text, /terminal exploded/);
     assert.equal(res.details.answer, "error");
+    assert.deepEqual(b.workingVisibility, [false, true], "failure restores the working row");
   });
 
   it("does not acknowledge files when the checkpoint fails", async () => {
@@ -1103,6 +1128,7 @@ describe("checkpoint tool — failure and teardown", () => {
 
     const res = await inFlight;
     assert.match(res.content[0].text, /no answer/, "shutdown resolves the card as dismissed");
+    assert.deepEqual(b.workingVisibility, [false, true], "shutdown restores the working row");
   });
 
   it("aborting the tool resolves an open card", async () => {
@@ -1117,6 +1143,7 @@ describe("checkpoint tool — failure and teardown", () => {
 
     const res = await inFlight;
     assert.match(res.content[0].text, /no answer/);
+    assert.deepEqual(b.workingVisibility, [false, true], "abort restores the working row");
   });
 
   it("every tool is a no-op in off mode", async () => {
