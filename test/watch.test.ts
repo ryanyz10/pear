@@ -8,7 +8,7 @@ import { FILE_POINTS } from "../core/load.ts";
  * whole reason the scheduler takes its clock as a parameter is that its
  * predecessor's races were untestable with real timers.
  */
-function harness(opts: { budget?: number } = {}) {
+function harness(opts: { budget?: number; softFraction?: number; blockMultiple?: number } = {}) {
   let clock = 0;
   let token = "A";
   let sampleFails: string | null = null;
@@ -24,6 +24,8 @@ function harness(opts: { budget?: number } = {}) {
       return measureFails === null ? { ok: true, ...stats } : { ok: false, detail: measureFails };
     },
     budget: () => opts.budget ?? 200,
+    ...(opts.softFraction === undefined ? {} : { softFraction: () => opts.softFraction as number }),
+    ...(opts.blockMultiple === undefined ? {} : { blockMultiple: () => opts.blockMultiple as number }),
     now: () => clock,
     emit: (e) => effects.push(e),
   });
@@ -58,8 +60,16 @@ function harness(opts: { budget?: number } = {}) {
     breakMeasure: (detail: string | null) => {
       measureFails = detail;
     },
-    last: () => effects[effects.length - 1],
-    kinds: () => effects.map((e) => e.kind),
+    /**
+     * The nudge/trigger channel only. `load` is a separate channel — it reports
+     * the count for the status line on every measurement, including quiet ones —
+     * so folding it in here would make every test about *whether pear speaks up*
+     * also a test of the status line. `loads()` asserts on it directly instead.
+     */
+    last: () => [...effects].reverse().find((e) => e.kind !== "load"),
+    kinds: () => effects.filter((e) => e.kind !== "load").map((e) => e.kind),
+    /** Every load reported, in order. */
+    loads: () => effects.flatMap((e) => (e.kind === "load" ? [e.points] : [])),
   };
   return api;
 }
@@ -195,6 +205,93 @@ describe("tiers", () => {
     h.settle();
     assert.deepEqual(h.kinds(), []);
   });
+
+  it("respects custom tier boundaries", () => {
+    // The bug this covers: the watcher used to tier on the hardcoded defaults,
+    // so configuring these moved the agent-driver gate and did nothing here.
+    const h = harness({ softFraction: 0.1, blockMultiple: 1 });
+    h.tick();
+    h.edit("B", QUIET); // 45 — quiet at 0.5, soft at 0.1
+    h.settle();
+    assert.equal(h.last()?.kind, "nudge");
+
+    h.edit("C", { files: 3, insertions: 100, deletions: 20 }); // 240 — due at ×2, blocked at ×1
+    h.settle();
+    assert.equal(h.last()?.kind, "trigger");
+  });
+
+  it("uses the shared defaults when the host supplies no boundaries", () => {
+    const h = harness();
+    h.tick();
+    h.edit("B", QUIET);
+    h.settle();
+    assert.deepEqual(h.kinds(), [], "45 is below the default soft threshold of 100");
+  });
+});
+
+describe("reporting the load", () => {
+  it("reports a quiet measurement, which nothing else would", () => {
+    // The bug this exists for: a small change was priced and then discarded,
+    // so the status line sat at zero and the watcher looked asleep.
+    const h = harness();
+    h.tick();
+    h.edit("B", QUIET);
+    h.settle();
+    assert.deepEqual(h.loads(), [FILE_POINTS + 5]);
+    assert.deepEqual(h.kinds(), [], "still says nothing out loud");
+  });
+
+  it("reports every tier, not just the loud ones", () => {
+    const h = harness();
+    h.tick();
+    h.edit("B", QUIET);
+    h.settle();
+    h.edit("C", SOFT);
+    h.settle();
+    h.edit("D", BLOCKED);
+    h.settle();
+    assert.deepEqual(h.loads(), [45, 130, 420]);
+  });
+
+  it("reports zero once when the tree returns to the baseline", () => {
+    const h = harness();
+    h.tick();
+    h.edit("B", SOFT);
+    h.settle();
+    h.edit("A", { files: 0, insertions: 0, deletions: 0 });
+    h.settle();
+    assert.deepEqual(h.loads(), [130, 0]);
+
+    // Sitting at the baseline must not re-report zero forever: this branch runs
+    // on every tick, and each report costs the host a status refresh.
+    h.settle();
+    assert.deepEqual(h.loads(), [130, 0]);
+  });
+
+  it("reports zero when the work is acknowledged", () => {
+    const h = harness();
+    h.tick();
+    h.edit("B", BLOCKED);
+    h.settle();
+    assert.deepEqual(h.loads(), [420]);
+
+    h.watcher.acknowledge();
+    assert.deepEqual(h.loads(), [420, 0]);
+  });
+
+  it("reports only what is new after an acknowledgement", () => {
+    // The credit is what stops the tree just reviewed being re-priced in full;
+    // the reported number has to follow it or the status line lies.
+    const h = harness();
+    h.tick();
+    h.edit("B", SOFT); // 130
+    h.settle();
+    h.watcher.acknowledge();
+
+    h.edit("C", { files: 2, insertions: 60, deletions: 10 }); // 150 gross, 20 new
+    h.settle();
+    assert.deepEqual(h.loads(), [130, 0, 20]);
+  });
 });
 
 describe("not re-asking", () => {
@@ -236,7 +333,7 @@ describe("not re-asking", () => {
 
     assert.deepEqual(h.kinds(), ["nudge", "nudge"]);
     const effect = h.last();
-    assert.equal(effect.kind === "nudge" && effect.files, 3);
+    assert.equal(effect?.kind === "nudge" && effect.files, 3);
   });
 });
 

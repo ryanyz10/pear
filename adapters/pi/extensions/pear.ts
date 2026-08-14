@@ -58,6 +58,7 @@ import {
 import { createWatcher, type WatchEffect, type Watcher } from "../../../core/watch.ts";
 import { askCard } from "../cards/ask.ts";
 import { renderCard, type CardSpec } from "../cards/card.ts";
+import { forceDisableMouse } from "../cards/mouse.ts";
 import { checkpointCard, type CheckpointView } from "../cards/checkpoint.ts";
 import { settingCard, settingsCard } from "../cards/config.ts";
 import { runCardViaDialogs } from "../cards/dialogs.ts";
@@ -114,6 +115,18 @@ type CardDetails = {
 
 /** Session entry type used to persist the approved plan across reloads. */
 const PLAN_ENTRY = "pear-plan";
+
+/**
+ * Session entry type used to *show* the approved plan in the chat history.
+ *
+ * Deliberately not `PLAN_ENTRY`, for two reasons that pull in opposite
+ * directions and would both be violated by sharing one key. `recoverPlan` reads
+ * the newest `PLAN_ENTRY` back as *the approved plan*, so nothing written for
+ * display may land under that key. And `PLAN_ENTRY` must keep no renderer, or
+ * resuming an older session would suddenly paint every plan it ever approved
+ * into the transcript.
+ */
+const PLAN_VIEW_ENTRY = "pear-plan-view";
 
 /**
  * Card answers that mean a human read the proposal, and so that it is worth
@@ -339,6 +352,10 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
           : { ok: false, detail: result.detail };
       },
       budget: () => runtime?.reviewBudget ?? 0,
+      // Read live off the runtime, which owns the tiers: `/pear-config` moves
+      // them through `setTiers` without rebuilding the watcher.
+      softFraction: () => runtime?.softFraction ?? DEFAULTS.softFraction,
+      blockMultiple: () => runtime?.blockMultiple ?? DEFAULTS.blockMultiple,
       now,
       emit: (effect) => {
         void onWatchEffect(ctx, effect);
@@ -385,11 +402,17 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
     if (rt === null) return;
 
     switch (effect.kind) {
-      case "nudge":
-        // The load is recorded either way. Turning the nudge off silences the
-        // warning shot, not the accounting — the trigger that starts a review
-        // turn is the blocked tier and is not affected by this.
+      // Every measurement reports its load here and nowhere else, so the status
+      // line tracks the tree at every tier rather than only once a nudge is due.
+      case "load":
         rt.setWorkingTreeLoad(effect.points);
+        refreshStatus(ctx);
+        return;
+
+      case "nudge":
+        // Turning the nudge off silences the warning shot, not the accounting —
+        // the trigger that starts a review turn is the blocked tier and is not
+        // affected by this.
         if (settings.nudge) {
           try {
             ctx.ui.setWidget(
@@ -419,7 +442,6 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
         return;
 
       case "trigger": {
-        rt.setWorkingTreeLoad(effect.points);
         const asked = startQuiz(ctx, effect.files, effect.insertions, effect.deletions);
         // The watcher parks itself on `triggered` waiting to be answered. If the
         // question never got out, nothing will ever answer it, and without this
@@ -611,6 +633,10 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
   pi.on("session_shutdown", (_event, ctx) => {
     runtime?.resolvePending({ kind: "dismissed" });
     stopWatching(ctx);
+    // Resolving the pending promise does not dispose pi's component, so a card
+    // can still be mounted here with mouse reporting on. Leaving a terminal in
+    // that state breaks clicking and text selection until `reset`.
+    forceDisableMouse();
   });
 
   // ----------------------------------------------------------------- persona
@@ -732,8 +758,24 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
    */
   async function show<A>(ctx: ExtensionContext, spec: CardSpec<A>): Promise<A | null> {
     if (canShowCard(ctx)) {
-      return await ctx.ui.custom<A | null>((tui, theme, _kb, done) =>
-        renderCard(tui, theme, done, spec),
+      return await ctx.ui.custom<A | null>(
+        (tui, theme, _kb, done) => renderCard(tui, theme, done, spec),
+        {
+          // An overlay, not an inline component, and the reason is the render
+          // loop rather than looks. Inline, the card is appended to the buffer
+          // below the whole chat, so a long one pushes pi's spinner above the
+          // viewport top; the spinner ticks ~10x a second, and every tick then
+          // lands a change above the viewport, which pi can only answer with a
+          // full redraw that clears the screen *and* the scrollback. That is
+          // the stutter. Overlays are composited screen-relative and never grow
+          // the buffer, so the spinner stays visible and the diff stays local.
+          overlay: true,
+          // Resolved per render so a resize is picked up. Full width because
+          // the compositor pads an overlay line to its declared width, which is
+          // what stops the chat behind it showing through; bottom-anchored so a
+          // short card sits where the editor was.
+          overlayOptions: () => ({ width: "100%", maxHeight: "100%", anchor: "bottom-center" }),
+        },
       );
     }
     return await runCardViaDialogs(ctx, spec);
@@ -844,6 +886,29 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
     );
   }
 
+  // --------------------------------------------------- the plan in the chat
+
+  /**
+   * Paint an approved plan into the transcript.
+   *
+   * This is the durable, scrollable copy: the card is a fullscreen overlay that
+   * vanishes when answered and contributes nothing to the terminal's scrollback,
+   * so without this the plan you agreed to is unreadable a minute later.
+   *
+   * Rendered in full regardless of `expanded`. Entries honour pi's collapse
+   * toggle, but a plan collapsed to one line is exactly the thing this is meant
+   * to stop, so the toggle is ignored rather than obeyed.
+   */
+  pi.registerEntryRenderer<PlanSpec>(PLAN_VIEW_ENTRY, (entry, _options, theme) => {
+    // Entries are replayed from disk, so this may be data written by an older
+    // version. A shape we do not recognise renders nothing rather than throwing
+    // inside pi's render loop.
+    if (!isPlanSpec(entry.data)) return undefined;
+    const heading = theme.fg("accent", theme.bold("the plan we agreed"));
+    const body = theme.fg("muted", formatPlan(entry.data));
+    return new Text(`${heading}\n${body}`, 1, 0);
+  });
+
   // ------------------------------------------------------------------- tools
 
   const renderCardCall = (
@@ -925,6 +990,11 @@ export default function pear(pi: ExtensionAPI, hooks: PearHooks = {}) {
             if (answer.kind === "approve") {
               try {
                 pi.appendEntry(PLAN_ENTRY, proposed);
+                // A second entry, for reading rather than for state. Written on
+                // approval only: appending every proposal would put a full copy
+                // of the plan in the transcript for each revision, and a
+                // scoping round routinely runs to four or five.
+                pi.appendEntry(PLAN_VIEW_ENTRY, proposed);
               } catch {
                 /* the plan still holds for this session */
               }

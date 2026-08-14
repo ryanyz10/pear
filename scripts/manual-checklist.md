@@ -44,6 +44,11 @@ you cannot type, that is a bug regardless of anything else on this list.
 7. **Keep exploring** → it looks harder and re-proposes. Editing is still closed.
 8. **Esc** → turn ends, nothing approved, you can type normally.
 9. **Looks good** → editing opens and it starts on step 1.
+9b. The approved plan is written into the chat transcript, so it is still
+    readable once the card is gone — the card is a fullscreen overlay and leaves
+    nothing in the scrollback. Only on approval: revise, keep exploring and Esc
+    must write nothing, or a scoping round leaves four copies behind. Then
+    `/reload` and confirm it appears once, not twice.
 
 ## B. Cadence — the main event
 
@@ -110,6 +115,11 @@ yourself.
 
 37. The nudge appears at a moment that feels informative, not nagging. It never
     steals focus and never interrupts a keystroke.
+37b. **The status counter moves before the nudge does.** Change one small file:
+    the count climbs (a file is 40 points plus its changed lines) well before
+    anything is said out loud. Sitting at `0/200` while you edit is the bug —
+    the load was being measured and then discarded. Revert the change and it
+    returns to zero.
 38. Keep going past the nudge. The agent speaks up on its own, at a pause rather
     than mid-thought. **If it consistently catches you mid-thought, the debounce
     is too short before the budget is wrong.**
@@ -149,38 +159,61 @@ yourself.
 
 ## I. Cards in a real terminal
 
-Unit tests price the windowing but cannot see it. These need eyes.
+Unit tests price the windowing but cannot see it, and nothing about scrolling or
+terminal state can be tested at all. These need eyes.
 
-51. **A plan taller than your terminal.** Every card body is windowed against
-    the real height, with a `↑ n above · ↓ n below` marker. PgUp/PgDn move it;
-    ↑↓ still move the options and Enter still answers. This is the bug that
-    made a long plan unreadable — check a checkpoint with many files too.
-52. **Resize while a card is open.** The card re-lays-out at the new width and
+The card is a **fullscreen overlay**. That is deliberate and it is what stops the
+stutter: rendered inline, a card taller than the space left over pushed pi's
+spinner above the viewport, and pi answers a change above the viewport by
+clearing the screen *and* the scrollback — ten times a second, because the
+spinner ticks. See `docs/pi-api-notes.md`.
+
+51. **A plan taller than your terminal.** The body is windowed with a
+    `↑ n above · ↓ n below` marker. It must not stutter, jump to the bottom, or
+    wipe your scrollback. Check a checkpoint with many files too.
+52. **Every scroll key.** `j`/`k` a line, `^U`/`^D` a page, PgUp/PgDn a page,
+    Home/End to the ends. ↑↓ still move the options and Enter still answers.
+    **Do not add shift+↑↓** — most terminals bind those to their own scrollback
+    and never forward them, which is how this went unnoticed once already.
+53. **The mouse wheel**, three lines a notch, in the body and in the editor and
+    pick sub-modes. pi has no mouse API; pear asks the terminal directly, so
+    this is the check most likely to differ between terminals.
+54. **Terminal state is handed back.** The dangerous one. With a card open, kill
+    pi hard (`kill -9` from another shell), then click around and select text in
+    your shell. If clicking emits `[<0;40;12M` or selection is dead, mouse
+    reporting was left on and you need `reset`. Repeat for: answering a card
+    normally, Esc, `/pear-mode off` mid-card, and quitting with Ctrl-D.
+55. **Resize while a card is open.** The card re-lays-out at the new width and
     height. Stale lines here mean the render cache lost its dimension key: pi
     answers a resize with `requestRender()` alone and never `invalidate()`.
-53. **Shrink the terminal until only the chrome fits.** The body floors at three
-    rows and overflows rather than collapsing to nothing.
+56. **Shrink the terminal until only the chrome fits.** The body squeezes and
+    then disappears entirely — but the options stay visible and answerable.
+    Losing the options is the failure: pi slices an over-tall overlay from the
+    *bottom*, so a card that grows past the screen becomes unanswerable.
 
 ## J. Settings
 
-54. `/pear-config` with no arguments opens the settings card: one line per key,
+57. `/pear-config` with no arguments opens the settings card: one line per key,
     each value elided to fit, never wrapped. Choosing one opens its own card;
     Esc there goes back to the picker, Esc at the picker closes. Booleans and
     `mode` offer a pick rather than a text box.
-55. `/pear-config statusIcon true` — the status line and the human-driver nudge
+58. `/pear-config statusIcon true` — the status line and the human-driver nudge
     switch to 🍐 immediately, and notifications still say "pear" in words.
-56. `/pear-config pollMs 500` then edit a file: the nudge appears sooner. The
+59. `/pear-config pollMs 500` then edit a file: the nudge appears sooner. The
     watcher is rebuilt, so it re-adopts the current tree — work already in the
     tree at that moment is not re-raised until you touch something again.
-57. `/pear-config allowedReadOnlyCommands ls, cat` — a whole list still
+60. `/pear-config allowedReadOnlyCommands ls, cat` — a whole list still
     *replaces* the defaults, so `git status` starts costing review points.
     `default` puts them back.
-58. `/pear-config allowedReadOnlyCommands +rg` then `-rg` — each edits one
+61. `/pear-config allowedReadOnlyCommands +rg` then `-rg` — each edits one
     entry and leaves the rest alone. Repeating either says "nothing changed"
     and writes nothing.
-59. `/pear-config allowedReadOnlyCommands` on its own opens that setting's
+62. `/pear-config softFraction 0.25` then edit a file in human-driver: the nudge
+    arrives sooner. The watcher reads the tiers live off the runtime, so this
+    lands without a restart — it used to ignore both tier keys entirely.
+63. `/pear-config allowedReadOnlyCommands` on its own opens that setting's
     card with the full list in the body — it does **not** empty the list, which
     is what the argument form used to do. Add three commands from the card in a
     row: it returns to the same card each time, with the new value shown.
-60. Set the list long enough to overflow the terminal: the card body scrolls
-    with PgUp/PgDn and the options below it stay put.
+64. Set the list long enough to overflow the terminal: the card body scrolls
+    with the wheel and with `j`/`k` and the options below it stay put.

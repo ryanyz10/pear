@@ -196,6 +196,16 @@ describe("isReadOnlyBashCommand", () => {
     assert.equal(isReadOnlyBashCommand("find . -name a -o -name b", ["find"]), true);
   });
 
+  it("refuses rg's --pre, which executes an arbitrary program per file", () => {
+    assert.equal(isReadOnlyBashCommand("rg --pre touch pat f", ["rg"]), false);
+    assert.equal(isReadOnlyBashCommand("rg --pre=touch pat f", ["rg"]), false);
+    assert.equal(isReadOnlyBashCommand("ls | rg --pre touch pat", ["ls", "rg"]), false);
+    // --pre-glob without --pre only filters; it executes nothing.
+    assert.equal(isReadOnlyBashCommand("rg --pre-glob=a.md pat f", ["rg"]), true);
+    // ...and --pre is only refused for rg, where it means "execute this".
+    assert.equal(isReadOnlyBashCommand("grep --pre foo f", ["grep"]), true);
+  });
+
   it("applies the syntax gate before the list, whatever is on it", () => {
     // Rule 1 is not configurable: an allowlisted verb inside untrustworthy
     // shell syntax is still refused.

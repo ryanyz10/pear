@@ -146,6 +146,20 @@ function namesAnOutputFile(tokens: string[]): boolean {
 }
 
 /**
+ * Does this command tell ripgrep to execute a program? `rg --pre <cmd>` runs
+ * an arbitrary preprocessor over every file searched, which makes "read-only"
+ * meaningless whatever the allowlist says. Like `--output`, this is the
+ * definition of the question rather than a policy: a command that executes a
+ * program of the caller's choosing cannot be vouched for by this file.
+ * (`--pre-glob` alone is harmless — it only filters which files `--pre`
+ * applies to — so it is not matched here.)
+ */
+function namesAPreprocessor(tokens: string[]): boolean {
+  if (tokens[0] !== "rg") return false;
+  return tokens.some((t) => t === "--pre" || t.startsWith("--pre="));
+}
+
+/**
  * The operators that separate one command from the next without changing what
  * either of them does. Anything else structural is refused; see the header.
  */
@@ -220,6 +234,7 @@ function isReadOnlySegment(tokens: string[], allowed: readonly string[]): boolea
   if (verb.includes("/")) return false;
 
   if (namesAnOutputFile(tokens)) return false;
+  if (namesAPreprocessor(tokens)) return false;
 
   return allowed.some((entry) => matchesEntry(tokens, entry));
 }

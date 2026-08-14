@@ -40,6 +40,7 @@ function fakePi(entries: Entry[], extraTools: string[]) {
   >();
   let active = [...BUILTINS, ...extraTools];
   const toolSetCalls: string[][] = [];
+  const entryRenderers = new Map<string, (entry: any, options: any, theme: any) => any>();
 
   const api = {
     on: (event: string, handler: Handler) => {
@@ -52,7 +53,8 @@ function fakePi(entries: Entry[], extraTools: string[]) {
       if (!active.includes(tool.name)) active.push(tool.name);
     },
     registerCommand: (name: string, opts: any) => commands.set(name, opts),
-    registerEntryRenderer: () => {},
+    registerEntryRenderer: (customType: string, renderer: any) =>
+      entryRenderers.set(customType, renderer),
     registerMessageRenderer: () => {},
     appendEntry: (customType: string, data?: unknown) =>
       entries.push({ type: "custom", customType, data }),
@@ -80,6 +82,7 @@ function fakePi(entries: Entry[], extraTools: string[]) {
     sentUserMessages,
     activeTools: () => [...active],
     toolSetCalls,
+    entryRenderers,
   };
 }
 
@@ -829,6 +832,108 @@ describe("plan persistence across a reload", () => {
     assert.match(prompt.systemPrompt, /you are the driver/i, "building, not scoping");
     assert.match(prompt.systemPrompt, /Retry on 5xx only/, "decisions carried through");
     assert.match(prompt.systemPrompt, /raise them at your first checkpoint/, "open questions flagged");
+  });
+});
+
+/**
+ * The approved plan, written into the transcript so it can still be read once
+ * the card is gone.
+ *
+ * The card is a fullscreen overlay: it vanishes when answered and contributes
+ * nothing to the terminal's scrollback, so this entry is the only durable copy.
+ */
+describe("the plan in the chat history", () => {
+  const viewEntries = (b: { entries: Entry[] }) =>
+    b.entries.filter((e) => e.customType === "pear-plan-view");
+
+  /** Identity styling, so assertions read the text and not the colour codes. */
+  const fakeTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  it("writes the plan to the transcript when it is approved", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    await approvePlan(b);
+    assert.deepEqual(
+      viewEntries(b).map((e) => e.data),
+      [PLAN_ARGS],
+    );
+  });
+
+  it("writes nothing for a plan that was not approved", async () => {
+    // Appending every proposal would put a full copy in the transcript for each
+    // revision, and a scoping round routinely runs to four or five.
+    for (const cardAnswer of [
+      { kind: "revise", text: "test first" },
+      { kind: "explore", text: "look at the queue" },
+      { kind: "dismissed" },
+    ]) {
+      const b = await boot({ ...driver({ planPhase: true }), cardAnswer });
+      await b.tools.get("pear_plan")?.execute("p", PLAN_ARGS, undefined, undefined, b.ctx);
+      assert.deepEqual(viewEntries(b), [], `nothing recorded for ${cardAnswer.kind}`);
+    }
+  });
+
+  it("keeps the display entry out of plan recovery", async () => {
+    // The trap this guards: `recoverPlan` reads the newest `pear-plan` back as
+    // THE approved plan. A display entry under that key would mean a reload
+    // silently adopting a plan nobody agreed to.
+    const b = await boot({
+      cwd: tempRepo(),
+      ...driver({ planPhase: true }),
+      entries: [
+        { type: "custom", customType: "pear-plan-view", data: { summary: "seen", steps: ["a"] } },
+      ],
+    });
+    const [prompt] = await b.emit("before_agent_start", { systemPrompt: "BASE" }, b.ctx);
+    assert.match(
+      prompt.systemPrompt,
+      /discover before you build/i,
+      "a shown plan is not an approved one",
+    );
+  });
+
+  it("registers a renderer for the display entry and none for the state entry", async () => {
+    // A renderer on `pear-plan` would repaint every plan an older session ever
+    // approved when it is resumed.
+    const b = await boot(driver({ planPhase: true }));
+    assert.ok(b.entryRenderers.has("pear-plan-view"), "the shown plan renders");
+    assert.equal(b.entryRenderers.has("pear-plan"), false, "the stored plan does not");
+  });
+
+  it("renders the plan's own content, in full", async () => {
+    const b = await boot(driver({ planPhase: true }));
+    const render = b.entryRenderers.get("pear-plan-view");
+    const full = {
+      summary: "Wrap the client in a retry.",
+      context: "It retries nothing today.",
+      steps: ["Add the helper", "Wire it in"],
+      decisions: ["Retry on 5xx only"],
+      openQuestions: ["Timeout value?"],
+      risks: ["Changes request timing"],
+    };
+    // Collapsed on purpose: entries honour pi's expand toggle, but a plan
+    // collapsed to one line is exactly what this entry exists to prevent.
+    const out = render?.({ type: "custom", customType: "pear-plan-view", data: full }, { expanded: false }, fakeTheme);
+    const text = String(out?.text ?? "");
+    assert.match(text, /Wrap the client in a retry/);
+    assert.match(text, /Add the helper/);
+    assert.match(text, /Wire it in/);
+    assert.match(text, /Retry on 5xx only/);
+    assert.match(text, /Timeout value\?/);
+    assert.match(text, /Changes request timing/);
+  });
+
+  it("renders nothing for data it does not recognise", async () => {
+    // Entries are replayed from disk, so this may be a shape an older version
+    // wrote. Throwing here would throw inside pi's render loop.
+    const b = await boot(driver({ planPhase: true }));
+    const render = b.entryRenderers.get("pear-plan-view");
+    for (const data of [undefined, null, 42, "a plan", {}, { summary: "s" }, { steps: ["a"] }]) {
+      assert.equal(
+        render?.({ type: "custom", customType: "pear-plan-view", data }, { expanded: true }, fakeTheme),
+        undefined,
+        JSON.stringify(data) ?? "undefined",
+      );
+    }
   });
 });
 

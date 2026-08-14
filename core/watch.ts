@@ -32,12 +32,18 @@
  * complaint.
  */
 
-import { loadTier, type LoadTier } from "./config.ts";
+import { BLOCK_MULTIPLE, SOFT_FRACTION, loadTier, type LoadTier } from "./config.ts";
 import { pointsForWorkingTree } from "./load.ts";
 
 /** What the watcher wants the host to do right now. */
 export type WatchEffect =
   | { kind: "none" }
+  /**
+   * The load now outstanding, whatever the tier. Emitted on every measurement
+   * so the status line moves while the human is still below the nudge
+   * threshold — otherwise a small change looks like the watcher is asleep.
+   */
+  | { kind: "load"; points: number }
   /** Show or refresh the passive nudge. */
   | { kind: "nudge"; files: number; insertions: number; deletions: number; points: number; tier: LoadTier }
   /** Clear the nudge; there is nothing worth reporting. */
@@ -59,6 +65,14 @@ export type WatchDeps = {
   measure: () => WatchMeasure;
   /** Review-load points allowed before a checkpoint is due. */
   budget: () => number;
+  /**
+   * The tier boundaries, read on every measurement rather than captured, so a
+   * `/pear-config` change lands without rebuilding the watcher. Both default to
+   * the shared constants, which is what makes the human-driver nudge and the
+   * agent-driver gate agree about what "a lot to read" means.
+   */
+  softFraction?: () => number;
+  blockMultiple?: () => number;
   now: () => number;
   /** Emit an effect for the host to carry out. */
   emit: (effect: WatchEffect) => void;
@@ -218,6 +232,9 @@ export function createWatcher(deps: WatchDeps): Watcher {
           state = "idle";
           points = 0;
           measuredToken = null;
+          // Only on the transition: this branch runs every tick while the tree
+          // sits at the baseline, and re-reporting zero forever is noise.
+          deps.emit({ kind: "load", points: 0 });
         }
         clearNudge();
         return;
@@ -260,8 +277,16 @@ export function createWatcher(deps: WatchDeps): Watcher {
       // would suppress everything after it.
       if (grossPoints < acknowledgedPoints) acknowledgedPoints = 0;
       points = grossPoints - acknowledgedPoints;
+      // Before the tier branch, so the number is reported even when the tier is
+      // quiet and there is nothing else to say.
+      deps.emit({ kind: "load", points });
       const { files, insertions, deletions } = measured;
-      const tier = loadTier(points, deps.budget());
+      const tier = loadTier(
+        points,
+        deps.budget(),
+        deps.softFraction?.() ?? SOFT_FRACTION,
+        deps.blockMultiple?.() ?? BLOCK_MULTIPLE,
+      );
 
       if (tier === "quiet") {
         state = "idle";
@@ -307,6 +332,7 @@ export function createWatcher(deps: WatchDeps): Watcher {
       // Always emitted: acknowledging is also how a trigger is dismissed, and
       // the host may have UI up that a nudge-only clear would leave behind.
       nudgeShown = false;
+      deps.emit({ kind: "load", points: 0 });
       deps.emit({ kind: "clear" });
     },
 

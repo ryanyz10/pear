@@ -386,3 +386,56 @@ terminal.
 `before_agent_start`. `sendMessage({ triggerTurn: true })` calls
 `_runAgentPrompt` directly and skips both. The human-driver auto-trigger must
 use the former or the model runs the review turn without the navigator persona.
+
+## Mouse input: pi receives it but never asks for it
+
+This is the one place pear writes to the terminal outside pi's API. Re-check it
+whenever the pin moves.
+
+**pi has no mouse API.** Nothing in `pi-tui` enables tracking, and neither
+`Component`, `keys.d.ts` nor `OverlayOptions` mentions a mouse. `mouseTracking`
+and the `ScrollView` component exist only in the oh-my-pi fork, not here.
+
+**But the receiving half is already built.** `pi-tui/dist/stdin-buffer.js`
+recognises SGR mouse reports explicitly:
+
+```js
+// Special handling for SGR mouse sequences
+// Format: ESC[<B;X;Ym or ESC[<B;X;YM
+if (payload.startsWith("<")) {
+    const mouseMatch = /^<\d+;\d+;\d+[Mm]$/.test(payload);
+```
+
+It buffers them until complete (they arrive split across `data` events), and
+`Terminal.forwardInputSequence` passes them **verbatim** to `TUI.handleInput`,
+which hands anything that is not `shift+ctrl+d` to `focusedComponent.handleInput`.
+So a focused component already receives wheel reports as raw strings; nothing has
+asked the terminal to send them.
+
+`adapters/pi/cards/mouse.ts` therefore supplies the two missing halves:
+
+- **The mode-set sequences**, written straight to `process.stdout`:
+  `\x1b[?1000h\x1b[?1006h` on, `\x1b[?1006l\x1b[?1000l` off. `1000` is button
+  reporting (the wheel rides on it); `1006` is SGR encoding, which survives past
+  column 223. Motion reporting (`1002`/`1003`) is deliberately not requested.
+- **A parser**, because pi exposes none.
+
+Two consequences worth knowing:
+
+- **A terminal left in reporting mode is a user-visible break** — clicks emit
+  escape codes into the shell and native selection stops working until `reset`.
+  Disabling is therefore idempotent, refcounted, and hangs off three hooks: the
+  card's `dispose`, `session_shutdown`, and `process.on("exit")`. The
+  `session_shutdown` hook is not redundant: resolving pear's pending card promise
+  does **not** dispose pi's component, so a card can still be mounted there.
+- **Keys the terminal claims never arrive.** `shift+up`/`shift+down` look like
+  the natural scroll binding and are bound nowhere in pi, but many terminals use
+  them for their own scrollback and never forward the sequence. The card uses
+  `j`/`k` and `^U`/`^D` instead, which no terminal intercepts. Enabling mouse
+  reporting is the same negotiation in reverse: it asks the terminal to stop
+  handling the wheel itself.
+
+### Assumption deliberately NOT relied upon
+
+That `dispose` will run. It is the happy path only, which is why teardown is
+triple-hooked rather than trusted.

@@ -3,12 +3,16 @@ import { describe, it } from "node:test";
 import { askCard } from "../adapters/pi/cards/ask.ts";
 import {
   MIN_BODY_ROWS,
+  body,
   plainLines,
+  renderCard,
   scrollHint,
   windowBody,
   type CardOption,
   type CardSpec,
 } from "../adapters/pi/cards/card.ts";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
 import { checkpointCard, reviewableFiles } from "../adapters/pi/cards/checkpoint.ts";
 import { settingCard, settingsCard } from "../adapters/pi/cards/config.ts";
 import { planCard } from "../adapters/pi/cards/plan.ts";
@@ -404,5 +408,205 @@ describe("scrollHint", () => {
 
   it("says which keys scroll it", () => {
     assert.match(scrollHint(windowBody(numbered(20), 5, 0)), /PgUp\/PgDn/);
+  });
+});
+
+/**
+ * The renderer, exercised against a stub terminal.
+ *
+ * Normally card *content* is asserted as data and the renderer is left alone,
+ * but the height it renders to is not content — it is the one thing a data test
+ * cannot see, and getting it wrong is now silent. The card is shown as an
+ * overlay, and pi's compositor slices an over-tall overlay from the bottom, so
+ * a card one line too tall loses its options and becomes unanswerable rather
+ * than merely ugly.
+ *
+ * `Editor`'s constructor only stores its arguments, so a stub TUI is enough.
+ */
+describe("renderCard", () => {
+  const stubTui = (rows: number) =>
+    ({ terminal: { rows, columns: 80 }, requestRender: () => {} }) as unknown as TUI;
+  // Identity styling: the assertions are about how many lines come back, and
+  // real colour codes would only make a width mismatch harder to read.
+  const stubTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as unknown as Theme;
+
+  const spec = (bodyRows: number): CardSpec<string> => {
+    const b = body();
+    for (let i = 0; i < bodyRows; i++) b.text(`body line ${i}`);
+    return {
+      title: "A card",
+      lines: b.lines,
+      options: [{ label: "keep going", answer: "continue" }, { label: "stop", answer: "stop" }],
+    };
+  };
+
+  const rendered = (rows: number, bodyRows: number): string[] => {
+    const card = renderCard(stubTui(rows), stubTheme, () => {}, spec(bodyRows));
+    return card.render(80);
+  };
+
+  it("never renders taller than the terminal", () => {
+    for (const rows of [8, 12, 24, 40, 80]) {
+      // A terminal shorter than the card's own chrome cannot be satisfied by any
+      // amount of squeezing, so that is the floor the invariant is measured
+      // against — rendered rather than hardcoded, so it tracks the chrome.
+      const chromeOnly = rendered(rows, 0).length;
+      const ceiling = Math.max(rows, chromeOnly);
+      for (const bodyRows of [0, 1, 5, 30, 200, 1000]) {
+        const lines = rendered(rows, bodyRows);
+        assert.ok(
+          lines.length <= ceiling,
+          `${bodyRows} body lines in ${rows} rows rendered ${lines.length}, over ${ceiling}`,
+        );
+      }
+    }
+  });
+
+  it("fits exactly on any terminal that can hold its chrome", () => {
+    // The case that matters in practice. Below this the card is unusable anyway.
+    for (const rows of [12, 24, 40, 80]) {
+      assert.ok(rendered(rows, 1000).length <= rows, `overflowed a ${rows}-row terminal`);
+    }
+  });
+
+  it("keeps the options even when the body cannot fit", () => {
+    // The failure this guards: the body growing to MIN_BODY_ROWS used to push
+    // the card past the screen, and an overlay is sliced from the bottom.
+    for (const rows of [8, 10, 14]) {
+      const lines = rendered(rows, 500).join("\n");
+      assert.match(lines, /keep going/, `options lost at ${rows} rows`);
+      assert.match(lines, /stop/, `options lost at ${rows} rows`);
+    }
+  });
+
+  it("shows the whole body when it fits, with no scroll marker", () => {
+    const lines = rendered(40, 5).join("\n");
+    assert.match(lines, /body line 4/);
+    assert.doesNotMatch(lines, /below/);
+  });
+
+  it("marks a windowed body as scrollable", () => {
+    const lines = rendered(24, 200).join("\n");
+    assert.match(lines, /below/);
+    assert.match(lines, /PgUp\/PgDn/);
+  });
+});
+
+/**
+ * Scroll bindings, driven as real key sequences.
+ *
+ * The card is a fullscreen overlay and contributes nothing to the terminal's
+ * scrollback, so these keys are the only way to read past the first screenful.
+ * A laptop with no PgUp/PgDn made the body unreachable entirely, which is why
+ * more than one binding is asserted here.
+ *
+ * The sequences are the legacy forms pi's `matchesKey` accepts (keys.js:236 and
+ * the CSI-with-modifier form at :438), not invented ones.
+ */
+describe("scrolling the card body", () => {
+  const KEYS = {
+    lineUp: "k",
+    lineDown: "j",
+    ctrlPageUp: "\x15", // ^U
+    ctrlPageDown: "\x04", // ^D
+    home: "\x1b[H",
+    end: "\x1b[F",
+    pageDown: "\x1b[6~",
+    pageUp: "\x1b[5~",
+    up: "\x1b[A",
+    down: "\x1b[B",
+  };
+
+  const stubTui = (rows: number) =>
+    ({ terminal: { rows, columns: 80 }, requestRender: () => {} }) as unknown as TUI;
+  const stubTheme = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as unknown as Theme;
+
+  /** A card whose body is far too long to fit, so it is always windowed. */
+  const scrollable = () => {
+    const b = body();
+    for (let i = 0; i < 300; i++) b.text(`body line ${i}`);
+    const card = renderCard(stubTui(24), stubTheme, () => {}, {
+      title: "A long card",
+      lines: b.lines,
+      options: [{ label: "keep going", answer: "continue" }],
+    });
+    const draw = () => card.render(80).join("\n");
+    draw(); // first render establishes the viewport the bindings move by
+    // `handleInput` is optional on pi's Component, so bind a non-optional one.
+    const press = (data: string) => card.handleInput?.(data);
+    return { press, draw };
+  };
+
+  it("scrolls a line at a time with j and k", () => {
+    const { press, draw } = scrollable();
+    assert.match(draw(), /body line 0/);
+
+    press(KEYS.lineDown);
+    assert.doesNotMatch(draw(), /body line 0\b/);
+    assert.match(draw(), /body line 1/);
+
+    press(KEYS.lineUp);
+    assert.match(draw(), /body line 0/);
+  });
+
+  it("jumps to the ends with Home and End", () => {
+    const { press, draw } = scrollable();
+    press(KEYS.end);
+    const atEnd = draw();
+    assert.match(atEnd, /body line 299/);
+    assert.doesNotMatch(atEnd, /below/, "nothing left below at the end");
+
+    press(KEYS.home);
+    const atTop = draw();
+    assert.match(atTop, /body line 0/);
+    assert.doesNotMatch(atTop, /above/, "nothing above at the top");
+  });
+
+  it("pages with PgUp/PgDn", () => {
+    const { press, draw } = scrollable();
+    press(KEYS.pageDown);
+    // A page is a screenful less one line of overlap, so it moves much further
+    // than the single line j does.
+    assert.doesNotMatch(draw(), /body line 1\b/);
+
+    press(KEYS.pageUp);
+    assert.match(draw(), /body line 0/);
+  });
+
+  it("pages with ^U and ^D, for a keyboard with no PgUp/PgDn", () => {
+    // The case that started this: the navigator's laptop has no PgUp/PgDn, so
+    // an alias that survives on any keyboard is the point, not a convenience.
+    const { press, draw } = scrollable();
+    press(KEYS.ctrlPageDown);
+    assert.doesNotMatch(draw(), /body line 1\b/);
+
+    press(KEYS.ctrlPageUp);
+    assert.match(draw(), /body line 0/);
+  });
+
+  it("clamps at both ends rather than running off", () => {
+    const { press, draw } = scrollable();
+    for (let i = 0; i < 5; i++) press(KEYS.lineUp);
+    assert.match(draw(), /body line 0/, "cannot scroll above the start");
+
+    press(KEYS.end);
+    for (let i = 0; i < 5; i++) press(KEYS.lineDown);
+    assert.match(draw(), /body line 299/, "cannot scroll past the end");
+  });
+
+  it("leaves plain arrows to the options", () => {
+    // The whole reason the line step is j/k and not the arrows.
+    const { press, draw } = scrollable();
+    press(KEYS.down);
+    assert.match(draw(), /body line 0/, "plain ↓ must not scroll the body");
+  });
+
+  it("names every working key, so none of them is undiscoverable", () => {
+    const { draw } = scrollable();
+    const hint = draw();
+    assert.match(hint, /j\/k/);
+    assert.match(hint, /\^U\/\^D/);
+    assert.match(hint, /PgUp\/PgDn/);
+    assert.match(hint, /Home\/End/);
   });
 });

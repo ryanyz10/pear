@@ -12,6 +12,7 @@
  */
 
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { enableMouse, parseWheel } from "./mouse.ts";
 import {
   Editor,
   type EditorTheme,
@@ -85,13 +86,23 @@ export function plainLines<A>(spec: CardSpec<A>): string[] {
 }
 
 /**
- * The smallest body worth showing. Below this a card is all chrome and no
- * content, so we overflow the terminal rather than render something useless.
+ * The smallest body worth showing. A card with less than this is all chrome and
+ * no content, but it is still answerable, which is what matters: the card is
+ * rendered as a full-height overlay and the compositor *slices* anything past
+ * the terminal height, so growing past it would cut the options off the bottom
+ * and leave a card nobody can answer. The body is squeezed instead.
  */
 export const MIN_BODY_ROWS = 3;
 
 /** Rows to assume when the terminal will not say how tall it is. */
 export const FALLBACK_ROWS = 24;
+
+/**
+ * Body lines per wheel notch. Three is the near-universal convention, and
+ * matching it is what makes the card feel like the rest of the terminal rather
+ * than like a program with opinions about your mouse.
+ */
+export const WHEEL_LINES = 3;
 
 export type BodyWindow = {
   /** The slice to render. */
@@ -127,12 +138,19 @@ export function windowBody(lines: string[], viewport: number, offset: number): B
   };
 }
 
-/** The one-line "there is more" marker shown under a windowed body. */
+/**
+ * The one-line "there is more" marker shown under a windowed body.
+ *
+ * Every working key is named, not just one. The card is a fullscreen overlay,
+ * so it contributes nothing to the terminal's scrollback and these keys are the
+ * *only* way to reach the rest of the body — and laptops routinely have no
+ * PgUp/PgDn, which is exactly how this went unnoticed.
+ */
 export function scrollHint(window: BodyWindow): string {
   const parts: string[] = [];
   if (window.above > 0) parts.push(`↑ ${window.above} above`);
   if (window.below > 0) parts.push(`↓ ${window.below} below`);
-  return `${parts.join(" · ")} · PgUp/PgDn to scroll`;
+  return `${parts.join(" · ")} · j/k scroll · ^U/^D or PgUp/PgDn page · Home/End ends`;
 }
 
 const THEME_KEY: Record<Tone, ThemeColor> = {
@@ -153,7 +171,11 @@ export function renderCard<A>(
   theme: Theme,
   done: (answer: A | null) => void,
   spec: CardSpec<A>,
-): Component {
+): Component & { dispose: () => void } {
+  // Asked for as the card opens and released in `dispose`. See mouse.ts for why
+  // the teardown does not rely on this one path alone.
+  const releaseMouse = enableMouse();
+
   type Mode = { at: "options" } | { at: "editor"; option: number } | { at: "pick"; option: number; index: number };
 
   let index = 0;
@@ -171,6 +193,8 @@ export function renderCard<A>(
   let bodyOffset = 0;
   /** Body rows the last render had room for, so paging can move by a screenful. */
   let lastViewport = MIN_BODY_ROWS;
+  /** Wrapped body lines at the last render, so End knows where the end is. */
+  let lastBodyLines = 0;
 
   const editorTheme: EditorTheme = {
     borderColor: (s) => theme.fg("accent", s),
@@ -193,6 +217,12 @@ export function renderCard<A>(
    * How tall the terminal is. `render` is only told the width, but the card is
    * handed the TUI, and `Terminal` exposes `rows`. A terminal that will not say
    * gets a conservative guess rather than an unscrollable card.
+   *
+   * This is the card's real budget only because it is shown as an overlay at
+   * `maxHeight: "100%"` — an overlay owns the whole screen. Rendered inline it
+   * would have to share the buffer with pi's status, widget and footer rows,
+   * and sizing to the full height is what used to push pi's spinner out of the
+   * viewport and force a screen-clearing redraw on every spinner tick.
    */
   const terminalRows = (): number => {
     try {
@@ -203,11 +233,19 @@ export function renderCard<A>(
     }
   };
 
-  /** Move the body window. Paging is by a screenful less one line of overlap. */
-  const scrollBody = (direction: -1 | 1): void => {
-    const step = Math.max(1, lastViewport - 1);
-    bodyOffset = Math.max(0, bodyOffset + direction * step);
+  /**
+   * Move the body window by an exact number of lines. The upper bound is left
+   * to `windowBody` at render time, which is the only place the viewport is
+   * known — a resize can invalidate any clamp made here.
+   */
+  const scrollBodyBy = (lines: number): void => {
+    bodyOffset = Math.max(0, bodyOffset + lines);
     invalidate();
+  };
+
+  /** Page the body. A screenful less one line, so the reader keeps their place. */
+  const scrollBody = (direction: -1 | 1): void => {
+    scrollBodyBy(direction * Math.max(1, lastViewport - 1));
   };
 
   const optionAt = (i: number): CardOption<A> | undefined => spec.options[i];
@@ -246,6 +284,14 @@ export function renderCard<A>(
   }
 
   function handleInput(data: string): void {
+    // Before the mode dispatch: the wheel means the same thing everywhere, and
+    // in editor mode the raw report would otherwise be typed into the editor.
+    const wheel = parseWheel(data);
+    if (wheel !== undefined) {
+      scrollBodyBy(wheel === "up" ? -WHEEL_LINES : WHEEL_LINES);
+      return;
+    }
+
     if (mode.at === "editor") {
       if (matchesKey(data, Key.escape)) {
         mode = { at: "options" };
@@ -289,14 +335,46 @@ export function renderCard<A>(
       return;
     }
 
-    // Paging is bound separately from ↑↓ on purpose: the arrows belong to the
-    // options, and a card whose body does not fit must still be readable.
+    // Scrolling is bound to everything *except* plain ↑↓, which belong to the
+    // options. Several bindings rather than one because a card whose body does
+    // not fit must still be readable on a keyboard that lacks any given key.
     if (matchesKey(data, Key.pageUp)) {
       scrollBody(-1);
       return;
     }
     if (matchesKey(data, Key.pageDown)) {
       scrollBody(1);
+      return;
+    }
+    // ^U/^D page as well, as the alias for a keyboard with no PgUp/PgDn.
+    if (matchesKey(data, Key.ctrl("u"))) {
+      scrollBody(-1);
+      return;
+    }
+    if (matchesKey(data, Key.ctrl("d"))) {
+      scrollBody(1);
+      return;
+    }
+    // Plain letters for the line step. Deliberately not shift+↑↓, which reads as
+    // the obvious choice and does not work: terminals commonly bind those to
+    // their own scrollback and never send them to the application at all.
+    if (matchesKey(data, "k")) {
+      scrollBodyBy(-1);
+      return;
+    }
+    if (matchesKey(data, "j")) {
+      scrollBodyBy(1);
+      return;
+    }
+    if (matchesKey(data, Key.home)) {
+      bodyOffset = 0;
+      invalidate();
+      return;
+    }
+    if (matchesKey(data, Key.end)) {
+      // Past the end on purpose; the render clamps to whatever fits.
+      bodyOffset = lastBodyLines;
+      invalidate();
       return;
     }
     if (matchesKey(data, Key.up)) {
@@ -405,24 +483,33 @@ export function renderCard<A>(
     );
     tail.push(rule);
 
-    // What is left for the body once the chrome has taken its share. The card
-    // may still overflow a very short terminal — MIN_BODY_ROWS says a body of
-    // one line is worse than a card that runs off the top.
-    const available = rows - head.length - tail.length;
+    // What is left for the body once the chrome has taken its share. Never
+    // rounded up: the card is composited as an overlay and the compositor slices
+    // an over-tall one from the *bottom*, so every row the body borrows beyond
+    // the terminal is taken out of the options — a card nobody can answer.
+    // MIN_BODY_ROWS is the preference; fitting is the requirement.
+    const budget = rows - head.length - tail.length;
+    lastBodyLines = bodyLines.length;
     const out = [...head];
-    if (bodyLines.length <= available) {
+    if (bodyLines.length <= budget) {
       // Everything fits: no window, no marker, and no stale offset left behind.
       bodyOffset = 0;
       lastViewport = Math.max(MIN_BODY_ROWS, bodyLines.length);
       out.push(...bodyLines);
-    } else {
+    } else if (budget >= 2) {
       // One row goes to the marker, so the human can tell there is more.
-      const viewport = Math.max(MIN_BODY_ROWS, available - 1);
+      const viewport = budget - 1;
       const window = windowBody(bodyLines, viewport, bodyOffset);
       bodyOffset = window.offset;
       lastViewport = viewport;
       out.push(...window.lines);
       wrapInto(out, theme.fg("dim", scrollHint(window)), " ");
+    } else {
+      // A terminal too short for the chrome alone. Nothing can be shown without
+      // costing the options, so the body is dropped entirely and the human is
+      // left with a card they can still answer.
+      bodyOffset = 0;
+      lastViewport = MIN_BODY_ROWS;
     }
     out.push(...tail);
 
@@ -438,5 +525,6 @@ export function renderCard<A>(
       cached = undefined;
     },
     handleInput,
+    dispose: releaseMouse,
   };
 }

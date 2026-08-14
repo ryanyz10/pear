@@ -179,6 +179,14 @@ export type PearRuntime = {
   readonly paused: boolean;
   readonly explaining: string | null;
   readonly reviewBudget: number;
+  /**
+   * The tier boundaries in force. Exposed because human-driver's watcher tiers
+   * its own git measurements and must use the same numbers as the gate — these
+   * are runtime state, moved by `setTiers`, so reading them off the host's
+   * config copy would drift.
+   */
+  readonly softFraction: number;
+  readonly blockMultiple: number;
   readonly checkpoint: Checkpoint;
   isCardPending: () => boolean;
   tier: () => LoadTier;
@@ -363,6 +371,14 @@ export function createRuntime(deps: RuntimeDeps): PearRuntime {
     },
     get reviewBudget() {
       return budget;
+    },
+
+    get softFraction() {
+      return softFraction;
+    },
+
+    get blockMultiple() {
+      return blockMultiple;
     },
     get checkpoint() {
       return checkpoint;
